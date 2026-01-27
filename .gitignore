@@ -1,6 +1,39 @@
-!9e75b59c
-!6984de94
-!81b6b4c0
-!7d51c6b8
-!81b69c70
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
 
+# --- Virtualenv ---
+.venv/
+venv/
+ENV/
+
+# --- IDE ---
+.vscode/
+.idea/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Logs / runtime outputs ---
+*.log
+logs/
+output/
+tmp/
+cache/
+
+# --- Secrets / local config ---
+.env
+*.local
+config.local.*
+
+# --- Working files
+graphGen/
+meshLogger/
+nodeDb.txt
+nodes.txt
