@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-graphGen.py — Meshtastic traces → Graphviz DOT/SVG/JPG generator (chatty terminal output)
+graphGen.py — Meshtastic traces → D3.js HTML/JSON generator (chatty terminal output)
 
-Version: 0.7.9
-Date: 2026-01-25
+Version: 0.8.0
+Date: 2026-02-01
 
 CHANGELOG:
+0.8.0 (2026-02-01)
+  - Switched graph output to D3.js (HTML + JSON), removed Graphviz dependency.
+  - HTML includes interactive force layout with zoom/drag and tooltips.
+  - JSON includes node metadata, routing %, RSSI, and edge thickness.
+
 0.7.9 (2026-01-25)
   - --datetime window filter now uses timestamps STRICTLY from the beginning of EACH TRACE LINE
     inside the file (NOT filename, NOT file mtime/ctime).
@@ -36,7 +41,7 @@ Trace filename pattern expected in <root>/meshLogger:
   'YYYY-MM-DD !xxxxxxxx*.txt'
 """
 
-__version__ = "0.7.9"
+__version__ = "0.8.0"
 
 import argparse
 import colorsys
@@ -44,8 +49,6 @@ import hashlib
 import json
 import math
 import re
-import shutil
-import subprocess
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -104,10 +107,6 @@ def sha1_file(path: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
     h.update(str(st.st_size).encode())
     h.update(str(int(st.st_mtime)).encode())
     return h.hexdigest()
-
-
-def which_dot() -> Optional[str]:
-    return shutil.which("dot")
 
 
 def extract_first_json_object(text: str) -> Optional[str]:
@@ -237,16 +236,6 @@ def role_fill(role: str) -> str:
     return ROLE_COLORS["UNKNOWN"]
 
 
-def esc_html(s: str) -> str:
-    return (
-        (s or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
 def grad_rssi(value_db: Optional[float], vmin: float, vmax: float) -> str:
     if value_db is None:
         return "#9a9a9a"
@@ -273,11 +262,6 @@ def margin_from_neighbors(n: int, vmax: int) -> str:
     mx = 0.25 + 0.60 * t
     my = 0.22 + 0.58 * t
     return f"{mx:.2f},{my:.2f}"
-
-
-def fmt_role(role: str) -> str:
-    r = (role or "").upper()
-    return r if r else "-"
 
 
 def build_auto_out(measurer_id: str) -> str:
@@ -645,39 +629,247 @@ def parse_traces_with_stats(
     return dict(edge_count), dict(edge_rssi), dict(transit_count), stats_list, debug, selected_files
 
 
-def render_svg(dot_path: Path, svg_path: Path) -> None:
-    subprocess.run(["dot", "-Tsvg", str(dot_path), "-o", str(svg_path)], check=True)
+def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
+    payload_json = json.dumps(graph_payload, ensure_ascii=False, indent=2)
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meshtastic Graph</title>
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+        background: #0b0b0b;
+        color: #f5f5f5;
+        font-family: "Helvetica Neue", Arial, sans-serif;
+        height: 100%;
+        overflow: hidden;
+      }}
+      .toolbar {{
+        position: absolute;
+        left: 16px;
+        top: 16px;
+        background: rgba(20, 20, 20, 0.9);
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 12px 14px;
+        font-size: 14px;
+        z-index: 10;
+      }}
+      .toolbar h1 {{
+        font-size: 16px;
+        margin: 0 0 8px 0;
+        font-weight: 600;
+      }}
+      .toolbar .meta {{
+        font-size: 12px;
+        color: #c0c0c0;
+        line-height: 1.4;
+      }}
+      svg {{
+        width: 100vw;
+        height: 100vh;
+      }}
+      .link {{
+        stroke-opacity: 0.75;
+      }}
+      .node circle {{
+        stroke: #222;
+        stroke-width: 1px;
+      }}
+      .node text {{
+        fill: #f0f0f0;
+        pointer-events: none;
+        font-size: 11px;
+      }}
+      .tooltip {{
+        position: absolute;
+        pointer-events: none;
+        background: rgba(25, 25, 25, 0.95);
+        border: 1px solid #444;
+        padding: 8px 10px;
+        border-radius: 6px;
+        color: #f0f0f0;
+        font-size: 12px;
+        line-height: 1.4;
+        opacity: 0;
+        transition: opacity 0.1s ease;
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="toolbar">
+      <h1>Meshtastic Graph (D3.js)</h1>
+      <div class="meta" id="meta"></div>
+    </div>
+    <div class="tooltip" id="tooltip"></div>
+    <svg></svg>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script>
+      window.addEventListener("load", () => {{
+      if (typeof d3 === "undefined") {{
+        const meta = document.getElementById("meta");
+        meta.textContent = "D3.js failed to load (check network or local hosting).";
+        return;
+      }}
+      const graph = {payload_json};
+      const meta = document.getElementById("meta");
+      meta.textContent = `Nodes: ${{graph.meta.nodes}} | Links: ${{graph.meta.links}} | Min edge: ${{graph.meta.minEdge}} | Unknown: ${{graph.meta.includeUnknown ? "yes" : "no"}}`;
 
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const svg = d3.select("svg");
+      svg.attr("width", width).attr("height", height);
+      const zoomLayer = svg.append("g");
 
-def render_jpg(dot_path: Path, jpg_path: Path, dpi: int) -> None:
-    subprocess.run(["dot", "-Tjpg", f"-Gdpi={dpi}", str(dot_path), "-o", str(jpg_path)], check=True)
+      const tooltip = d3.select("#tooltip");
 
+      svg.call(
+        d3.zoom().scaleExtent([0.2, 4]).on("zoom", (event) => {{
+          zoomLayer.attr("transform", event.transform);
+        }})
+      );
 
-def enforce_svg_size(svg_path: Path, width_pt: str = "8000pt", height_pt: str = "4500pt") -> None:
-    """
-    Post-process SVG root element to enforce requested width/height.
-    """
-    s = svg_path.read_text(errors="ignore")
-    # Replace width="...pt" and height="...pt" in the <svg ...> tag
-    # Keep it minimal and deterministic.
-    s2 = re.sub(r'(<svg\b[^>]*?)\swidth="[^"]*"', r'\1 width="' + width_pt + '"', s, count=1)
-    s2 = re.sub(r'(<svg\b[^>]*?)\sheight="[^"]*"', r'\1 height="' + height_pt + '"', s2, count=1)
+      const link = zoomLayer
+        .append("g")
+        .attr("class", "links")
+        .selectAll("line")
+        .data(graph.links)
+        .enter()
+        .append("line")
+        .attr("class", "link")
+        .attr("stroke", (d) => d.color || "#666")
+        .attr("stroke-width", (d) => d.width || 1.5);
 
-    # If width/height absent for some reason, inject after <svg
-    if s2 == s:
-        s2 = re.sub(r"<svg\b", f'<svg width="{width_pt}" height="{height_pt}"', s, count=1)
+      const node = zoomLayer
+        .append("g")
+        .attr("class", "nodes")
+        .selectAll("g")
+        .data(graph.nodes)
+        .enter()
+        .append("g")
+        .attr("class", "node")
+        .call(
+          d3.drag()
+            .on("start", dragstarted)
+            .on("drag", dragged)
+            .on("end", dragended)
+        );
 
-    svg_path.write_text(s2, encoding="utf-8")
+      node
+        .append("circle")
+        .attr("r", (d) => Math.max(6, d.neighbors * 1.2 + 6))
+        .attr("fill", (d) => d.fill || "#888")
+        .on("mouseover", (event, d) => {{
+          tooltip
+            .style("opacity", 1)
+            .html(
+              `<strong>${{d.longName}}</strong> [${{d.shortName}}]<br/>` +
+              `${{d.id}}<br/>` +
+              `Role: ${{d.role || "UNKNOWN"}}<br/>` +
+              `Neighbors: ${{d.neighbors}}<br/>` +
+              `Routing: ${{d.routingPct.toFixed(1)}}%<br/>` +
+              `chUtil: ${{d.chUtil === null ? "n/a" : d.chUtil.toFixed(1) + "%"}}`
+            );
+        }})
+        .on("mousemove", (event) => {{
+          tooltip.style("left", event.pageX + 12 + "px").style("top", event.pageY + 12 + "px");
+        }})
+        .on("mouseout", () => {{
+          tooltip.style("opacity", 0);
+        }});
+
+      node
+        .append("text")
+        .attr("x", 10)
+        .attr("y", 4)
+        .text((d) => d.label);
+
+      if (!graph.nodes || graph.nodes.length === 0) {{
+        meta.textContent = "No nodes to display (check filters or input data).";
+        return;
+      }}
+
+      const simulation = d3
+        .forceSimulation(graph.nodes)
+        .force(
+          "link",
+          d3
+            .forceLink(graph.links)
+            .id((d) => d.id)
+            .distance((d) => 160 + Math.min(220, d.count * 8))
+            .strength(0.6)
+        )
+        .force("charge", d3.forceManyBody().strength(-650))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force(
+          "radial",
+          d3
+            .forceRadial((d) => 140 + d.neighbors * 24, width / 2, height / 2)
+            .strength(0.75)
+        )
+        .force(
+          "collision",
+          d3.forceCollide().radius((d) => {{
+            const labelBoost = d.label ? Math.min(24, d.label.length * 0.7) : 0;
+            return Math.max(24, d.neighbors * 1.8 + 16 + labelBoost);
+          }})
+        );
+
+      simulation.on("tick", () => {{
+        link
+          .attr("x1", (d) => d.source.x)
+          .attr("y1", (d) => d.source.y)
+          .attr("x2", (d) => d.target.x)
+          .attr("y2", (d) => d.target.y);
+
+        node.attr("transform", (d) => `translate(${{d.x}},${{d.y}})`);
+      }});
+
+      function dragstarted(event, d) {{
+        if (!event.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+      }}
+
+      function dragged(event, d) {{
+        d.fx = event.x;
+        d.fy = event.y;
+      }}
+
+      function dragended(event, d) {{
+        if (!event.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+      }}
+
+      window.addEventListener("resize", () => {{
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        svg.attr("width", w).attr("height", h);
+        simulation.force("center", d3.forceCenter(w / 2, h / 2));
+        simulation.force(
+          "radial",
+          d3.forceRadial((d) => 140 + d.neighbors * 24, w / 2, h / 2).strength(0.75)
+        );
+        simulation.alpha(0.3).restart();
+      }});
+      }});
+    </script>
+  </body>
+</html>
+"""
+    html_path.write_text(html, encoding="utf-8")
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="graphGen.py: build Meshtastic graph (DOT+SVG+JPG) from trace files.")
+    ap = argparse.ArgumentParser(description="graphGen.py: build Meshtastic graph (D3.js HTML/JSON) from trace files.")
 
     # Keep existing args (as you used)
     ap.add_argument("--root", default=".", help="Directory with input files (default: current).")
     ap.add_argument("--min-edge", type=int, default=3, help="Minimum confirmations to keep a directed link (default: 3).")
-    ap.add_argument("--rankdir", default="LR", choices=["LR", "TB", "RL", "BT"], help="Graphviz rankdir (default: LR).")
-    ap.add_argument("--dpi", type=int, default=75, help="JPG DPI (default: 75).")
     ap.add_argument(
         "--include-unknown",
         action="store_true",
@@ -731,13 +923,6 @@ def main() -> int:
     print(f"  3) home:   {node_search[2]}")
     print("")
 
-    dot_bin = which_dot()
-    if not dot_bin:
-        eprint("ERROR: Graphviz 'dot' not found in PATH. Install graphviz and retry.")
-        return 4
-    print(f"Graphviz: {dot_bin}")
-    print("")
-
     trace_files = find_trace_files(trace_root)
     if not trace_files:
         eprint("ERROR: no trace files found. Expected patterns in ~/meshLogger: 'YYYY-MM-DD !xxxxxxxx*.txt'")
@@ -785,9 +970,8 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_base = build_auto_out(measurer_id)
-    dot_path = out_dir / f"{out_base}.dot"
-    svg_path = out_dir / f"{out_base}.svg"
-    jpg_path = out_dir / f"{out_base}.jpg"
+    json_path = out_dir / f"{out_base}.json"
+    html_path = out_dir / f"{out_base}.html"
 
     print("Read files:")
     print(f"node database: {nodedb_path if nodedb_path else '(not found)'}")
@@ -886,7 +1070,8 @@ def main() -> int:
     def penwidth_from_count_relative(cnt: int) -> float:
         if max_conf <= 0:
             return round(min_w, 2)
-        t = cnt / float(max_conf)  # 0..1
+        denom = math.log1p(max_conf)
+        t = math.log1p(cnt) / denom if denom > 0 else 0.0  # 0..1, logarithmic
         w = min_w + t * (max_w - min_w)
         return round(w, 2)
 
@@ -923,14 +1108,8 @@ def main() -> int:
         print(f"  {transit_count.get(n,0):>5}  {pct:>5.1f}%  {pretty_name(n)}")
     print("")
 
-    # DOT build
-    dot_lines: List[str] = []
-    dot_lines.append("digraph Meshtastic {")
-    dot_lines.append(f'  graph [rankdir={args.rankdir}, bgcolor="black", nodesep=0.55, ranksep=0.90];')
-    dot_lines.append('  node [shape=box, style="rounded,filled", fontcolor="#000000", color="#333333", fontname="Helvetica"];')
-    dot_lines.append('  edge [arrowsize=0.8];')
-    dot_lines.append("")
-
+    # D3 payload
+    nodes_payload: List[Dict[str, Any]] = []
     for nid in nodes:
         meta = node_meta.get(nid, {"longName": "", "shortName": "", "role": "", "chUtil": None})
         ln = meta.get("longName") or "Unknown"
@@ -939,28 +1118,27 @@ def main() -> int:
         fill = role_fill(role)
 
         cu = meta.get("chUtil")
-        cu_str = f"{cu:.1f}%" if isinstance(cu, (int, float)) else "n/a"
-
         neigh = deg_u.get(nid, 0)
         fs = fontsize_from_neighbors(neigh, vmax_neighbors)
         margin = margin_from_neighbors(neigh, vmax_neighbors)
 
-        line1 = f"{ln} [{sn}]"
-        line2 = nid
-        line3 = fmt_role(role)
-        line4 = f"neighbors:{neigh} | routing:{routing_pct.get(nid, 0.0):.1f}% | chUtil:{cu_str}"
-
-        label = (
-            f'<<FONT POINT-SIZE="{fs}">'
-            f"{esc_html(line1)}<BR/>"
-            f"{esc_html(line2)}<BR/>"
-            f"{esc_html(line3)}<BR/>"
-            f"{esc_html(line4)}"
-            f"</FONT>>"
+        nodes_payload.append(
+            {
+                "id": nid,
+                "label": f"{ln} [{sn}]",
+                "longName": ln,
+                "shortName": sn,
+                "role": role or "UNKNOWN",
+                "neighbors": neigh,
+                "routingPct": round(routing_pct.get(nid, 0.0), 2),
+                "chUtil": float(cu) if isinstance(cu, (int, float)) else None,
+                "fill": fill,
+                "fontSize": fs,
+                "margin": margin,
+            }
         )
-        dot_lines.append(f'  "{nid}" [fillcolor="{fill}", fontsize={fs}, margin="{margin}", label={label}];')
 
-    dot_lines.append("")
+    links_payload: List[Dict[str, Any]] = []
     for (a, b), cnt in edge_count_f.items():
         vals = edge_rssi.get((a, b), [])
         avg = (sum(vals) / len(vals)) if vals else None
@@ -969,22 +1147,37 @@ def main() -> int:
         # ONLY thickness formula changed here:
         pw = penwidth_from_count_relative(cnt)
 
-        dot_lines.append(f'  "{a}" -> "{b}" [penwidth={pw}, color="{color}"];')
-    dot_lines.append("}")
+        links_payload.append(
+            {
+                "source": a,
+                "target": b,
+                "count": cnt,
+                "avgRssi": round(avg, 2) if avg is not None else None,
+                "color": color,
+                "width": pw,
+            }
+        )
 
-    dot_path.write_text("\n".join(dot_lines), encoding="utf-8")
+    payload = {
+        "meta": {
+            "generatedAt": datetime.now().isoformat(timespec="seconds"),
+            "nodes": len(nodes_payload),
+            "links": len(links_payload),
+            "minEdge": args.min_edge,
+            "includeUnknown": include_unknown,
+            "rssiRange": {"min": round(vmin, 2), "max": round(vmax, 2)},
+            "maxConfirmations": max_conf,
+        },
+        "nodes": nodes_payload,
+        "links": links_payload,
+    }
 
-    try:
-        render_svg(dot_path, svg_path)
-        enforce_svg_size(svg_path, width_pt="8000pt", height_pt="4500pt")
-        render_jpg(dot_path, jpg_path, args.dpi)
-    except subprocess.CalledProcessError as e:
-        eprint("ERROR: dot failed:", e)
-        return 5
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_d3_html(html_path, payload)
 
-    print(f"OK: wrote {dot_path}")
-    print(f"OK: wrote {svg_path}")
-    print(f"OK: wrote {jpg_path}")
+    print(f"OK: wrote {json_path}")
+    print(f"OK: wrote {html_path}")
+    print("Tip: open HTML via a local web server to avoid browser file:// restrictions.")
     print("")
     return 0
 
