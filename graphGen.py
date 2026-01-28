@@ -1070,7 +1070,8 @@ def main() -> int:
     def penwidth_from_count_relative(cnt: int) -> float:
         if max_conf <= 0:
             return round(min_w, 2)
-        t = cnt / float(max_conf)  # 0..1
+        denom = math.log1p(max_conf)
+        t = math.log1p(cnt) / denom if denom > 0 else 0.0  # 0..1, logarithmic
         w = min_w + t * (max_w - min_w)
         return round(w, 2)
 
