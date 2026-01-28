@@ -784,6 +784,27 @@ def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
         .forceSimulation(graph.nodes)
         .force(
           "link",
+          d3
+            .forceLink(graph.links)
+            .id((d) => d.id)
+            .distance((d) => 160 + Math.min(220, d.count * 8))
+            .strength(0.6)
+        )
+        .force("charge", d3.forceManyBody().strength(-650))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force(
+          "radial",
+          d3
+            .forceRadial((d) => 140 + d.neighbors * 24, width / 2, height / 2)
+            .strength(0.75)
+        )
+        .force(
+          "collision",
+          d3.forceCollide().radius((d) => {{
+            const labelBoost = d.label ? Math.min(24, d.label.length * 0.7) : 0;
+            return Math.max(24, d.neighbors * 1.8 + 16 + labelBoost);
+          }})
+        );
           d3.forceLink(graph.links).id((d) => d.id).distance(120).strength(0.8)
         )
         .force("charge", d3.forceManyBody().strength(-280))
@@ -822,6 +843,10 @@ def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
         const h = window.innerHeight;
         svg.attr("width", w).attr("height", h);
         simulation.force("center", d3.forceCenter(w / 2, h / 2));
+        simulation.force(
+          "radial",
+          d3.forceRadial((d) => 140 + d.neighbors * 24, w / 2, h / 2).strength(0.75)
+        );
         simulation.alpha(0.3).restart();
       }});
     </script>
@@ -1123,6 +1148,24 @@ def main() -> int:
                 "width": pw,
             }
         )
+
+    payload = {
+        "meta": {
+            "generatedAt": datetime.now().isoformat(timespec="seconds"),
+            "nodes": len(nodes_payload),
+            "links": len(links_payload),
+            "minEdge": args.min_edge,
+            "includeUnknown": include_unknown,
+            "rssiRange": {"min": round(vmin, 2), "max": round(vmax, 2)},
+            "maxConfirmations": max_conf,
+        },
+        "nodes": nodes_payload,
+        "links": links_payload,
+    }
+
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_d3_html(html_path, payload)
+
 
     payload = {
         "meta": {
