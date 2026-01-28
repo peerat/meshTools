@@ -708,6 +708,12 @@ def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
     <svg></svg>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <script>
+      window.addEventListener("load", () => {{
+      if (typeof d3 === "undefined") {{
+        const meta = document.getElementById("meta");
+        meta.textContent = "D3.js failed to load (check network or local hosting).";
+        return;
+      }}
       const graph = {payload_json};
       const meta = document.getElementById("meta");
       meta.textContent = `Nodes: ${{graph.meta.nodes}} | Links: ${{graph.meta.links}} | Min edge: ${{graph.meta.minEdge}} | Unknown: ${{graph.meta.includeUnknown ? "yes" : "no"}}`;
@@ -715,6 +721,7 @@ def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
       const width = window.innerWidth;
       const height = window.innerHeight;
       const svg = d3.select("svg");
+      svg.attr("width", width).attr("height", height);
       const zoomLayer = svg.append("g");
 
       const tooltip = d3.select("#tooltip");
@@ -780,6 +787,11 @@ def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
         .attr("y", 4)
         .text((d) => d.label);
 
+      if (!graph.nodes || graph.nodes.length === 0) {{
+        meta.textContent = "No nodes to display (check filters or input data).";
+        return;
+      }}
+
       const simulation = d3
         .forceSimulation(graph.nodes)
         .force(
@@ -805,11 +817,6 @@ def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
             return Math.max(24, d.neighbors * 1.8 + 16 + labelBoost);
           }})
         );
-          d3.forceLink(graph.links).id((d) => d.id).distance(120).strength(0.8)
-        )
-        .force("charge", d3.forceManyBody().strength(-280))
-        .force("center", d3.forceCenter(width / 2, height / 2))
-        .force("collision", d3.forceCollide().radius((d) => Math.max(18, d.neighbors * 1.2 + 12)));
 
       simulation.on("tick", () => {{
         link
@@ -848,6 +855,7 @@ def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
           d3.forceRadial((d) => 140 + d.neighbors * 24, w / 2, h / 2).strength(0.75)
         );
         simulation.alpha(0.3).restart();
+      }});
       }});
     </script>
   </body>
@@ -1148,24 +1156,6 @@ def main() -> int:
                 "width": pw,
             }
         )
-
-    payload = {
-        "meta": {
-            "generatedAt": datetime.now().isoformat(timespec="seconds"),
-            "nodes": len(nodes_payload),
-            "links": len(links_payload),
-            "minEdge": args.min_edge,
-            "includeUnknown": include_unknown,
-            "rssiRange": {"min": round(vmin, 2), "max": round(vmax, 2)},
-            "maxConfirmations": max_conf,
-        },
-        "nodes": nodes_payload,
-        "links": links_payload,
-    }
-
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_d3_html(html_path, payload)
-
 
     payload = {
         "meta": {
