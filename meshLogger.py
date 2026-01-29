@@ -672,10 +672,26 @@ def main() -> int:
             active0 = filter_hops(active0, args.minhops, args.maxhops)
             return active0
 
-        rc, so, se = run_cmd(["meshtastic", "--port", args.port, "--info"], timeout=max(60, args.timeout + 15))
-        mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
+        mesh_info_text = ""
+        parse_error: Optional[Exception] = None
+        for extra_args in (["--format", "json"], ["--json"], []):
+            rc, so, se = run_cmd(
+                ["meshtastic", "--port", args.port, "--info"] + extra_args,
+                timeout=max(60, args.timeout + 15),
+            )
+            mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
+            try:
+                nodes = parse_nodes_block(mesh_info_text)
+                parse_error = None
+                break
+            except Exception as ex:
+                parse_error = ex
+                nodes = {}
+                continue
 
-        nodes = parse_nodes_block(mesh_info_text)
+        if parse_error is not None:
+            raise parse_error
+
         self_id = detect_self_id(mesh_info_text, nodes)
         self_long, self_short = node_names(nodes, self_id)
 
