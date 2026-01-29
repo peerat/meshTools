@@ -674,9 +674,11 @@ def main() -> int:
 
         mesh_info_text = ""
         parse_error: Optional[Exception] = None
+        attempt_log: List[str] = []
         for extra_args in (["--format", "json"], ["--json"], []):
+            cmd = ["meshtastic", "--port", args.port, "--info"] + extra_args
             rc, so, se = run_cmd(
-                ["meshtastic", "--port", args.port, "--info"] + extra_args,
+                cmd,
                 timeout=max(60, args.timeout + 15),
             )
             mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
@@ -687,10 +689,17 @@ def main() -> int:
             except Exception as ex:
                 parse_error = ex
                 nodes = {}
+                preview = "\n".join(mesh_info_text.splitlines()[:8])
+                stderr_preview = "\n".join((se or "").splitlines()[:6])
+                attempt_log.append(
+                    "cmd=" + " ".join(cmd)
+                    + f" rc={rc} stderr={stderr_preview!r} preview={preview!r}"
+                )
                 continue
 
         if parse_error is not None:
-            raise parse_error
+            details = " | ".join(attempt_log) if attempt_log else "no output captured"
+            raise RuntimeError(f"{parse_error} (parse attempts: {details})")
 
         self_id = detect_self_id(mesh_info_text, nodes)
         self_long, self_short = node_names(nodes, self_id)
