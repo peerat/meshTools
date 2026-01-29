@@ -444,6 +444,36 @@ def parse_info_output(stdout: str) -> Dict[str, Any]:
 
 
 # ==============================================================================
+# Output Formatting
+# ==============================================================================
+
+def _format_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    return str(value)
+
+
+def format_table(headers: List[str], rows: List[List[Any]]) -> List[str]:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(_format_cell(value)))
+    lines = []
+    header_line = "  " + "  ".join(
+        header.ljust(widths[idx]) for idx, header in enumerate(headers)
+    )
+    separator_line = "  " + "  ".join("-" * width for width in widths)
+    lines.append(header_line)
+    lines.append(separator_line)
+    for row in rows:
+        line = "  " + "  ".join(
+            _format_cell(value).ljust(widths[idx]) for idx, value in enumerate(row)
+        )
+        lines.append(line)
+    return lines
+
+
+# ==============================================================================
 # Database Operations
 # ==============================================================================
 
@@ -459,11 +489,7 @@ TRACKED_FIELDS = [
     ("position.alt_m", "position.alt_m"),
     ("battery.state", "battery.state"),
     ("battery.percent", "battery.percent"),
-    ("channel_util_pct", "channel_util_pct"),
-    ("tx_air_util_pct", "tx_air_util_pct"),
     ("snr_db", "snr_db"),
-    ("hops", "hops"),
-    ("channel_index", "channel_index"),
 ]
 
 
@@ -797,7 +823,6 @@ def main() -> int:
     role_count = 0
     hardware_count = 0
     pubkey_count = 0
-    util_count = 0
     
     seen_node_ids = set()
     
@@ -826,8 +851,6 @@ def main() -> int:
                 hardware_count += 1
             if "pubkey" in changes:
                 pubkey_count += 1
-            if "channel_util_pct" in changes or "tx_air_util_pct" in changes:
-                util_count += 1
     
     # Record run statistics
     db["meta"]["last_run_stats"] = {
@@ -848,16 +871,27 @@ def main() -> int:
     # Report new nodes
     if new_nodes:
         print("\n[NEW NODES]")
-        for node_id in new_nodes:
-            current = db_nodes[node_id]["current"]
-            print(
-                f"  + {node_id}  "
-                f"user={current.get('user')!r}  "
-                f"aka={current.get('aka')!r}  "
-                f"hw={current.get('hardware')!r}  "
-                f"role={current.get('role')!r}"
-            )
-    
+        new_rows: List[List[Any]] = []
+        for idx, node_id in enumerate(sorted(new_nodes), 1):
+            record = db_nodes[node_id]
+            current = record.get("current", {})
+            new_rows.append([
+                idx,
+                node_id,
+                current.get("user"),
+                current.get("aka"),
+                current.get("hardware"),
+                current.get("role"),
+                record.get("last_seen_utc"),
+                current.get("last_heard"),
+                current.get("since"),
+            ])
+        for line in format_table(
+            ["#", "ID", "User", "AKA", "HW", "Role", "Last Seen (UTC)", "Last Heard", "Since"],
+            new_rows,
+        ):
+            print(line)
+
     # Report changes
     if changed_nodes:
         print("\n[CHANGES]")
@@ -865,14 +899,23 @@ def main() -> int:
             current = db_nodes[node_id]["current"]
             name = current.get("user")
             aka = current.get("aka")
+            last_seen = db_nodes[node_id].get("last_seen_utc")
+            last_heard = current.get("last_heard")
             
             header = f"  * {node_id}"
             if name or aka:
                 header += f" ({name or ''}{' / ' if (name and aka) else ''}{aka or ''})"
-            print(header)
+            print(f"{header}  last_seen_utc={last_seen!r}  last_heard={last_heard!r}")
             
+            change_rows: List[List[Any]] = []
             for field, change_info in changes.items():
-                print(f"      - {field}: {change_info.get('from')!r} → {change_info.get('to')!r}")
+                change_rows.append([
+                    field,
+                    change_info.get("from"),
+                    change_info.get("to"),
+                ])
+            for line in format_table(["Field", "From", "To"], change_rows):
+                print(line)
         
         print("\n[CHANGE COUNTS]")
         print(f"  User renamed:       {rename_count}")
@@ -880,19 +923,30 @@ def main() -> int:
         print(f"  Role changed:       {role_count}")
         print(f"  Hardware changed:   {hardware_count}")
         print(f"  Pubkey changed:     {pubkey_count}")
-        print(f"  Utilization changed: {util_count} (channel_util_pct / tx_air_util_pct)")
     
-    # Sanity check for utilization data
-    missing_util_count = 0
-    for node_id in seen_node_ids:
-        current = db_nodes[node_id]["current"]
-        if current.get("channel_util_pct") is None and current.get("tx_air_util_pct") is None:
-            missing_util_count += 1
-    
-    print(
-        f"\n[SANITY] Utilization data missing for {missing_util_count}/{len(seen_node_ids)} nodes "
-        f"(normal if nodes report N/A)"
+    print("\n[NODES]")
+    node_rows: List[List[Any]] = []
+    sorted_nodes = sorted(
+        db_nodes.items(),
+        key=lambda item: item[1].get("first_seen_utc") or "",
+        reverse=True,
     )
+    for idx, (node_id, record) in enumerate(sorted_nodes, 1):
+        current = record.get("current", {})
+        node_rows.append([
+            idx,
+            node_id,
+            current.get("user"),
+            current.get("aka"),
+            record.get("last_seen_utc"),
+            current.get("last_heard"),
+            current.get("since"),
+        ])
+    for line in format_table(
+        ["#", "ID", "User", "AKA", "Last Seen (UTC)", "Last Heard", "Since"],
+        node_rows,
+    ):
+        print(line)
     
     return 0
 
