@@ -444,6 +444,36 @@ def parse_info_output(stdout: str) -> Dict[str, Any]:
 
 
 # ==============================================================================
+# Output Formatting
+# ==============================================================================
+
+def _format_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    return str(value)
+
+
+def format_table(headers: List[str], rows: List[List[Any]]) -> List[str]:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(_format_cell(value)))
+    lines = []
+    header_line = "  " + "  ".join(
+        header.ljust(widths[idx]) for idx, header in enumerate(headers)
+    )
+    separator_line = "  " + "  ".join("-" * width for width in widths)
+    lines.append(header_line)
+    lines.append(separator_line)
+    for row in rows:
+        line = "  " + "  ".join(
+            _format_cell(value).ljust(widths[idx]) for idx, value in enumerate(row)
+        )
+        lines.append(line)
+    return lines
+
+
+# ==============================================================================
 # Database Operations
 # ==============================================================================
 
@@ -841,16 +871,27 @@ def main() -> int:
     # Report new nodes
     if new_nodes:
         print("\n[NEW NODES]")
-        for node_id in new_nodes:
-            current = db_nodes[node_id]["current"]
-            print(
-                f"  + {node_id}  "
-                f"user={current.get('user')!r}  "
-                f"aka={current.get('aka')!r}  "
-                f"hw={current.get('hardware')!r}  "
-                f"role={current.get('role')!r}"
-            )
-    
+        new_rows: List[List[Any]] = []
+        for idx, node_id in enumerate(sorted(new_nodes), 1):
+            record = db_nodes[node_id]
+            current = record.get("current", {})
+            new_rows.append([
+                idx,
+                node_id,
+                current.get("user"),
+                current.get("aka"),
+                current.get("hardware"),
+                current.get("role"),
+                record.get("last_seen_utc"),
+                current.get("last_heard"),
+                current.get("since"),
+            ])
+        for line in format_table(
+            ["#", "ID", "User", "AKA", "HW", "Role", "Last Seen (UTC)", "Last Heard", "Since"],
+            new_rows,
+        ):
+            print(line)
+
     # Report changes
     if changed_nodes:
         print("\n[CHANGES]")
@@ -858,14 +899,23 @@ def main() -> int:
             current = db_nodes[node_id]["current"]
             name = current.get("user")
             aka = current.get("aka")
+            last_seen = db_nodes[node_id].get("last_seen_utc")
+            last_heard = current.get("last_heard")
             
             header = f"  * {node_id}"
             if name or aka:
                 header += f" ({name or ''}{' / ' if (name and aka) else ''}{aka or ''})"
-            print(header)
+            print(f"{header}  last_seen_utc={last_seen!r}  last_heard={last_heard!r}")
             
+            change_rows: List[List[Any]] = []
             for field, change_info in changes.items():
-                print(f"      - {field}: {change_info.get('from')!r} → {change_info.get('to')!r}")
+                change_rows.append([
+                    field,
+                    change_info.get("from"),
+                    change_info.get("to"),
+                ])
+            for line in format_table(["Field", "From", "To"], change_rows):
+                print(line)
         
         print("\n[CHANGE COUNTS]")
         print(f"  User renamed:       {rename_count}")
@@ -875,21 +925,24 @@ def main() -> int:
         print(f"  Pubkey changed:     {pubkey_count}")
     
     print("\n[NODES]")
-    for node_id in sorted(db_nodes.keys()):
+    node_rows: List[List[Any]] = []
+    for idx, node_id in enumerate(sorted(db_nodes.keys()), 1):
         record = db_nodes[node_id]
         current = record.get("current", {})
-        name = current.get("user")
-        aka = current.get("aka")
-        last_seen_utc = record.get("last_seen_utc")
-        last_heard = current.get("last_heard")
-        label = f"{name or ''}{' / ' if (name and aka) else ''}{aka or ''}".strip()
-        if label:
-            label = f" ({label})"
-        print(
-            f"  - {node_id}{label}  "
-            f"last_seen_utc={last_seen_utc!r}  "
-            f"last_heard={last_heard!r}"
-        )
+        node_rows.append([
+            idx,
+            node_id,
+            current.get("user"),
+            current.get("aka"),
+            record.get("last_seen_utc"),
+            current.get("last_heard"),
+            current.get("since"),
+        ])
+    for line in format_table(
+        ["#", "ID", "User", "AKA", "Last Seen (UTC)", "Last Heard", "Since"],
+        node_rows,
+    ):
+        print(line)
     
     return 0
 

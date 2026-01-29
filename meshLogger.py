@@ -193,6 +193,9 @@ def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
                         return nodes
             except Exception:
                 pass
+        nodes_block = _extract_nodes_block_from_text(t_clean)
+        if nodes_block is not None:
+            return nodes_block
 
     m = re.search(r"Nodes\s+in\s+mesh\s*:\s*", t)
     if not m:
@@ -228,6 +231,23 @@ def _extract_nodes_from_info_json(parsed: dict) -> Optional[Dict[str, dict]]:
                 nodes = nested.get(nested_key)
                 if isinstance(nodes, dict):
                     return nodes
+    return None
+
+
+def _extract_nodes_block_from_text(text: str) -> Optional[Dict[str, dict]]:
+    m = re.search(r'"nodes"\s*:\s*{', text)
+    if not m:
+        return None
+    block = extract_balanced_braces(text, m.start())
+    if not block:
+        return None
+    try:
+        import json
+        parsed = json.loads(block)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
     return None
 
 
