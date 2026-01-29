@@ -169,6 +169,31 @@ def extract_balanced_braces(text: str, start_idx: int) -> Optional[str]:
 
 def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
     t = clean_ansi(mesh_info_text)
+    t_lines = [line for line in t.splitlines() if line.strip() and line.strip() != "Connected to radio"]
+    t_clean = "\n".join(t_lines).strip()
+    if t_clean:
+        try:
+            import json
+            parsed = json.loads(t_clean)
+            if isinstance(parsed, dict):
+                nodes = _extract_nodes_from_info_json(parsed)
+                if nodes is not None:
+                    return nodes
+        except Exception:
+            pass
+
+        block = extract_balanced_braces(t_clean, 0)
+        if block:
+            try:
+                import json
+                parsed = json.loads(block)
+                if isinstance(parsed, dict):
+                    nodes = _extract_nodes_from_info_json(parsed)
+                    if nodes is not None:
+                        return nodes
+            except Exception:
+                pass
+
     m = re.search(r"Nodes\s+in\s+mesh\s*:\s*", t)
     if not m:
         raise RuntimeError("cannot parse nodes (missing Nodes in mesh block)")
@@ -188,6 +213,22 @@ def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
         if isinstance(nodes, dict):
             return nodes
         raise RuntimeError("nodes block is not a dict")
+
+
+def _extract_nodes_from_info_json(parsed: dict) -> Optional[Dict[str, dict]]:
+    candidate_keys = ("nodes", "Nodes", "nodesById")
+    for key in candidate_keys:
+        nodes = parsed.get(key)
+        if isinstance(nodes, dict):
+            return nodes
+    for key in ("mesh", "meshInfo", "info"):
+        nested = parsed.get(key)
+        if isinstance(nested, dict):
+            for nested_key in candidate_keys:
+                nodes = nested.get(nested_key)
+                if isinstance(nodes, dict):
+                    return nodes
+    return None
 
 
 def parse_my_node_num(mesh_info_text: str) -> Optional[int]:

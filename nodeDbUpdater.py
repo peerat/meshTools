@@ -459,11 +459,7 @@ TRACKED_FIELDS = [
     ("position.alt_m", "position.alt_m"),
     ("battery.state", "battery.state"),
     ("battery.percent", "battery.percent"),
-    ("channel_util_pct", "channel_util_pct"),
-    ("tx_air_util_pct", "tx_air_util_pct"),
     ("snr_db", "snr_db"),
-    ("hops", "hops"),
-    ("channel_index", "channel_index"),
 ]
 
 
@@ -797,7 +793,6 @@ def main() -> int:
     role_count = 0
     hardware_count = 0
     pubkey_count = 0
-    util_count = 0
     
     seen_node_ids = set()
     
@@ -826,8 +821,6 @@ def main() -> int:
                 hardware_count += 1
             if "pubkey" in changes:
                 pubkey_count += 1
-            if "channel_util_pct" in changes or "tx_air_util_pct" in changes:
-                util_count += 1
     
     # Record run statistics
     db["meta"]["last_run_stats"] = {
@@ -880,19 +873,23 @@ def main() -> int:
         print(f"  Role changed:       {role_count}")
         print(f"  Hardware changed:   {hardware_count}")
         print(f"  Pubkey changed:     {pubkey_count}")
-        print(f"  Utilization changed: {util_count} (channel_util_pct / tx_air_util_pct)")
     
-    # Sanity check for utilization data
-    missing_util_count = 0
-    for node_id in seen_node_ids:
-        current = db_nodes[node_id]["current"]
-        if current.get("channel_util_pct") is None and current.get("tx_air_util_pct") is None:
-            missing_util_count += 1
-    
-    print(
-        f"\n[SANITY] Utilization data missing for {missing_util_count}/{len(seen_node_ids)} nodes "
-        f"(normal if nodes report N/A)"
-    )
+    print("\n[NODES]")
+    for node_id in sorted(db_nodes.keys()):
+        record = db_nodes[node_id]
+        current = record.get("current", {})
+        name = current.get("user")
+        aka = current.get("aka")
+        last_seen_utc = record.get("last_seen_utc")
+        last_heard = current.get("last_heard")
+        label = f"{name or ''}{' / ' if (name and aka) else ''}{aka or ''}".strip()
+        if label:
+            label = f" ({label})"
+        print(
+            f"  - {node_id}{label}  "
+            f"last_seen_utc={last_seen_utc!r}  "
+            f"last_heard={last_heard!r}"
+        )
     
     return 0
 
