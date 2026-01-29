@@ -169,6 +169,34 @@ def extract_balanced_braces(text: str, start_idx: int) -> Optional[str]:
 
 def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
     t = clean_ansi(mesh_info_text)
+    t_lines = [line for line in t.splitlines() if line.strip() and line.strip() != "Connected to radio"]
+    t_clean = "\n".join(t_lines).strip()
+    if t_clean:
+        try:
+            import json
+            parsed = json.loads(t_clean)
+            if isinstance(parsed, dict):
+                nodes = _extract_nodes_from_info_json(parsed)
+                if nodes is not None:
+                    return nodes
+        except Exception:
+            pass
+
+        block = extract_balanced_braces(t_clean, 0)
+        if block:
+            try:
+                import json
+                parsed = json.loads(block)
+                if isinstance(parsed, dict):
+                    nodes = _extract_nodes_from_info_json(parsed)
+                    if nodes is not None:
+                        return nodes
+            except Exception:
+                pass
+        nodes_block = _extract_nodes_block_from_text(t_clean)
+        if nodes_block is not None:
+            return nodes_block
+
     m = re.search(r"Nodes\s+in\s+mesh\s*:\s*", t)
     if not m:
         raise RuntimeError("cannot parse nodes (missing Nodes in mesh block)")
@@ -188,6 +216,39 @@ def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
         if isinstance(nodes, dict):
             return nodes
         raise RuntimeError("nodes block is not a dict")
+
+
+def _extract_nodes_from_info_json(parsed: dict) -> Optional[Dict[str, dict]]:
+    candidate_keys = ("nodes", "Nodes", "nodesById")
+    for key in candidate_keys:
+        nodes = parsed.get(key)
+        if isinstance(nodes, dict):
+            return nodes
+    for key in ("mesh", "meshInfo", "info"):
+        nested = parsed.get(key)
+        if isinstance(nested, dict):
+            for nested_key in candidate_keys:
+                nodes = nested.get(nested_key)
+                if isinstance(nodes, dict):
+                    return nodes
+    return None
+
+
+def _extract_nodes_block_from_text(text: str) -> Optional[Dict[str, dict]]:
+    m = re.search(r'"nodes"\s*:\s*{', text)
+    if not m:
+        return None
+    block = extract_balanced_braces(text, m.start())
+    if not block:
+        return None
+    try:
+        import json
+        parsed = json.loads(block)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return None
 
 
 def parse_my_node_num(mesh_info_text: str) -> Optional[int]:
@@ -611,10 +672,26 @@ def main() -> int:
             active0 = filter_hops(active0, args.minhops, args.maxhops)
             return active0
 
-        rc, so, se = run_cmd(["meshtastic", "--port", args.port, "--info"], timeout=max(60, args.timeout + 15))
-        mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
+        mesh_info_text = ""
+        parse_error: Optional[Exception] = None
+        for extra_args in (["--format", "json"], ["--json"], []):
+            rc, so, se = run_cmd(
+                ["meshtastic", "--port", args.port, "--info"] + extra_args,
+                timeout=max(60, args.timeout + 15),
+            )
+            mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
+            try:
+                nodes = parse_nodes_block(mesh_info_text)
+                parse_error = None
+                break
+            except Exception as ex:
+                parse_error = ex
+                nodes = {}
+                continue
 
-        nodes = parse_nodes_block(mesh_info_text)
+        if parse_error is not None:
+            raise parse_error
+
         self_id = detect_self_id(mesh_info_text, nodes)
         self_long, self_short = node_names(nodes, self_id)
 
