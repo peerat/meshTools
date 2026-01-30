@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-graphGen.py — Meshtastic traces → Graphviz DOT/SVG/JPG generator (chatty terminal output)
+graphGen.py — генератор графов Graphviz DOT/SVG/JPG по трассам Meshtastic (болтливый вывод в терминал)
 
-Version: 0.7.9
-Date: 2026-01-25
+Версия: 0.7.9
+Дата: 2026-01-25
 
-CHANGELOG:
+ИСТОРИЯ ИЗМЕНЕНИЙ:
 0.7.9 (2026-01-25)
-  - --datetime window filter now uses timestamps STRICTLY from the beginning of EACH TRACE LINE
-    inside the file (NOT filename, NOT file mtime/ctime).
-  - Edge thickness scaling changed to RELATIVE normalization per current selection:
-      max confirmations => 100% => maxwidthline
-      others => proportional between minwidthline..maxwidthline
-    Added: --minwidthline / --maxwidthline (defaults 1..30).
-  - JPG DPI default set to 75.
-  - SVG post-process enforced: width="8000pt" height="4500pt".
+  - Фильтр окна --datetime теперь берёт временные метки СТРОГО с начала КАЖДОЙ СТРОКИ ТРАССЫ
+    внутри файла (НЕ из имени файла и НЕ из mtime/ctime).
+  - Толщина рёбер теперь нормализуется ОТНОСИТЕЛЬНО текущей выборки:
+      максимум подтверждений => 100% => maxwidthline
+      остальные => пропорционально между minwidthline..maxwidthline
+    Добавлено: --minwidthline / --maxwidthline (по умолчанию 1..30).
+  - JPG DPI по умолчанию установлен на 75.
+  - Постобработка SVG: width="8000pt" height="4500pt".
 
 0.7.5 (2026-01-19)
-  - Unknown node excluded by default (acts like it doesn't exist):
-      * drops all edges adjacent to Unknown (!ffffffff)
-      * does NOT "bridge" A->B across Unknown
-      * removes Unknown from routing/transit stats
-    Use --include-unknown to revert to old behavior.
-  - Terminal output reports how many edges were dropped due to Unknown.
-  - Output basename auto-format: "YYYY-MM-DD HH:MM:SS !<measurer_id>"
-  - Auto measurer id detection from filenames; DOT+SVG+JPG by default
+  - Узел Unknown по умолчанию исключён (считаем, что его нет):
+      * удаляются все рёбра, смежные с Unknown (!ffffffff)
+      * НЕ выполняется "мост" A->B через Unknown
+      * Unknown исключён из статистики маршрутизации/транзита
+    Флаг --include-unknown возвращает старое поведение.
+  - В терминале выводится, сколько рёбер отброшено из-за Unknown.
+  - Имя выходных файлов по шаблону: "YYYY-MM-DD HH:MM:SS !<measurer_id>"
+  - Автоопределение measurer id по именам файлов; DOT+SVG+JPG по умолчанию
 
-IMPORTANT FIXED PATHS (as per your setup):
-  - traces folder:   <root>/meshLogger
-  - output folder:   <root>/graphGen
-  - nodeDb search:   1) cwd, 2) script dir, 3) home
+ВАЖНЫЕ ПУТИ:
+  - папка трасс:     <root>/meshLogger
+  - папка вывода:    <root>/graphGen
+  - поиск nodeDb:    1) root, 2) папка скрипта, 3) домашняя папка
 
-Trace filename pattern expected in <root>/meshLogger:
+Ожидаемый шаблон имени файлов трасс в <root>/meshLogger:
   'YYYY-MM-DD !xxxxxxxx*.txt'
 """
 
@@ -68,15 +68,15 @@ ROLE_COLORS = {
     "UNKNOWN": "#e0e0e0",
 }
 
-# hop parsing in trace lines
+# разбор hop в строках трассировки
 NODE_RE = re.compile(r"(![0-9a-fA-F]{8}|Unknown)")
 DB_RE = re.compile(r"\((-?\d+(?:\.\d+)?|\?)dB\)")
 
-# filename measurer-id detection
+# извлечение measurer-id из имени файла
 TRACE_NAME_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+(![0-9a-fA-F]{8})", re.I)
 
-# timestamp at beginning of each trace line (we filter by THIS, only)
-# Accept:
+# временная метка в начале каждой строки трассы (фильтруем ТОЛЬКО по ней)
+# Принимаем:
 #   2026-01-24 16:30:12 ...
 #   2026-01-24 16:30 ...
 LINE_TS_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})(?:[ T]+(\d{2}:\d{2})(?::(\d{2}))?)?")
@@ -163,33 +163,31 @@ def find_latest_file(patterns: List[str], root: Path) -> Optional[Path]:
     return cand[0]
 
 
-def fixed_paths() -> Tuple[Path, Path, List[Path]]:
+def fixed_paths(root: Path) -> Tuple[Path, Path, List[Path]]:
     """
-    root = cwd (where you run it) OR script dir (same in your case ~/meshTools)
-    We follow your 'fixed' layout:
-      traces:  <root>/meshLogger
-      output:  <root>/graphGen
-      nodeDb:  search order: cwd, script dir, home
+    root = cwd (где запускаете) ИЛИ папка скрипта (в вашем случае ~/meshTools)
+    Используем фиксированный расклад:
+      трассы:  <root>/meshLogger
+      вывод:   <root>/graphGen
+      nodeDb:  порядок поиска: root, папка скрипта, домашняя папка
     """
     cwd = Path.cwd().resolve()
     script_dir = Path(__file__).resolve().parent
     home = Path.home().resolve()
 
-    # In your usage, you run inside ~/meshTools, and script is in same dir.
-    # We'll take root as cwd to keep current behaviour.
-    root = cwd
-
+    # В вашем сценарии запуск из ~/meshTools и скрипт там же.
+    # Берём root как cwd, чтобы сохранить текущее поведение.
     trace_root = root / "meshLogger"
     out_dir = root / "graphGen"
-    node_search = [cwd, script_dir, home]
+    node_search = [root, script_dir, home]
     return trace_root, out_dir, node_search
 
 
 def find_trace_files(trace_root: Path) -> List[Path]:
     """
-    Only pattern requested:
+    Единственный ожидаемый шаблон:
       'YYYY-MM-DD !xxxxxxxx*.txt'
-    Inside fixed folder: <root>/meshLogger
+    Внутри фиксированной папки: <root>/meshLogger
     """
     files = set()
     for p in trace_root.glob("20??-??-?? !*.txt"):
@@ -287,12 +285,12 @@ def build_auto_out(measurer_id: str) -> str:
 
 def parse_line_ts(line: str) -> Optional[datetime]:
     """
-    Parse timestamp STRICTLY from the beginning of the line.
-    Accept:
+    Парсинг временной метки СТРОГО с начала строки.
+    Допустимые форматы:
       YYYY-MM-DD
       YYYY-MM-DD HH:MM
       YYYY-MM-DD HH:MM:SS
-    If only date => time 00:00:00.
+    Если только дата — время 00:00:00.
     """
     m = LINE_TS_RE.match(line)
     if not m:
@@ -318,19 +316,19 @@ def parse_line_ts(line: str) -> Optional[datetime]:
 
 def parse_datetime_point(s: str) -> Tuple[datetime, bool]:
     """
-    Parse a single endpoint.
-    Returns (dt, has_time).
-    has_time=True if string included HH:MM (with optional :SS).
+    Парсинг одного конца интервала.
+    Возвращает (dt, has_time).
+    has_time=True, если строка содержит HH:MM (и опционально :SS).
     """
     s = (s or "").strip()
-    # try full
+    # пробуем полные форматы
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(s, fmt)
             return dt, True
         except Exception:
             pass
-    # date-only
+    # только дата
     try:
         dt = datetime.strptime(s, "%Y-%m-%d")
         return dt, False
@@ -340,12 +338,12 @@ def parse_datetime_point(s: str) -> Tuple[datetime, bool]:
 
 def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
     """
-    --datetime supports:
+    --datetime поддерживает:
       'YYYY-MM-DD'
       'YYYY-MM-DD - YYYY-MM-DD'
       'YYYY-MM-DD HH:MM - YYYY-MM-DD HH:MM'
       'YYYY-MM-DD HH:MM:SS - YYYY-MM-DD HH:MM:SS'
-    Split ONLY by ' - ' (space-hyphen-space) to avoid breaking dates.
+    Разбиваем ТОЛЬКО по ' - ' (пробел-дефис-пробел), чтобы не ломать даты.
     """
     expr = (expr or "").strip()
     if not expr:
@@ -356,11 +354,11 @@ def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
         a_dt, a_has_time = parse_datetime_point(a_str)
         b_dt, b_has_time = parse_datetime_point(b_str)
 
-        # If end is date-only => end of that day
+        # Если конец — только дата, берём конец дня
         if not b_has_time:
             b_dt = b_dt + timedelta(days=1) - timedelta(seconds=1)
 
-        # If start is date-only => start of day already ok
+        # Если начало — только дата, это уже начало дня
         if not a_has_time:
             a_dt = a_dt.replace(hour=0, minute=0, second=0)
 
@@ -368,12 +366,12 @@ def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
             raise ValueError("bad --datetime format")
         return a_dt, b_dt
 
-    # single endpoint:
+    # одиночная точка:
     a_dt, a_has_time = parse_datetime_point(expr)
     if a_has_time:
-        # exact minute/second point => treat as [dt .. dt] (single moment)
+        # точная минута/секунда => считаем [dt .. dt] (один момент)
         return a_dt, a_dt
-    # date-only => full day
+    # только дата => весь день
     b_dt = a_dt + timedelta(days=1) - timedelta(seconds=1)
     return a_dt, b_dt
 
@@ -396,11 +394,11 @@ class TraceFileStats:
 
 def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]], Optional[Path], Dict[str, Any]]:
     """
-    Robust nodeDb parser:
-    - First try Meshtastic JSON export shape: nodes -> {id: {current:{user:{longName, shortName, role}, ...}}}
-    - If missing, also support nodeDb where current.raw_nodes_row holds keys:
-        User / AKA / Role / Channel util.
-      (this matches your provided nodeDb.txt)
+    Надёжный парсер nodeDb:
+    - Сначала пробуем формат экспорта Meshtastic JSON: nodes -> {id: {current:{user:{longName, shortName, role}, ...}}}
+    - Если нет, поддерживаем nodeDb, где current.raw_nodes_row содержит ключи:
+        ключи User / AKA / Role / Channel util.
+      (это соответствует вашему nodeDb.txt)
     """
     node_meta: Dict[str, Dict[str, Any]] = {}
     debug = {"nodeDb_nodes_loaded": 0, "nodeDb_nodes_with_longName": 0}
@@ -412,7 +410,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
             nodedb_path = cand
             break
     if nodedb_path is None:
-        # fallback by patterns if needed
+        # запасной поиск по шаблонам
         for base in node_search:
             cand = find_latest_file(["nodeDb*.txt", "nodeDb*.TXT"], base)
             if cand:
@@ -432,7 +430,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                 role = ""
                 ch_util = None
 
-                # Path A: current.user is dict
+                # Вариант A: current.user — словарь
                 user = cur.get("user")
                 if isinstance(user, dict):
                     long_name = user.get("longName") or ""
@@ -440,19 +438,19 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                     if user.get("role"):
                         role = (user.get("role") or "").upper()
 
-                # Path B: nodeDb like yours: current.raw_nodes_row is dict
+                # Вариант B: nodeDb как у вас: current.raw_nodes_row — словарь
                 raw = cur.get("raw_nodes_row")
                 if isinstance(raw, dict):
-                    # 'User' is the long visible name in your export
+                    # 'User' — длинное имя из вашего экспорта
                     if not long_name and isinstance(raw.get("User"), str):
                         long_name = raw.get("User") or ""
-                    # 'AKA' often holds short tag
+                    # 'AKA' часто содержит короткий тег
                     if not short_name and isinstance(raw.get("AKA"), str):
                         short_name = raw.get("AKA") or ""
-                    # Role
+                    # Роль
                     if not role and isinstance(raw.get("Role"), str):
                         role = (raw.get("Role") or "").upper()
-                    # Channel util.
+                    # Утилизация канала.
                     for k in ("Channel util.", "Channel util", "channel util.", "channel util"):
                         v = raw.get(k)
                         if isinstance(v, (int, float)):
@@ -467,7 +465,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                                 except Exception:
                                     pass
 
-                # Path C: current.aka or current.user string as last resort
+                # Вариант C: current.aka или current.user (строка) как последний шанс
                 aka = cur.get("aka")
                 if isinstance(aka, str) and not short_name:
                     short_name = aka
@@ -504,19 +502,19 @@ def parse_traces_with_stats(
     List[Path],
 ]:
     """
-    Main parser:
-      - Reads each file line-by-line
-      - If dt_window is set: uses timestamp parsed from LINE START only
-        (lines without timestamp are ignored for window filtering; they won't count)
-      - Builds:
-          edge_count (directed confirmations)
-          edge_rssi   (list of RSSI per directed link)
-          transit_count (nodes appearing as transit, excluding Unknown unless included)
-      - Drops edges adjacent to Unknown when Unknown excluded
-    Also returns:
-      per-file stats
-      debug counters
-      selected_files (files which had >=1 trace line in window, if window active)
+    Основной парсер:
+      - Читает каждый файл построчно
+      - Если задан dt_window: используется метка времени ТОЛЬКО из НАЧАЛА СТРОКИ
+        (строки без метки игнорируются при фильтрации окна; в статистику не идут)
+      - Строит:
+          edge_count (направленные подтверждения)
+          edge_rssi   (список RSSI для направленной связи)
+          transit_count (узлы-транзиты, без Unknown если он исключён)
+      - Удаляет рёбра, смежные с Unknown, когда Unknown исключён
+    Также возвращает:
+      статистику по файлам
+      отладочные счётчики
+      selected_files (файлы, где >=1 строка попала в окно, если окно активно)
     """
     edge_count: Dict[Tuple[str, str], int] = defaultdict(int)
     edge_rssi: Dict[Tuple[str, str], List[float]] = defaultdict(list)
@@ -547,7 +545,7 @@ def parse_traces_with_stats(
         lines_in_window = 0
 
         for line in lines:
-            # window filter uses timestamp from line start ONLY
+            # фильтр окна использует метку времени ТОЛЬКО с начала строки
             if w_start and w_end:
                 ts = parse_line_ts(line)
                 if ts is None:
@@ -576,12 +574,12 @@ def parse_traces_with_stats(
             for n in seq:
                 unique_nodes_in_file.add(n)
 
-            # transit stats (exclude Unknown unless explicitly included)
+            # статистика транзита (Unknown исключаем, если явно не включён)
             for n in seq[1:-1]:
                 if include_unknown or n != UNKNOWN_ID:
                     transit_count[n] += 1
 
-            # RSSI samples extraction
+            # извлечение выборок RSSI
             dbs: List[Optional[float]] = []
             for mdb in DB_RE.finditer(line):
                 v = mdb.group(1)
@@ -597,7 +595,7 @@ def parse_traces_with_stats(
                     hop += 1
                     continue
 
-                # drop edges adjacent to Unknown if Unknown is excluded
+                # удаляем рёбра, смежные с Unknown, если Unknown исключён
                 if (not include_unknown) and (a == UNKNOWN_ID or b == UNKNOWN_ID):
                     dropped_unknown_edges += 1
                     if hop < len(dbs) and dbs[hop] is not None:
@@ -613,7 +611,7 @@ def parse_traces_with_stats(
                     edge_rssi[(a, b)].append(float(dbs[hop]))
                 hop += 1
 
-        # If window active: select file only if it had >=1 line_in_window
+        # Если окно активно: выбираем файл только если есть >=1 строка в окне
         if w_start and w_end:
             if lines_in_window > 0:
                 selected_files.append(tf)
@@ -655,15 +653,15 @@ def render_jpg(dot_path: Path, jpg_path: Path, dpi: int) -> None:
 
 def enforce_svg_size(svg_path: Path, width_pt: str = "8000pt", height_pt: str = "4500pt") -> None:
     """
-    Post-process SVG root element to enforce requested width/height.
+    Постобработка корневого SVG-элемента, чтобы задать нужные ширину/высоту.
     """
     s = svg_path.read_text(errors="ignore")
-    # Replace width="...pt" and height="...pt" in the <svg ...> tag
-    # Keep it minimal and deterministic.
+    # Заменяем width="...pt" и height="...pt" в теге <svg ...>
+    # Делаем минимально и детерминированно.
     s2 = re.sub(r'(<svg\b[^>]*?)\swidth="[^"]*"', r'\1 width="' + width_pt + '"', s, count=1)
     s2 = re.sub(r'(<svg\b[^>]*?)\sheight="[^"]*"', r'\1 height="' + height_pt + '"', s2, count=1)
 
-    # If width/height absent for some reason, inject after <svg
+    # Если width/height отсутствуют, вставляем после <svg
     if s2 == s:
         s2 = re.sub(r"<svg\b", f'<svg width="{width_pt}" height="{height_pt}"', s, count=1)
 
@@ -673,7 +671,7 @@ def enforce_svg_size(svg_path: Path, width_pt: str = "8000pt", height_pt: str = 
 def main() -> int:
     ap = argparse.ArgumentParser(description="graphGen.py: build Meshtastic graph (DOT+SVG+JPG) from trace files.")
 
-    # Keep existing args (as you used)
+    # Сохраняем существующие аргументы (как у вас)
     ap.add_argument("--root", default=".", help="Directory with input files (default: current).")
     ap.add_argument("--min-edge", type=int, default=3, help="Minimum confirmations to keep a directed link (default: 3).")
     ap.add_argument("--rankdir", default="LR", choices=["LR", "TB", "RL", "BT"], help="Graphviz rankdir (default: LR).")
@@ -685,7 +683,7 @@ def main() -> int:
     )
     ap.add_argument("--top", type=int, default=15, help="Top N lines in summary lists (default: 15).")
 
-    # Your time window option
+    # Опция временного окна
     ap.add_argument(
         "--datetime",
         default=None,
@@ -696,7 +694,7 @@ def main() -> int:
         ),
     )
 
-    # Only thickness scaling change (relative range)
+    # Изменение только для толщины рёбер (относительная шкала)
     ap.add_argument(
         "--minwidthline",
         type=float,
@@ -713,10 +711,8 @@ def main() -> int:
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
 
-    # Fixed paths
-    trace_root, out_dir, node_search = fixed_paths()
-
-    root = Path(args.root).resolve()  # printed only (kept as before)
+    root = Path(args.root).resolve()
+    trace_root, out_dir, node_search = fixed_paths(root)
     include_unknown = bool(args.include_unknown)
 
     print(f"graphGen.py version {__version__}")
@@ -747,7 +743,7 @@ def main() -> int:
 
     node_meta, nodedb_path, meta_debug = build_node_meta(node_search)
 
-    # --datetime window parse
+    # Разбор окна --datetime
     dt_window: Optional[Tuple[datetime, datetime]] = None
     if args.datetime is not None:
         try:
@@ -761,7 +757,7 @@ def main() -> int:
         print(f"  expr: '{args.datetime}'")
         print(f"  window: {w_start.strftime('%Y-%m-%d %H:%M:%S')} - {w_end.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"  traces in folder: {len(trace_files)}")
-        # selection will be known after parse
+        # выборка будет известна после парсинга
         print("")
 
     edge_count, edge_rssi, transit_count, per_file_stats, parse_debug, selected_files = parse_traces_with_stats(
@@ -818,7 +814,7 @@ def main() -> int:
     print("")
 
     print("trace log files summary:")
-    # print stats only for files; show window hit counts if window used
+    # печатаем статистику по файлам; при окне показываем попадания
     for st in per_file_stats:
         print(st.path)
         print(f"  size: {human_bytes(st.size_bytes)} | mtime: {st.mtime_iso} | sig: {st.sha1sig[:12]}…")
@@ -833,7 +829,7 @@ def main() -> int:
         print(f"  unknown mentions: {st.unknown_mentions}")
         print("")
 
-    # filter edges by confirmation count
+    # фильтруем рёбра по числу подтверждений
     edge_count_f = {
         k: v
         for k, v in edge_count.items()
@@ -841,7 +837,7 @@ def main() -> int:
         and (include_unknown or (k[0] != UNKNOWN_ID and k[1] != UNKNOWN_ID))
     }
 
-    # build neighbors (unique visible)
+    # строим соседей (уникальные видимые)
     neighbors: Dict[str, set] = defaultdict(set)
     for (a, b), _c in edge_count_f.items():
         neighbors[a].add(b)
@@ -855,7 +851,7 @@ def main() -> int:
     deg_u = {n: len(neighbors[n]) for n in nodes}
     vmax_neighbors = max(deg_u.values()) if deg_u else 1
 
-    # routing percent based on transit_count limited to kept nodes
+    # процент маршрутизации по transit_count, ограниченный сохранёнными узлами
     total_transit = 0
     for n, c in transit_count.items():
         if n in nodes:
@@ -863,7 +859,7 @@ def main() -> int:
     total_transit = total_transit or 1
     routing_pct = {n: (transit_count.get(n, 0) / total_transit) * 100.0 for n in nodes}
 
-    # rssi global min/max from kept edges only
+    # глобальные min/max RSSI только по сохранённым рёбрам
     all_rssi_vals: List[float] = []
     missing_rssi_edges = 0
     for (a, b), _cnt in edge_count_f.items():
@@ -874,19 +870,19 @@ def main() -> int:
             missing_rssi_edges += 1
     vmin, vmax = (min(all_rssi_vals), max(all_rssi_vals)) if all_rssi_vals else (-25.0, 5.0)
 
-    # EDGE THICKNESS (RELATIVE) — единственное изменение алгоритма толщины:
-    # max confirmations in THIS run => 100% => maxwidthline
+    # ТОЛЩИНА РЁБЕР (ОТНОСИТЕЛЬНО) — единственное изменение алгоритма толщины:
+    # максимум подтверждений В ЭТОМ запуске => 100% => maxwidthline
     max_conf = max(edge_count_f.values()) if edge_count_f else 1
     min_w = float(args.minwidthline)
     max_w = float(args.maxwidthline)
     if max_w < min_w:
-        # keep deterministic behaviour, but do not change other parts
+        # сохраняем детерминированность, не трогая остальное
         max_w, min_w = min_w, max_w
 
     def penwidth_from_count_relative(cnt: int) -> float:
         if max_conf <= 0:
             return round(min_w, 2)
-        t = cnt / float(max_conf)  # 0..1
+        t = cnt / float(max_conf)  # от 0 до 1
         w = min_w + t * (max_w - min_w)
         return round(w, 2)
 
@@ -923,7 +919,7 @@ def main() -> int:
         print(f"  {transit_count.get(n,0):>5}  {pct:>5.1f}%  {pretty_name(n)}")
     print("")
 
-    # DOT build
+    # сборка DOT
     dot_lines: List[str] = []
     dot_lines.append("digraph Meshtastic {")
     dot_lines.append(f'  graph [rankdir={args.rankdir}, bgcolor="black", nodesep=0.55, ranksep=0.90];')
@@ -966,7 +962,7 @@ def main() -> int:
         avg = (sum(vals) / len(vals)) if vals else None
         color = grad_rssi(avg, vmin, vmax)
 
-        # ONLY thickness formula changed here:
+        # ТОЛЬКО здесь меняется формула толщины:
         pw = penwidth_from_count_relative(cnt)
 
         dot_lines.append(f'  "{a}" -> "{b}" [penwidth={pw}, color="{color}"];')

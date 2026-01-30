@@ -3,16 +3,16 @@
 """
 node_db_update.py
 
-One-shot Meshtastic node database updater with cumulative JSON storage.
+Одноразовый обновитель базы узлов Meshtastic с накопительным JSON‑хранилищем.
 
-Features:
-- Captures channel utilization and TX air utilization from --nodes output
-- Stores complete --info output in database
-- Maintains per-node raw snapshots from parsed --nodes data
-- Tracks changes in node properties over time
-- Reports new nodes and property changes
+Возможности:
+- Снимает channel utilization и TX air utilization из вывода --nodes
+- Сохраняет полный вывод --info в базе
+- Хранит сырой снимок по каждому узлу из парсинга --nodes
+- Отслеживает изменения свойств узлов со временем
+- Печатает новые узлы и изменения свойств
 
-Usage:
+Использование:
     python node_db_update.py --port /dev/ttyUSB0 --db nodeDb.txt
 """
 
@@ -30,24 +30,24 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ==============================================================================
-# Utility Functions
+# Вспомогательные функции
 # ==============================================================================
 
 def iso_now() -> str:
-    """Return current UTC time in ISO format."""
+    """Вернуть текущее время UTC в формате ISO."""
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def run_cmd(cmd: List[str], timeout: int) -> Tuple[int, str, str]:
     """
-    Execute command and return (returncode, stdout, stderr).
-    
-    Args:
-        cmd: Command and arguments as list
-        timeout: Maximum execution time in seconds
-        
-    Returns:
-        Tuple of (return_code, stdout, stderr)
+    Выполнить команду и вернуть (returncode, stdout, stderr).
+
+    Аргументы:
+        cmd: Команда и аргументы списком
+        timeout: Максимальное время выполнения в секундах
+
+    Возвращает:
+        Кортеж (return_code, stdout, stderr)
     """
     proc = subprocess.run(
         cmd,
@@ -61,11 +61,11 @@ def run_cmd(cmd: List[str], timeout: int) -> Tuple[int, str, str]:
 
 def atomic_write_text(path: str, data: str) -> None:
     """
-    Atomically write text data to file using temp file and rename.
-    
-    Args:
-        path: Destination file path
-        data: Text content to write
+    Атомарно записать текст в файл через временный файл и переименование.
+
+    Аргументы:
+        path: Путь назначения
+        data: Текст для записи
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
@@ -91,7 +91,7 @@ def atomic_write_text(path: str, data: str) -> None:
 
 
 def safe_float(value: Any) -> Optional[float]:
-    """Safely convert value to float, return None on error."""
+    """Безопасно преобразовать значение в float, при ошибке вернуть None."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -99,7 +99,7 @@ def safe_float(value: Any) -> Optional[float]:
 
 
 def safe_int(value: Any) -> Optional[int]:
-    """Safely convert value to int, return None on error."""
+    """Безопасно преобразовать значение в int, при ошибке вернуть None."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -108,21 +108,21 @@ def safe_int(value: Any) -> Optional[int]:
 
 def try_parse_json(stdout: str) -> Optional[Any]:
     """
-    Attempt to parse JSON from command output.
-    
-    Strips common preface lines like "Connected to radio" before parsing.
-    
-    Args:
-        stdout: Raw command output
-        
-    Returns:
-        Parsed JSON object or None if parsing fails
+    Попытаться распарсить JSON из вывода команды.
+
+    Перед парсингом удаляет типовые префиксы вроде "Connected to radio".
+
+    Аргументы:
+        stdout: Сырой вывод команды
+
+    Возвращает:
+        Распарсенный JSON-объект или None при ошибке
     """
     text = stdout.strip()
     if not text:
         return None
     
-    # Remove known preface lines
+    # Удаляем известные префиксные строки
     lines = [
         line for line in text.splitlines()
         if line.strip() and line.strip() != "Connected to radio"
@@ -139,7 +139,7 @@ def try_parse_json(stdout: str) -> Optional[Any]:
 
 
 # ==============================================================================
-# ASCII Table Parsing
+# Парсинг ASCII-таблицы
 # ==============================================================================
 
 BOX_ROW_RE = re.compile(r"^\s*│")
@@ -147,23 +147,23 @@ DATA_ROW_START_RE = re.compile(r"^\s*│\s*\d+\s*│")
 
 
 def split_box_row(line: str) -> List[str]:
-    """Split ASCII table row by │ delimiter and strip whitespace."""
+    """Разбить строку ASCII-таблицы по разделителю │ и обрезать пробелы."""
     parts = [part.strip() for part in line.strip().strip("│").split("│")]
     return parts
 
 
 def parse_nodes_table(stdout: str) -> List[Dict[str, Any]]:
     """
-    Parse ASCII box-drawing table from --nodes output.
-    
-    Returns list of row dicts with column headers as keys, plus special
-    "__cols__" key containing the column names in order.
-    
-    Args:
-        stdout: Raw --nodes command output
-        
-    Returns:
-        List of parsed row dictionaries
+    Парсинг ASCII-таблицы из вывода --nodes.
+
+    Возвращает список строк-словарей с ключами по заголовкам колонок, плюс
+    служебный ключ "__cols__" с именами колонок по порядку.
+
+    Аргументы:
+        stdout: Сырой вывод команды --nodes
+
+    Возвращает:
+        Список словарей строк
     """
     lines = [ln.rstrip("\n") for ln in stdout.splitlines() if ln.strip()]
     header_cols: Optional[List[str]] = None
@@ -173,23 +173,23 @@ def parse_nodes_table(stdout: str) -> List[Dict[str, Any]]:
         if not BOX_ROW_RE.match(line):
             continue
         
-        # Detect header row
+        # Находим заголовок
         if header_cols is None:
             if "│" in line and "User" in line and "ID" in line and "Hardware" in line:
                 header_cols = split_box_row(line)
             continue
         
-        # Parse data rows (start with │ <number> │)
+        # Парсим строки данных (начинаются с │ <число> │)
         if not DATA_ROW_START_RE.match(line):
             continue
         
         parts = split_box_row(line)
         
-        # Trim to header length
+        # Обрезаем до длины заголовка
         if len(parts) >= len(header_cols):
             parts = parts[:len(header_cols)]
         
-        # Validate row length
+        # Проверяем длину строки
         if len(parts) != len(header_cols):
             continue
         
@@ -201,22 +201,22 @@ def parse_nodes_table(stdout: str) -> List[Dict[str, Any]]:
 
 
 # ==============================================================================
-# Column Matching and Value Parsing
+# Сопоставление колонок и парсинг значений
 # ==============================================================================
 
 def _normalize_column_name(name: str) -> str:
     """
-    Normalize column header for fuzzy matching.
-    
-    - Convert to lowercase
-    - Remove punctuation (%, ., commas)
-    - Collapse whitespace
-    
-    Args:
-        name: Raw column header
-        
-    Returns:
-        Normalized column name
+    Нормализовать заголовок колонки для нечёткого сопоставления.
+
+    - Привести к нижнему регистру
+    - Удалить пунктуацию (%, ., запятые)
+    - Схлопнуть пробелы
+
+    Аргументы:
+        name: Исходный заголовок колонки
+
+    Возвращает:
+        Нормализованное имя колонки
     """
     normalized = name.strip().lower()
     normalized = normalized.replace("%", "")
@@ -227,19 +227,19 @@ def _normalize_column_name(name: str) -> str:
 
 def _get_column_value(row: Dict[str, Any], candidates: List[str]) -> Optional[str]:
     """
-    Get column value using fuzzy matching on header names.
-    
-    Tries exact normalized match first, then substring match.
-    Returns None for empty/N/A values.
-    
-    Args:
-        row: Parsed table row dictionary
-        candidates: List of possible normalized column names
-        
-    Returns:
-        Column value or None
+    Получить значение колонки по нечёткому совпадению заголовков.
+
+    Сначала пробует точное совпадение нормализованных имён, затем подстроку.
+    Возвращает None для пустых/N/A значений.
+
+    Аргументы:
+        row: Словарь строки таблицы
+        candidates: Список возможных нормализованных имён колонок
+
+    Возвращает:
+        Значение колонки или None
     """
-    # Try exact normalized match
+    # Пробуем точное совпадение нормализованного имени
     for key in row.keys():
         if key == "__cols__":
             continue
@@ -254,7 +254,7 @@ def _get_column_value(row: Dict[str, Any], candidates: List[str]) -> Optional[st
                 value_str = str(value).strip()
                 return value_str if value_str and value_str != "N/A" else None
     
-    # Fallback: substring match
+    # Запасной вариант: совпадение по подстроке
     for key in row.keys():
         if key == "__cols__":
             continue
@@ -273,7 +273,7 @@ def _get_column_value(row: Dict[str, Any], candidates: List[str]) -> Optional[st
 
 
 def _parse_percentage(value: Optional[str]) -> Optional[float]:
-    """Parse percentage string (e.g., '45.2%') to float."""
+    """Парсинг строки процента (например, '45.2%') в float."""
     if not value:
         return None
     cleaned = value.replace("%", "").strip()
@@ -281,7 +281,7 @@ def _parse_percentage(value: Optional[str]) -> Optional[float]:
 
 
 def _parse_degrees(value: Optional[str]) -> Optional[float]:
-    """Parse degree string (e.g., '45.2°') to float."""
+    """Парсинг строки градусов (например, '45.2°') в float."""
     if not value:
         return None
     cleaned = value.replace("°", "").strip()
@@ -289,7 +289,7 @@ def _parse_degrees(value: Optional[str]) -> Optional[float]:
 
 
 def _parse_altitude_meters(value: Optional[str]) -> Optional[float]:
-    """Parse altitude string (e.g., '123m') to float."""
+    """Парсинг высоты (например, '123m') в float."""
     if not value:
         return None
     cleaned = value.lower().replace("m", "").strip()
@@ -297,7 +297,7 @@ def _parse_altitude_meters(value: Optional[str]) -> Optional[float]:
 
 
 def _parse_decibels(value: Optional[str]) -> Optional[float]:
-    """Parse decibel string (e.g., '10dB') to float."""
+    """Парсинг децибел (например, '10dB') в float."""
     if not value:
         return None
     cleaned = value.replace("dB", "").replace("db", "").strip()
@@ -306,69 +306,69 @@ def _parse_decibels(value: Optional[str]) -> Optional[float]:
 
 def _parse_battery(value: Optional[str]) -> Dict[str, Any]:
     """
-    Parse battery status.
-    
-    Returns dict with 'state' and 'percent' keys.
-    Handles 'Powered', percentage values, and text states.
-    
-    Args:
-        value: Battery status string
-        
-    Returns:
-        Dictionary with state and percent fields
+    Парсинг состояния батареи.
+
+    Возвращает словарь с ключами 'state' и 'percent'.
+    Обрабатывает 'Powered', процентные значения и текстовые состояния.
+
+    Аргументы:
+        value: Строка состояния батареи
+
+    Возвращает:
+        Словарь с полями state и percent
     """
     if not value:
         return {"state": None, "percent": None}
     
     value_lower = value.strip().lower()
     
-    # Handle "Powered" state
+    # Состояние "Powered"
     if value_lower == "powered":
         return {"state": "Powered", "percent": None}
     
-    # Handle percentage
+    # Процент
     if value.strip().endswith("%"):
         return {"state": None, "percent": _parse_percentage(value)}
     
-    # Handle other states
+    # Остальные состояния
     return {"state": value.strip(), "percent": None}
 
 
 # ==============================================================================
-# Node Data Normalization
+# Нормализация данных узла
 # ==============================================================================
 
 def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Normalize node data from parsed ASCII table row.
-    
-    Uses robust column matching to handle variations in column headers
-    across different meshtastic CLI versions.
-    
-    Args:
-        row: Parsed table row dictionary
-        
-    Returns:
-        Normalized node dictionary with standardized keys
+    Нормализация данных узла из строки ASCII-таблицы.
+
+    Использует устойчивое сопоставление колонок, чтобы учесть вариации заголовков
+    между разными версиями meshtastic CLI.
+
+    Аргументы:
+        row: Словарь строки таблицы
+
+    Возвращает:
+        Нормализованный словарь узла со стандартными ключами
     """
-    # Extract node ID
+    # Извлекаем ID узла
     node_id = _get_column_value(row, ["id"])
     if not node_id or not node_id.startswith("!"):
         return {}
     
-    # Extract core fields
+    # Извлекаем основные поля
     user = _get_column_value(row, ["user"])
     aka = _get_column_value(row, ["aka"])
     hardware = _get_column_value(row, ["hardware"])
     pubkey = _get_column_value(row, ["pubkey"])
     role = _get_column_value(row, ["role"])
     
-    # Extract position data
+    # Извлекаем координаты
     lat_str = _get_column_value(row, ["latitude", "lat"])
     lon_str = _get_column_value(row, ["longitude", "lon"])
     alt_str = _get_column_value(row, ["altitude", "alt", "alt m", "altitude m"])
     
-    # Extract telemetry
+    # Извлекаем телеметрию
     battery_str = _get_column_value(row, ["battery", "batt"])
     channel_util_str = _get_column_value(row, [
         "channel util", "channel utilization", "chan util", "ch util"
@@ -380,11 +380,11 @@ def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
     hops_str = _get_column_value(row, ["hops"])
     channel_str = _get_column_value(row, ["channel", "channel index", "ch index"])
     
-    # Extract timestamps
+    # Извлекаем временные метки
     last_heard = _get_column_value(row, ["lastheard", "last heard"])
     since = _get_column_value(row, ["since"])
     
-    # Build normalized node data
+    # Собираем нормализованные данные узла
     node_data: Dict[str, Any] = {
         "id": node_id,
         "user": user,
@@ -405,7 +405,7 @@ def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "channel_index": safe_int(channel_str) if channel_str else None,
         "last_heard": last_heard,
         "since": since,
-        # Preserve raw row data
+        # Сохраняем исходные данные строки
         "raw_nodes_row": {k: v for k, v in row.items() if k != "__cols__"},
     }
     
@@ -413,27 +413,27 @@ def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ==============================================================================
-# Info Command Parsing
+# Парсинг команды Info
 # ==============================================================================
 
 def parse_info_output(stdout: str) -> Dict[str, Any]:
     """
-    Parse meshtastic --info output.
-    
-    Attempts JSON parsing first, falls back to raw text.
-    
-    Args:
-        stdout: Raw --info command output
-        
-    Returns:
-        Dictionary with 'json' or 'raw_text' key
+    Парсинг вывода meshtastic --info.
+
+    Сначала пытается JSON, при неудаче — сырой текст.
+
+    Аргументы:
+        stdout: Сырой вывод команды --info
+
+    Возвращает:
+        Словарь с ключом 'json' или 'raw_text'
     """
     parsed_json = try_parse_json(stdout)
     
     if isinstance(parsed_json, (dict, list)):
         return {"json": parsed_json}
     
-    # Fallback to raw text
+    # Запасной вариант: сырой текст
     text_lines = [
         line for line in stdout.splitlines()
         if line.strip() and line.strip() != "Connected to radio"
@@ -444,7 +444,7 @@ def parse_info_output(stdout: str) -> Dict[str, Any]:
 
 
 # ==============================================================================
-# Output Formatting
+# Форматирование вывода
 # ==============================================================================
 
 def _format_cell(value: Any) -> str:
@@ -453,31 +453,113 @@ def _format_cell(value: Any) -> str:
     return str(value)
 
 
+def _display_width(s: str) -> int:
+    import unicodedata
+    width = 0
+    for ch in s:
+        if ch == "\t":
+            width += 4
+            continue
+        # Комбинируемые символы ширины не добавляют
+        if unicodedata.combining(ch):
+            continue
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _ljust_display(s: str, width: int) -> str:
+    pad = width - _display_width(s)
+    if pad <= 0:
+        return s
+    return s + (" " * pad)
+
+
 def format_table(headers: List[str], rows: List[List[Any]]) -> List[str]:
-    widths = [len(header) for header in headers]
+    widths = [_display_width(header) for header in headers]
     for row in rows:
         for idx, value in enumerate(row):
-            widths[idx] = max(widths[idx], len(_format_cell(value)))
+            widths[idx] = max(widths[idx], _display_width(_format_cell(value)))
     lines = []
     header_line = "  " + "  ".join(
-        header.ljust(widths[idx]) for idx, header in enumerate(headers)
+        _ljust_display(header, widths[idx]) for idx, header in enumerate(headers)
     )
     separator_line = "  " + "  ".join("-" * width for width in widths)
     lines.append(header_line)
     lines.append(separator_line)
     for row in rows:
         line = "  " + "  ".join(
-            _format_cell(value).ljust(widths[idx]) for idx, value in enumerate(row)
+            _ljust_display(_format_cell(value), widths[idx]) for idx, value in enumerate(row)
         )
         lines.append(line)
     return lines
 
 
+def format_ts_display(value: Any) -> Any:
+    """
+    Привести время к виду "YYYY-MM-DD HH:MM:SS" для вывода.
+    Убирает суффиксы временной зоны типа "+00:00".
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return s
+        try:
+            s_norm = s.replace("Z", "+00:00")
+            dt_obj = dt.datetime.fromisoformat(s_norm)
+            if dt_obj.tzinfo is not None:
+                dt_obj = dt_obj.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            if s.endswith("+00:00"):
+                s = s[:-6]
+            return s.replace("T", " ")
+    return value
+
+
+def parse_ts_to_epoch(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            s_norm = s.replace("Z", "+00:00")
+            dt_obj = dt.datetime.fromisoformat(s_norm)
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=dt.timezone.utc)
+            return dt_obj.timestamp()
+        except Exception:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    dt_obj = dt.datetime.strptime(s, fmt).replace(tzinfo=dt.timezone.utc)
+                    return dt_obj.timestamp()
+                except Exception:
+                    continue
+    return None
+
+
 # ==============================================================================
-# Database Operations
+# Операции с базой данных
 # ==============================================================================
 
-# Fields to track for changes
+# Поля для отслеживания изменений
 TRACKED_FIELDS = [
     ("user", "user"),
     ("aka", "aka"),
@@ -495,14 +577,14 @@ TRACKED_FIELDS = [
 
 def deep_get(data: Dict[str, Any], path: str) -> Any:
     """
-    Get value from nested dictionary using dot notation path.
-    
-    Args:
-        data: Source dictionary
-        path: Dot-separated path (e.g., 'position.lat')
-        
-    Returns:
-        Value at path or None if not found
+    Получить значение из вложенного словаря по пути в нотации с точками.
+
+    Аргументы:
+        data: Исходный словарь
+        path: Путь с точками (например, 'position.lat')
+
+    Возвращает:
+        Значение по пути или None, если не найдено
     """
     current: Any = data
     for part in path.split("."):
@@ -514,40 +596,40 @@ def deep_get(data: Dict[str, Any], path: str) -> Any:
 
 def deep_set(data: Dict[str, Any], path: str, value: Any) -> None:
     """
-    Set value in nested dictionary using dot notation path.
-    
-    Creates intermediate dictionaries as needed.
-    
-    Args:
-        data: Target dictionary
-        path: Dot-separated path (e.g., 'position.lat')
-        value: Value to set
+    Установить значение во вложенном словаре по пути в нотации с точками.
+
+    При необходимости создаёт промежуточные словари.
+
+    Аргументы:
+        data: Целевой словарь
+        path: Путь с точками (например, 'position.lat')
+        value: Значение для установки
     """
     parts = path.split(".")
     current: Any = data
     
-    # Navigate to parent
+    # Переходим к родителю
     for part in parts[:-1]:
         if part not in current or not isinstance(current[part], dict):
             current[part] = {}
         current = current[part]
     
-    # Set value
+    # Устанавливаем значение
     current[parts[-1]] = value
 
 
 def load_database(path: str) -> Dict[str, Any]:
     """
-    Load database from JSON file.
-    
-    Creates new database if file doesn't exist or is corrupt.
-    Backs up corrupt files before replacing.
-    
-    Args:
-        path: Database file path
-        
-    Returns:
-        Database dictionary
+    Загрузить базу из JSON-файла.
+
+    Создаёт новую базу, если файла нет или он повреждён.
+    Делает бэкап повреждённого файла перед заменой.
+
+    Аргументы:
+        path: Путь к файлу базы
+
+    Возвращает:
+        Словарь базы
     """
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return {
@@ -562,7 +644,7 @@ def load_database(path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, ValueError):
-        # Backup corrupt file
+        # Бэкап повреждённого файла
         backup_path = f"{path}.corrupt_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         os.replace(path, backup_path)
         
@@ -578,14 +660,14 @@ def load_database(path: str) -> Dict[str, Any]:
 
 def ensure_node_record(node_id: str, db_nodes: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Ensure node record exists in database, create if needed.
-    
-    Args:
-        node_id: Node identifier
-        db_nodes: Database nodes dictionary
-        
-    Returns:
-        Node record dictionary
+    Убедиться, что запись узла есть в базе, при необходимости создать.
+
+    Аргументы:
+        node_id: Идентификатор узла
+        db_nodes: Словарь узлов базы
+
+    Возвращает:
+        Словарь записи узла
     """
     if node_id not in db_nodes:
         db_nodes[node_id] = {
@@ -593,7 +675,7 @@ def ensure_node_record(node_id: str, db_nodes: Dict[str, Any]) -> Dict[str, Any]
             "first_seen_utc": iso_now(),
             "last_seen_utc": None,
             "current": {},
-            "history": [],  # [{ts_utc, changes: {field: {from, to}}}]
+            "history": [],  # формат истории: [{ts_utc, changes: {field: {from, to}}}]
         }
     
     return db_nodes[node_id]
@@ -605,33 +687,33 @@ def apply_node_update(
     timestamp_utc: str
 ) -> Dict[str, Any]:
     """
-    Apply updates to node record and track changes.
-    
-    Compares new data against current state, records changes in history,
-    and updates current state.
-    
-    Args:
-        node_record: Existing node record
-        new_data: New node data from scan
-        timestamp_utc: Update timestamp
-        
-    Returns:
-        Dictionary of changes: {field: {from, to}}
+    Применить обновления к записи узла и отследить изменения.
+
+    Сравнивает новые данные с текущим состоянием, пишет изменения в историю
+    и обновляет текущее состояние.
+
+    Аргументы:
+        node_record: Существующая запись узла
+        new_data: Новые данные сканирования
+        timestamp_utc: Временная метка обновления
+
+    Возвращает:
+        Словарь изменений: {field: {from, to}}
     """
     current = node_record.get("current", {})
     changes: Dict[str, Any] = {}
     
-    # Check tracked fields for changes
+    # Проверяем отслеживаемые поля на изменения
     for field_path, source_path in TRACKED_FIELDS:
         new_value = deep_get(new_data, source_path)
         old_value = deep_get(current, field_path)
         
-        # Handle numeric jitter for floats
+        # Учитываем числовой шум для float
         if isinstance(new_value, float) and isinstance(old_value, float):
             if abs(new_value - old_value) < 1e-6:
                 continue
         
-        # Record change if values differ
+        # Фиксируем изменение при различии значений
         if new_value != old_value and not (new_value is None and old_value is None):
             changes[field_path] = {
                 "from": old_value,
@@ -639,22 +721,34 @@ def apply_node_update(
             }
             deep_set(current, field_path, new_value)
     
-    # Always update telemetry fields
+    # Всегда обновляем телеметрию
     for key in ("last_heard", "since"):
         value = new_data.get(key)
         if value is not None:
             current[key] = value
     
-    # Preserve raw row snapshot
+    # Сохраняем сырой снимок строки
     raw_row = new_data.get("raw_nodes_row")
     if isinstance(raw_row, dict):
         current["raw_nodes_row"] = raw_row
     
-    # Update record
+    # Обновляем запись
     node_record["current"] = current
-    node_record["last_seen_utc"] = timestamp_utc
+    # last_seen_utc при наличии выравниваем по last_heard
+    last_heard = new_data.get("last_heard")
+    if isinstance(last_heard, str) and last_heard.strip():
+        node_record["last_seen_utc"] = last_heard.strip()
+    elif isinstance(last_heard, (int, float)):
+        try:
+            node_record["last_seen_utc"] = dt.datetime.fromtimestamp(
+                float(last_heard), tz=dt.timezone.utc
+            ).isoformat(timespec="seconds")
+        except Exception:
+            node_record["last_seen_utc"] = timestamp_utc
+    else:
+        node_record["last_seen_utc"] = timestamp_utc
     
-    # Add to history if changes occurred
+    # Добавляем в историю, если были изменения
     if changes:
         node_record["history"].append({
             "ts_utc": timestamp_utc,
@@ -665,63 +759,90 @@ def apply_node_update(
 
 
 # ==============================================================================
-# Main Function
+# Основная функция
 # ==============================================================================
 
 def main() -> int:
-    """Main entry point."""
+    """Основная точка входа."""
     parser = argparse.ArgumentParser(
-        description="One-shot Meshtastic node database updater"
+        description="Одноразовый обновитель базы узлов Meshtastic",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Примеры:\n"
+            "  python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt\n"
+            "  python nodeDbUpdater.py --regenerate\n"
+            "  python nodeDbUpdater.py --prune-days 30\n"
+        ),
     )
     parser.add_argument(
         "--port",
         default="/dev/ttyUSB0",
-        help="Serial port (default: /dev/ttyUSB0)"
+        help="Серийный порт (по умолчанию: /dev/ttyUSB0)"
     )
     parser.add_argument(
         "--db",
         default="nodeDb.txt",
-        help="Database file path (default: nodeDb.txt)"
+        help="Путь к файлу базы (по умолчанию: nodeDb.txt)"
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=40,
-        help="Command timeout in seconds (default: 40)"
+        help="Таймаут команд в секундах (по умолчанию: 40)"
     )
     parser.add_argument(
         "--meshtastic-bin",
         default="meshtastic",
-        help="Meshtastic CLI binary name or path"
+        help="Имя/путь до Meshtastic CLI"
     )
     parser.add_argument(
         "--channel",
         type=int,
         default=None,
-        help="Optional channel index to query"
+        help="Опциональный индекс канала для запроса"
+    )
+    parser.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="Пересоздать базу с нуля (игнорировать существующую)"
+    )
+    parser.add_argument(
+        "--prune-days",
+        type=int,
+        default=None,
+        help="Удалить узлы, не замеченные дольше N дней"
     )
     
     args = parser.parse_args()
     timestamp = iso_now()
     
-    # Load database
-    db = load_database(args.db)
+    # Загружаем базу
+    if args.regenerate:
+        db = {
+            "meta": {
+                "created_utc": iso_now(),
+                "updated_utc": None
+            },
+            "nodes": {}
+        }
+    else:
+        db = load_database(args.db)
     db.setdefault("meta", {})
     db.setdefault("nodes", {})
     db["meta"]["updated_utc"] = timestamp
     db["meta"]["last_port"] = args.port
     
-    # Build base command
+    # Собираем базовую команду
     base_cmd = [args.meshtastic_bin, "--port", args.port]
     if args.channel is not None:
         base_cmd += ["--ch-index", str(args.channel)]
     
-    # ===== Fetch nodes data =====
+    # ===== Получение данных узлов =====
     nodes_json = None
     nodes_stdout = ""
     nodes_stderr = ""
     
-    # Try different JSON output flags
+    # Пробуем разные флаги JSON-вывода
     for json_flag in (["--format", "json"], ["--json"], []):
         cmd = base_cmd + ["--nodes"] + json_flag
         returncode, stdout, stderr = run_cmd(cmd, timeout=args.timeout)
@@ -737,20 +858,20 @@ def main() -> int:
             break
         
         nodes_stdout, nodes_stderr = stdout, stderr
-        if not json_flag:  # Last attempt
+        if not json_flag:  # Последняя попытка
             break
     
-    # Check for command failure
+    # Проверяем, что команда не провалилась
     if not nodes_stdout.strip() and nodes_stderr.strip():
         print("[ERROR] meshtastic --nodes returned no output.", file=sys.stderr)
         print(nodes_stderr.strip(), file=sys.stderr)
         return 2
     
-    # ===== Normalize nodes data =====
+    # ===== Нормализация данных узлов =====
     normalized_nodes: List[Dict[str, Any]] = []
     
     if isinstance(nodes_json, list):
-        # Parse JSON format
+        # Парсим JSON-формат
         for item in nodes_json:
             if not isinstance(item, dict):
                 continue
@@ -791,14 +912,14 @@ def main() -> int:
                 "raw_nodes_row": item,
             })
     else:
-        # Parse ASCII table format
+        # Парсим формат ASCII-таблицы
         table_rows = parse_nodes_table(nodes_stdout)
         for row in table_rows:
             normalized = normalize_node_from_table_row(row)
             if normalized.get("id"):
                 normalized_nodes.append(normalized)
     
-    # ===== Fetch info data =====
+    # ===== Получение данных info =====
     info_returncode, info_stdout, info_stderr = run_cmd(
         base_cmd + ["--info"],
         timeout=args.timeout
@@ -812,12 +933,12 @@ def main() -> int:
         "info": info_data
     }
     
-    # ===== Update database =====
+    # ===== Обновление базы =====
     db_nodes = db["nodes"]
     new_nodes: List[str] = []
     changed_nodes: List[Tuple[str, Dict[str, Any]]] = []
     
-    # Change counters
+    # Счётчики изменений
     rename_count = 0
     aka_count = 0
     role_count = 0
@@ -840,7 +961,7 @@ def main() -> int:
         if changes:
             changed_nodes.append((node_id, changes))
             
-            # Count specific change types
+            # Считаем конкретные типы изменений
             if "user" in changes:
                 rename_count += 1
             if "aka" in changes:
@@ -852,23 +973,43 @@ def main() -> int:
             if "pubkey" in changes:
                 pubkey_count += 1
     
-    # Record run statistics
+    # Записываем статистику запуска
     db["meta"]["last_run_stats"] = {
         "ts_utc": timestamp,
         "nodes_seen": len(seen_node_ids),
         "new_nodes": len(new_nodes),
         "nodes_changed": len(changed_nodes),
     }
+
+    # Удаляем старые записи по времени последнего появления
+    pruned_count = 0
+    if args.prune_days is not None and args.prune_days >= 0:
+        cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - (args.prune_days * 86400)
+        to_delete = []
+        for node_id, record in db_nodes.items():
+            current = record.get("current", {})
+            ts = parse_ts_to_epoch(current.get("last_heard"))
+            if ts is None:
+                ts = parse_ts_to_epoch(record.get("last_seen_utc"))
+            if ts is None:
+                ts = parse_ts_to_epoch(record.get("first_seen_utc"))
+            if ts is not None and ts < cutoff:
+                to_delete.append(node_id)
+        for node_id in to_delete:
+            del db_nodes[node_id]
+            pruned_count += 1
     
-    # ===== Save database =====
+    # ===== Сохраняем базу =====
     db_json = json.dumps(db, ensure_ascii=False, indent=2, sort_keys=True)
     atomic_write_text(args.db, db_json)
     
-    # ===== Report results =====
+    # ===== Выводим результаты =====
     print(f"[OK] Database updated: {args.db}")
     print(f"     Seen: {len(seen_node_ids)} | New: {len(new_nodes)} | Changed: {len(changed_nodes)}")
+    if args.prune_days is not None and args.prune_days >= 0:
+        print(f"     Pruned: {pruned_count} (older than {args.prune_days} days)")
     
-    # Report new nodes
+    # Вывод новых узлов
     if new_nodes:
         print("\n[NEW NODES]")
         new_rows: List[List[Any]] = []
@@ -882,8 +1023,8 @@ def main() -> int:
                 current.get("aka"),
                 current.get("hardware"),
                 current.get("role"),
-                record.get("last_seen_utc"),
-                current.get("last_heard"),
+                format_ts_display(record.get("last_seen_utc")),
+                format_ts_display(current.get("last_heard")),
                 current.get("since"),
             ])
         for line in format_table(
@@ -892,7 +1033,7 @@ def main() -> int:
         ):
             print(line)
 
-    # Report changes
+    # Вывод изменений
     if changed_nodes:
         print("\n[CHANGES]")
         for node_id, changes in changed_nodes:
@@ -905,7 +1046,7 @@ def main() -> int:
             header = f"  * {node_id}"
             if name or aka:
                 header += f" ({name or ''}{' / ' if (name and aka) else ''}{aka or ''})"
-            print(f"{header}  last_seen_utc={last_seen!r}  last_heard={last_heard!r}")
+            print(f"{header}  last_seen_utc={format_ts_display(last_seen)!r}  last_heard={format_ts_display(last_heard)!r}")
             
             change_rows: List[List[Any]] = []
             for field, change_info in changes.items():
@@ -926,20 +1067,24 @@ def main() -> int:
     
     print("\n[NODES]")
     node_rows: List[List[Any]] = []
-    for idx, node_id in enumerate(sorted(db_nodes.keys()), 1):
-        record = db_nodes[node_id]
+    def _first_seen_key(item: Tuple[str, Dict[str, Any]]) -> str:
+        rec = item[1]
+        val = rec.get("first_seen_utc")
+        return str(val or "")
+
+    sorted_items = sorted(db_nodes.items(), key=_first_seen_key)
+    for idx, (node_id, record) in enumerate(sorted_items, 1):
         current = record.get("current", {})
         node_rows.append([
             idx,
             node_id,
             current.get("user"),
             current.get("aka"),
-            record.get("last_seen_utc"),
-            current.get("last_heard"),
-            current.get("since"),
+            format_ts_display(record.get("first_seen_utc")),
+            format_ts_display(record.get("last_seen_utc")),
         ])
     for line in format_table(
-        ["#", "ID", "User", "AKA", "Last Seen (UTC)", "Last Heard", "Since"],
+        ["#", "ID", "User", "AKA", "First Seen", "Last Seen"],
         node_rows,
     ):
         print(line)
