@@ -3,6 +3,7 @@
 
 import argparse
 import datetime as _dt
+import os
 import re
 import signal
 import subprocess
@@ -14,26 +15,22 @@ from typing import Dict, List, Optional, Tuple
 VERSION = "1.8.5"
 
 # ----------------------------
-# Global stop + current child pgid (for instant Ctrl+C)
+# Глобальная остановка + текущий дочерний процесс (для мгновенного Ctrl+C)
 # ----------------------------
 
 STOP = False
-CURRENT_PGID: Optional[int] = None
+CURRENT_PROC: Optional[subprocess.Popen] = None
 
 
 def _sigint_handler(_signum, _frame):
-    global STOP, CURRENT_PGID
+    global STOP, CURRENT_PROC
     STOP = True
-    if CURRENT_PGID is not None:
-        try:
-            import os
-            os.killpg(CURRENT_PGID, signal.SIGKILL)
-        except Exception:
-            pass
+    if CURRENT_PROC is not None:
+        _terminate_process(CURRENT_PROC)
 
 
 # ----------------------------
-# Utils: time / printing
+# Утилиты: время / вывод
 # ----------------------------
 
 def ts_now() -> str:
@@ -54,12 +51,12 @@ def clean_ansi(s: str) -> str:
 
 
 def fmt_line(ts: str, pct: str, cyc: str, hop: str, msg: str) -> str:
-    # TS<space>PCT<TAB>[cycle][i/n]<space>HOP<TAB>MESSAGE
+    # TS<пробел>PCT<TAB>[cycle][i/n]<пробел>HOP<TAB>MESSAGE
     return f"{ts} {pct}\t{cyc} {hop}\t{msg}"
 
 
 # ----------------------------
-# Node id normalization
+# Нормализация id узла
 # ----------------------------
 
 _NODE_HEX8 = re.compile(r"^[0-9a-fA-F]{8}$")
@@ -69,10 +66,10 @@ _BANG_ID_FINDER = re.compile(r"![0-9a-fA-F]{8}")
 
 def normalize_node_id(s: str) -> Optional[str]:
     """
-    Accepts:
+    Принимает:
       - !aca96d48
-      - aca96d48   (so user avoids bash history expansion on '!')
-    Returns canonical lower-case "!xxxxxxxx" or None.
+      - aca96d48   (чтобы избежать расширения истории bash по '!')
+    Возвращает канонический нижний регистр "!xxxxxxxx" или None.
     """
     s = (s or "").strip()
     if not s:
@@ -85,28 +82,72 @@ def normalize_node_id(s: str) -> Optional[str]:
 
 
 # ----------------------------
-# CLI exec
+# Запуск CLI
 # ----------------------------
 
-def run_cmd(cmd: List[str], timeout: int, tick: float = 0.2) -> Tuple[int, str, str]:
-    """
-    Runs command with:
-      - separate process group (so we can kill it instantly on Ctrl+C)
-      - periodic timeout ticks to check STOP frequently (instant interrupt)
-    """
-    global CURRENT_PGID, STOP
-    import os
-
-    p = None
-    try:
-        p = subprocess.Popen(
+def _popen_new_process_group(cmd: List[str]) -> subprocess.Popen:
+    if os.name == "nt":
+        return subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            preexec_fn=os.setsid,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-        CURRENT_PGID = p.pid
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        preexec_fn=os.setsid,
+    )
+
+
+def _terminate_process(p: subprocess.Popen) -> None:
+    if p.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            p.send_signal(signal.CTRL_BREAK_EVENT)
+            time.sleep(0.2)
+        except Exception:
+            pass
+        try:
+            if p.poll() is None:
+                p.kill()
+        except Exception:
+            pass
+        if p.poll() is None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+    else:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def run_cmd(cmd: List[str], timeout: int, tick: float = 0.2) -> Tuple[int, str, str]:
+    """
+    Запускает команду с:
+      - отдельной группой процесса (чтобы мгновенно убить по Ctrl+C)
+      - периодическими тик‑таймаутами для частой проверки STOP
+    """
+    global CURRENT_PROC, STOP
+
+    p = None
+    try:
+        p = _popen_new_process_group(cmd)
+        CURRENT_PROC = p
         start = time.time()
 
         stdout_chunks: List[str] = []
@@ -114,24 +155,12 @@ def run_cmd(cmd: List[str], timeout: int, tick: float = 0.2) -> Tuple[int, str, 
 
         while True:
             if STOP:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
+                _terminate_process(p)
                 raise KeyboardInterrupt
 
             elapsed = time.time() - start
             if elapsed >= timeout:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
+                _terminate_process(p)
                 return 124, "".join(stdout_chunks), "[TIMEOUT]"
 
             try:
@@ -144,11 +173,11 @@ def run_cmd(cmd: List[str], timeout: int, tick: float = 0.2) -> Tuple[int, str, 
                 continue
 
     finally:
-        CURRENT_PGID = None
+        CURRENT_PROC = None
 
 
 # ----------------------------
-# Meshtastic --info parsing
+# Парсинг Meshtastic --info
 # ----------------------------
 
 def extract_balanced_braces(text: str, start_idx: int) -> Optional[str]:
@@ -169,6 +198,34 @@ def extract_balanced_braces(text: str, start_idx: int) -> Optional[str]:
 
 def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
     t = clean_ansi(mesh_info_text)
+    t_lines = [line for line in t.splitlines() if line.strip() and line.strip() != "Connected to radio"]
+    t_clean = "\n".join(t_lines).strip()
+    if t_clean:
+        try:
+            import json
+            parsed = json.loads(t_clean)
+            if isinstance(parsed, dict):
+                nodes = _extract_nodes_from_info_json(parsed)
+                if nodes is not None:
+                    return nodes
+        except Exception:
+            pass
+
+        block = extract_balanced_braces(t_clean, 0)
+        if block:
+            try:
+                import json
+                parsed = json.loads(block)
+                if isinstance(parsed, dict):
+                    nodes = _extract_nodes_from_info_json(parsed)
+                    if nodes is not None:
+                        return nodes
+            except Exception:
+                pass
+        nodes_block = _extract_nodes_block_from_text(t_clean)
+        if nodes_block is not None:
+            return nodes_block
+
     m = re.search(r"Nodes\s+in\s+mesh\s*:\s*", t)
     if not m:
         raise RuntimeError("cannot parse nodes (missing Nodes in mesh block)")
@@ -188,6 +245,39 @@ def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
         if isinstance(nodes, dict):
             return nodes
         raise RuntimeError("nodes block is not a dict")
+
+
+def _extract_nodes_from_info_json(parsed: dict) -> Optional[Dict[str, dict]]:
+    candidate_keys = ("nodes", "Nodes", "nodesById")
+    for key in candidate_keys:
+        nodes = parsed.get(key)
+        if isinstance(nodes, dict):
+            return nodes
+    for key in ("mesh", "meshInfo", "info"):
+        nested = parsed.get(key)
+        if isinstance(nested, dict):
+            for nested_key in candidate_keys:
+                nodes = nested.get(nested_key)
+                if isinstance(nodes, dict):
+                    return nodes
+    return None
+
+
+def _extract_nodes_block_from_text(text: str) -> Optional[Dict[str, dict]]:
+    m = re.search(r'"nodes"\s*:\s*{', text)
+    if not m:
+        return None
+    block = extract_balanced_braces(text, m.start())
+    if not block:
+        return None
+    try:
+        import json
+        parsed = json.loads(block)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return None
 
 
 def parse_my_node_num(mesh_info_text: str) -> Optional[int]:
@@ -229,7 +319,7 @@ def detect_self_id(mesh_info_text: str, nodes: Dict[str, dict]) -> str:
 
 
 # ----------------------------
-# Node model / selection
+# Модель узла / отбор
 # ----------------------------
 
 @dataclass
@@ -274,8 +364,8 @@ def load_active_nodes(nodes: Dict[str, dict], hours: int, self_id: str) -> List[
 
 def read_id_list(path: str) -> set:
     """
-    Read ANY text file, extract all occurrences of !xxxxxxxx (hex8) anywhere in the file.
-    Everything else ignored. Duplicates removed.
+    Читает ЛЮБОЙ текстовый файл, извлекает все вхождения !xxxxxxxx (hex8) по всему файлу.
+    Всё остальное игнорируется. Дубликаты удаляются.
     """
     want = set()
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -308,7 +398,7 @@ def filter_hops(all_nodes: List[NodeRec], minhops: Optional[int], maxhops: Optio
 
 
 # ----------------------------
-# Traceroute parsing -> pretty name routes
+# Парсинг traceroute -> маршруты с человекочитаемыми именами
 # ----------------------------
 
 def parse_routes_from_meshtastic_output(raw: str) -> Tuple[Optional[str], Optional[str]]:
@@ -354,16 +444,16 @@ def count_edges(route_line: str) -> int:
 
 
 # ----------------------------
-# Logging
+# Логирование
 # ----------------------------
 
 def log_filename_for_day(self_id: str) -> str:
-    # CHANGED: write logs into meshLogger/ subfolder (relative to script cwd)
+    # ИЗМЕНЕНО: пишем логи в подпапку meshLogger/ (относительно cwd скрипта)
     return f"meshLogger/{date_today()} {self_id}.txt"
 
 
 def append_log_line(path: str, line: str) -> None:
-    # CHANGED: ensure meshLogger Loggerxists
+    # ИЗМЕНЕНО: гарантируем существование meshLogger
     import os
     os.makedirs("meshLogger", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -371,7 +461,7 @@ def append_log_line(path: str, line: str) -> None:
 
 
 # ----------------------------
-# Help text (detailed)
+# Текст справки (подробно)
 # ----------------------------
 
 HELP_TEXT = """\
@@ -450,7 +540,7 @@ options:
 
 
 # ----------------------------
-# Banner
+# Баннер
 # ----------------------------
 
 def print_banner(
@@ -491,7 +581,7 @@ def print_banner(
 
 
 # ----------------------------
-# Main
+# Основной код
 # ----------------------------
 
 def main() -> int:
@@ -611,10 +701,35 @@ def main() -> int:
             active0 = filter_hops(active0, args.minhops, args.maxhops)
             return active0
 
-        rc, so, se = run_cmd(["meshtastic", "--port", args.port, "--info"], timeout=max(60, args.timeout + 15))
-        mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
+        mesh_info_text = ""
+        parse_error: Optional[Exception] = None
+        attempt_log: List[str] = []
+        for extra_args in (["--format", "json"], ["--json"], []):
+            cmd = ["meshtastic", "--port", args.port, "--info"] + extra_args
+            rc, so, se = run_cmd(
+                cmd,
+                timeout=max(60, args.timeout + 15),
+            )
+            mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
+            try:
+                nodes = parse_nodes_block(mesh_info_text)
+                parse_error = None
+                break
+            except Exception as ex:
+                parse_error = ex
+                nodes = {}
+                preview = "\n".join(mesh_info_text.splitlines()[:8])
+                stderr_preview = "\n".join((se or "").splitlines()[:6])
+                attempt_log.append(
+                    "cmd=" + " ".join(cmd)
+                    + f" rc={rc} stderr={stderr_preview!r} preview={preview!r}"
+                )
+                continue
 
-        nodes = parse_nodes_block(mesh_info_text)
+        if parse_error is not None:
+            details = " | ".join(attempt_log) if attempt_log else "no output captured"
+            raise RuntimeError(f"{parse_error} (parse attempts: {details})")
+
         self_id = detect_self_id(mesh_info_text, nodes)
         self_long, self_short = node_names(nodes, self_id)
 
@@ -622,7 +737,7 @@ def main() -> int:
         active = filter_ids(active, want_ids)
         active = filter_hops(active, args.minhops, args.maxhops)
 
-        # THESE TWO LINES MUST STAY
+        # ЭТИ ДВЕ СТРОКИ ДОЛЖНЫ ОСТАТЬСЯ
         out(f"{ts_now()} meshtastic --info updated from {self_id} {self_long}[{self_short}]")
         out(
             f"{ts_now()} a total of {len(nodes)} nodes were found, of which {len(active)} were active within the last {args.hours} hours. "
@@ -655,7 +770,7 @@ def main() -> int:
         if not args.quiet:
             for i, n in enumerate(active, 1):
                 hops = "?" if n.hops_away is None else str(n.hops_away)
-                # N.\t!id\t<HO>h\tLong[Short]
+                # N.\t!id\t<HO>h\tДлинное[Короткое]
                 out(f"{i}.\t{n.node_id}\t{hops}h\t{n.long}[{n.short}]")
 
         return active

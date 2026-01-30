@@ -1,39 +1,18 @@
-# --- Python ---
-__pycache__/
-*.py[cod]
-*.pyd
-*.so
-*.egg-info/
-dist/
-build/
+# Generated data and artifacts
+meshLogger/
+graphGen/
+nodeDb*.txt
+nodes.txt
+*.dot
+*.svg
+*.jpg
 
-# --- Virtualenv ---
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
 .venv/
 venv/
-ENV/
-
-# --- IDE ---
-.vscode/
-.idea/
-
-# --- OS ---
-.DS_Store
-Thumbs.db
-
-# --- Logs / runtime outputs ---
-*.log
-logs/
-output/
-tmp/
-cache/
-
-# --- Secrets / local config ---
-.env
-*.local
-config.local.*
-
-# --- Working files
-graphGen/
-meshLogger/
-nodeDb.txt
-nodes.txt

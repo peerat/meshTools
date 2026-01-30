@@ -1,47 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-graphGen.py — Meshtastic traces → D3.js HTML/JSON generator (chatty terminal output)
+graphGen.py — генератор графов Graphviz DOT/SVG/JPG по трассам Meshtastic (болтливый вывод в терминал)
 
-Version: 0.8.0
-Date: 2026-02-01
+Версия: 0.7.9
+Дата: 2026-01-25
 
-CHANGELOG:
-0.8.0 (2026-02-01)
-  - Switched graph output to D3.js (HTML + JSON), removed Graphviz dependency.
-  - HTML includes interactive force layout with zoom/drag and tooltips.
-  - JSON includes node metadata, routing %, RSSI, and edge thickness.
-
+ИСТОРИЯ ИЗМЕНЕНИЙ:
 0.7.9 (2026-01-25)
-  - --datetime window filter now uses timestamps STRICTLY from the beginning of EACH TRACE LINE
-    inside the file (NOT filename, NOT file mtime/ctime).
-  - Edge thickness scaling changed to RELATIVE normalization per current selection:
-      max confirmations => 100% => maxwidthline
-      others => proportional between minwidthline..maxwidthline
-    Added: --minwidthline / --maxwidthline (defaults 1..30).
-  - JPG DPI default set to 75.
-  - SVG post-process enforced: width="8000pt" height="4500pt".
+  - Фильтр окна --datetime теперь берёт временные метки СТРОГО с начала КАЖДОЙ СТРОКИ ТРАССЫ
+    внутри файла (НЕ из имени файла и НЕ из mtime/ctime).
+  - Толщина рёбер теперь нормализуется ОТНОСИТЕЛЬНО текущей выборки:
+      максимум подтверждений => 100% => maxwidthline
+      остальные => пропорционально между minwidthline..maxwidthline
+    Добавлено: --minwidthline / --maxwidthline (по умолчанию 1..30).
+  - JPG DPI по умолчанию установлен на 75.
+  - Постобработка SVG: width="8000pt" height="4500pt".
 
 0.7.5 (2026-01-19)
-  - Unknown node excluded by default (acts like it doesn't exist):
-      * drops all edges adjacent to Unknown (!ffffffff)
-      * does NOT "bridge" A->B across Unknown
-      * removes Unknown from routing/transit stats
-    Use --include-unknown to revert to old behavior.
-  - Terminal output reports how many edges were dropped due to Unknown.
-  - Output basename auto-format: "YYYY-MM-DD HH:MM:SS !<measurer_id>"
-  - Auto measurer id detection from filenames; DOT+SVG+JPG by default
+  - Узел Unknown по умолчанию исключён (считаем, что его нет):
+      * удаляются все рёбра, смежные с Unknown (!ffffffff)
+      * НЕ выполняется "мост" A->B через Unknown
+      * Unknown исключён из статистики маршрутизации/транзита
+    Флаг --include-unknown возвращает старое поведение.
+  - В терминале выводится, сколько рёбер отброшено из-за Unknown.
+  - Имя выходных файлов по шаблону: "YYYY-MM-DD HH:MM:SS !<measurer_id>"
+  - Автоопределение measurer id по именам файлов; DOT+SVG+JPG по умолчанию
 
-IMPORTANT FIXED PATHS (as per your setup):
-  - traces folder:   <root>/meshLogger
-  - output folder:   <root>/graphGen
-  - nodeDb search:   1) cwd, 2) script dir, 3) home
+ВАЖНЫЕ ПУТИ:
+  - папка трасс:     <root>/meshLogger
+  - папка вывода:    <root>/graphGen
+  - поиск nodeDb:    1) root, 2) папка скрипта, 3) домашняя папка
 
-Trace filename pattern expected in <root>/meshLogger:
+Ожидаемый шаблон имени файлов трасс в <root>/meshLogger:
   'YYYY-MM-DD !xxxxxxxx*.txt'
 """
 
-__version__ = "0.8.0"
+__version__ = "0.7.9"
 
 import argparse
 import colorsys
@@ -49,6 +44,8 @@ import hashlib
 import json
 import math
 import re
+import shutil
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -71,15 +68,15 @@ ROLE_COLORS = {
     "UNKNOWN": "#e0e0e0",
 }
 
-# hop parsing in trace lines
+# разбор hop в строках трассировки
 NODE_RE = re.compile(r"(![0-9a-fA-F]{8}|Unknown)")
 DB_RE = re.compile(r"\((-?\d+(?:\.\d+)?|\?)dB\)")
 
-# filename measurer-id detection
+# извлечение measurer-id из имени файла
 TRACE_NAME_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+(![0-9a-fA-F]{8})", re.I)
 
-# timestamp at beginning of each trace line (we filter by THIS, only)
-# Accept:
+# временная метка в начале каждой строки трассы (фильтруем ТОЛЬКО по ней)
+# Принимаем:
 #   2026-01-24 16:30:12 ...
 #   2026-01-24 16:30 ...
 LINE_TS_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})(?:[ T]+(\d{2}:\d{2})(?::(\d{2}))?)?")
@@ -107,6 +104,10 @@ def sha1_file(path: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
     h.update(str(st.st_size).encode())
     h.update(str(int(st.st_mtime)).encode())
     return h.hexdigest()
+
+
+def which_dot() -> Optional[str]:
+    return shutil.which("dot")
 
 
 def extract_first_json_object(text: str) -> Optional[str]:
@@ -162,33 +163,31 @@ def find_latest_file(patterns: List[str], root: Path) -> Optional[Path]:
     return cand[0]
 
 
-def fixed_paths() -> Tuple[Path, Path, List[Path]]:
+def fixed_paths(root: Path) -> Tuple[Path, Path, List[Path]]:
     """
-    root = cwd (where you run it) OR script dir (same in your case ~/meshTools)
-    We follow your 'fixed' layout:
-      traces:  <root>/meshLogger
-      output:  <root>/graphGen
-      nodeDb:  search order: cwd, script dir, home
+    root = cwd (где запускаете) ИЛИ папка скрипта (в вашем случае ~/meshTools)
+    Используем фиксированный расклад:
+      трассы:  <root>/meshLogger
+      вывод:   <root>/graphGen
+      nodeDb:  порядок поиска: root, папка скрипта, домашняя папка
     """
     cwd = Path.cwd().resolve()
     script_dir = Path(__file__).resolve().parent
     home = Path.home().resolve()
 
-    # In your usage, you run inside ~/meshTools, and script is in same dir.
-    # We'll take root as cwd to keep current behaviour.
-    root = cwd
-
+    # В вашем сценарии запуск из ~/meshTools и скрипт там же.
+    # Берём root как cwd, чтобы сохранить текущее поведение.
     trace_root = root / "meshLogger"
     out_dir = root / "graphGen"
-    node_search = [cwd, script_dir, home]
+    node_search = [root, script_dir, home]
     return trace_root, out_dir, node_search
 
 
 def find_trace_files(trace_root: Path) -> List[Path]:
     """
-    Only pattern requested:
+    Единственный ожидаемый шаблон:
       'YYYY-MM-DD !xxxxxxxx*.txt'
-    Inside fixed folder: <root>/meshLogger
+    Внутри фиксированной папки: <root>/meshLogger
     """
     files = set()
     for p in trace_root.glob("20??-??-?? !*.txt"):
@@ -236,6 +235,16 @@ def role_fill(role: str) -> str:
     return ROLE_COLORS["UNKNOWN"]
 
 
+def esc_html(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
 def grad_rssi(value_db: Optional[float], vmin: float, vmax: float) -> str:
     if value_db is None:
         return "#9a9a9a"
@@ -264,6 +273,11 @@ def margin_from_neighbors(n: int, vmax: int) -> str:
     return f"{mx:.2f},{my:.2f}"
 
 
+def fmt_role(role: str) -> str:
+    r = (role or "").upper()
+    return r if r else "-"
+
+
 def build_auto_out(measurer_id: str) -> str:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return f"{ts} {measurer_id}"
@@ -271,12 +285,12 @@ def build_auto_out(measurer_id: str) -> str:
 
 def parse_line_ts(line: str) -> Optional[datetime]:
     """
-    Parse timestamp STRICTLY from the beginning of the line.
-    Accept:
+    Парсинг временной метки СТРОГО с начала строки.
+    Допустимые форматы:
       YYYY-MM-DD
       YYYY-MM-DD HH:MM
       YYYY-MM-DD HH:MM:SS
-    If only date => time 00:00:00.
+    Если только дата — время 00:00:00.
     """
     m = LINE_TS_RE.match(line)
     if not m:
@@ -302,19 +316,19 @@ def parse_line_ts(line: str) -> Optional[datetime]:
 
 def parse_datetime_point(s: str) -> Tuple[datetime, bool]:
     """
-    Parse a single endpoint.
-    Returns (dt, has_time).
-    has_time=True if string included HH:MM (with optional :SS).
+    Парсинг одного конца интервала.
+    Возвращает (dt, has_time).
+    has_time=True, если строка содержит HH:MM (и опционально :SS).
     """
     s = (s or "").strip()
-    # try full
+    # пробуем полные форматы
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(s, fmt)
             return dt, True
         except Exception:
             pass
-    # date-only
+    # только дата
     try:
         dt = datetime.strptime(s, "%Y-%m-%d")
         return dt, False
@@ -324,12 +338,12 @@ def parse_datetime_point(s: str) -> Tuple[datetime, bool]:
 
 def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
     """
-    --datetime supports:
+    --datetime поддерживает:
       'YYYY-MM-DD'
       'YYYY-MM-DD - YYYY-MM-DD'
       'YYYY-MM-DD HH:MM - YYYY-MM-DD HH:MM'
       'YYYY-MM-DD HH:MM:SS - YYYY-MM-DD HH:MM:SS'
-    Split ONLY by ' - ' (space-hyphen-space) to avoid breaking dates.
+    Разбиваем ТОЛЬКО по ' - ' (пробел-дефис-пробел), чтобы не ломать даты.
     """
     expr = (expr or "").strip()
     if not expr:
@@ -340,11 +354,11 @@ def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
         a_dt, a_has_time = parse_datetime_point(a_str)
         b_dt, b_has_time = parse_datetime_point(b_str)
 
-        # If end is date-only => end of that day
+        # Если конец — только дата, берём конец дня
         if not b_has_time:
             b_dt = b_dt + timedelta(days=1) - timedelta(seconds=1)
 
-        # If start is date-only => start of day already ok
+        # Если начало — только дата, это уже начало дня
         if not a_has_time:
             a_dt = a_dt.replace(hour=0, minute=0, second=0)
 
@@ -352,12 +366,12 @@ def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
             raise ValueError("bad --datetime format")
         return a_dt, b_dt
 
-    # single endpoint:
+    # одиночная точка:
     a_dt, a_has_time = parse_datetime_point(expr)
     if a_has_time:
-        # exact minute/second point => treat as [dt .. dt] (single moment)
+        # точная минута/секунда => считаем [dt .. dt] (один момент)
         return a_dt, a_dt
-    # date-only => full day
+    # только дата => весь день
     b_dt = a_dt + timedelta(days=1) - timedelta(seconds=1)
     return a_dt, b_dt
 
@@ -380,11 +394,11 @@ class TraceFileStats:
 
 def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]], Optional[Path], Dict[str, Any]]:
     """
-    Robust nodeDb parser:
-    - First try Meshtastic JSON export shape: nodes -> {id: {current:{user:{longName, shortName, role}, ...}}}
-    - If missing, also support nodeDb where current.raw_nodes_row holds keys:
-        User / AKA / Role / Channel util.
-      (this matches your provided nodeDb.txt)
+    Надёжный парсер nodeDb:
+    - Сначала пробуем формат экспорта Meshtastic JSON: nodes -> {id: {current:{user:{longName, shortName, role}, ...}}}
+    - Если нет, поддерживаем nodeDb, где current.raw_nodes_row содержит ключи:
+        ключи User / AKA / Role / Channel util.
+      (это соответствует вашему nodeDb.txt)
     """
     node_meta: Dict[str, Dict[str, Any]] = {}
     debug = {"nodeDb_nodes_loaded": 0, "nodeDb_nodes_with_longName": 0}
@@ -396,7 +410,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
             nodedb_path = cand
             break
     if nodedb_path is None:
-        # fallback by patterns if needed
+        # запасной поиск по шаблонам
         for base in node_search:
             cand = find_latest_file(["nodeDb*.txt", "nodeDb*.TXT"], base)
             if cand:
@@ -416,7 +430,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                 role = ""
                 ch_util = None
 
-                # Path A: current.user is dict
+                # Вариант A: current.user — словарь
                 user = cur.get("user")
                 if isinstance(user, dict):
                     long_name = user.get("longName") or ""
@@ -424,19 +438,19 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                     if user.get("role"):
                         role = (user.get("role") or "").upper()
 
-                # Path B: nodeDb like yours: current.raw_nodes_row is dict
+                # Вариант B: nodeDb как у вас: current.raw_nodes_row — словарь
                 raw = cur.get("raw_nodes_row")
                 if isinstance(raw, dict):
-                    # 'User' is the long visible name in your export
+                    # 'User' — длинное имя из вашего экспорта
                     if not long_name and isinstance(raw.get("User"), str):
                         long_name = raw.get("User") or ""
-                    # 'AKA' often holds short tag
+                    # 'AKA' часто содержит короткий тег
                     if not short_name and isinstance(raw.get("AKA"), str):
                         short_name = raw.get("AKA") or ""
-                    # Role
+                    # Роль
                     if not role and isinstance(raw.get("Role"), str):
                         role = (raw.get("Role") or "").upper()
-                    # Channel util.
+                    # Утилизация канала.
                     for k in ("Channel util.", "Channel util", "channel util.", "channel util"):
                         v = raw.get(k)
                         if isinstance(v, (int, float)):
@@ -451,7 +465,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                                 except Exception:
                                     pass
 
-                # Path C: current.aka or current.user string as last resort
+                # Вариант C: current.aka или current.user (строка) как последний шанс
                 aka = cur.get("aka")
                 if isinstance(aka, str) and not short_name:
                     short_name = aka
@@ -488,19 +502,19 @@ def parse_traces_with_stats(
     List[Path],
 ]:
     """
-    Main parser:
-      - Reads each file line-by-line
-      - If dt_window is set: uses timestamp parsed from LINE START only
-        (lines without timestamp are ignored for window filtering; they won't count)
-      - Builds:
-          edge_count (directed confirmations)
-          edge_rssi   (list of RSSI per directed link)
-          transit_count (nodes appearing as transit, excluding Unknown unless included)
-      - Drops edges adjacent to Unknown when Unknown excluded
-    Also returns:
-      per-file stats
-      debug counters
-      selected_files (files which had >=1 trace line in window, if window active)
+    Основной парсер:
+      - Читает каждый файл построчно
+      - Если задан dt_window: используется метка времени ТОЛЬКО из НАЧАЛА СТРОКИ
+        (строки без метки игнорируются при фильтрации окна; в статистику не идут)
+      - Строит:
+          edge_count (направленные подтверждения)
+          edge_rssi   (список RSSI для направленной связи)
+          transit_count (узлы-транзиты, без Unknown если он исключён)
+      - Удаляет рёбра, смежные с Unknown, когда Unknown исключён
+    Также возвращает:
+      статистику по файлам
+      отладочные счётчики
+      selected_files (файлы, где >=1 строка попала в окно, если окно активно)
     """
     edge_count: Dict[Tuple[str, str], int] = defaultdict(int)
     edge_rssi: Dict[Tuple[str, str], List[float]] = defaultdict(list)
@@ -531,7 +545,7 @@ def parse_traces_with_stats(
         lines_in_window = 0
 
         for line in lines:
-            # window filter uses timestamp from line start ONLY
+            # фильтр окна использует метку времени ТОЛЬКО с начала строки
             if w_start and w_end:
                 ts = parse_line_ts(line)
                 if ts is None:
@@ -560,12 +574,12 @@ def parse_traces_with_stats(
             for n in seq:
                 unique_nodes_in_file.add(n)
 
-            # transit stats (exclude Unknown unless explicitly included)
+            # статистика транзита (Unknown исключаем, если явно не включён)
             for n in seq[1:-1]:
                 if include_unknown or n != UNKNOWN_ID:
                     transit_count[n] += 1
 
-            # RSSI samples extraction
+            # извлечение выборок RSSI
             dbs: List[Optional[float]] = []
             for mdb in DB_RE.finditer(line):
                 v = mdb.group(1)
@@ -581,7 +595,7 @@ def parse_traces_with_stats(
                     hop += 1
                     continue
 
-                # drop edges adjacent to Unknown if Unknown is excluded
+                # удаляем рёбра, смежные с Unknown, если Unknown исключён
                 if (not include_unknown) and (a == UNKNOWN_ID or b == UNKNOWN_ID):
                     dropped_unknown_edges += 1
                     if hop < len(dbs) and dbs[hop] is not None:
@@ -597,7 +611,7 @@ def parse_traces_with_stats(
                     edge_rssi[(a, b)].append(float(dbs[hop]))
                 hop += 1
 
-        # If window active: select file only if it had >=1 line_in_window
+        # Если окно активно: выбираем файл только если есть >=1 строка в окне
         if w_start and w_end:
             if lines_in_window > 0:
                 selected_files.append(tf)
@@ -629,247 +643,39 @@ def parse_traces_with_stats(
     return dict(edge_count), dict(edge_rssi), dict(transit_count), stats_list, debug, selected_files
 
 
-def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
-    payload_json = json.dumps(graph_payload, ensure_ascii=False, indent=2)
-    html = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Meshtastic Graph</title>
-    <style>
-      html, body {{
-        margin: 0;
-        padding: 0;
-        background: #0b0b0b;
-        color: #f5f5f5;
-        font-family: "Helvetica Neue", Arial, sans-serif;
-        height: 100%;
-        overflow: hidden;
-      }}
-      .toolbar {{
-        position: absolute;
-        left: 16px;
-        top: 16px;
-        background: rgba(20, 20, 20, 0.9);
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 12px 14px;
-        font-size: 14px;
-        z-index: 10;
-      }}
-      .toolbar h1 {{
-        font-size: 16px;
-        margin: 0 0 8px 0;
-        font-weight: 600;
-      }}
-      .toolbar .meta {{
-        font-size: 12px;
-        color: #c0c0c0;
-        line-height: 1.4;
-      }}
-      svg {{
-        width: 100vw;
-        height: 100vh;
-      }}
-      .link {{
-        stroke-opacity: 0.75;
-      }}
-      .node circle {{
-        stroke: #222;
-        stroke-width: 1px;
-      }}
-      .node text {{
-        fill: #f0f0f0;
-        pointer-events: none;
-        font-size: 11px;
-      }}
-      .tooltip {{
-        position: absolute;
-        pointer-events: none;
-        background: rgba(25, 25, 25, 0.95);
-        border: 1px solid #444;
-        padding: 8px 10px;
-        border-radius: 6px;
-        color: #f0f0f0;
-        font-size: 12px;
-        line-height: 1.4;
-        opacity: 0;
-        transition: opacity 0.1s ease;
-      }}
-    </style>
-  </head>
-  <body>
-    <div class="toolbar">
-      <h1>Meshtastic Graph (D3.js)</h1>
-      <div class="meta" id="meta"></div>
-    </div>
-    <div class="tooltip" id="tooltip"></div>
-    <svg></svg>
-    <script src="https://d3js.org/d3.v7.min.js"></script>
-    <script>
-      window.addEventListener("load", () => {{
-      if (typeof d3 === "undefined") {{
-        const meta = document.getElementById("meta");
-        meta.textContent = "D3.js failed to load (check network or local hosting).";
-        return;
-      }}
-      const graph = {payload_json};
-      const meta = document.getElementById("meta");
-      meta.textContent = `Nodes: ${{graph.meta.nodes}} | Links: ${{graph.meta.links}} | Min edge: ${{graph.meta.minEdge}} | Unknown: ${{graph.meta.includeUnknown ? "yes" : "no"}}`;
+def render_svg(dot_path: Path, svg_path: Path) -> None:
+    subprocess.run(["dot", "-Tsvg", str(dot_path), "-o", str(svg_path)], check=True)
 
-      const width = window.innerWidth;
-      const height = window.innerHeight;
-      const svg = d3.select("svg");
-      svg.attr("width", width).attr("height", height);
-      const zoomLayer = svg.append("g");
 
-      const tooltip = d3.select("#tooltip");
+def render_jpg(dot_path: Path, jpg_path: Path, dpi: int) -> None:
+    subprocess.run(["dot", "-Tjpg", f"-Gdpi={dpi}", str(dot_path), "-o", str(jpg_path)], check=True)
 
-      svg.call(
-        d3.zoom().scaleExtent([0.2, 4]).on("zoom", (event) => {{
-          zoomLayer.attr("transform", event.transform);
-        }})
-      );
 
-      const link = zoomLayer
-        .append("g")
-        .attr("class", "links")
-        .selectAll("line")
-        .data(graph.links)
-        .enter()
-        .append("line")
-        .attr("class", "link")
-        .attr("stroke", (d) => d.color || "#666")
-        .attr("stroke-width", (d) => d.width || 1.5);
+def enforce_svg_size(svg_path: Path, width_pt: str = "8000pt", height_pt: str = "4500pt") -> None:
+    """
+    Постобработка корневого SVG-элемента, чтобы задать нужные ширину/высоту.
+    """
+    s = svg_path.read_text(errors="ignore")
+    # Заменяем width="...pt" и height="...pt" в теге <svg ...>
+    # Делаем минимально и детерминированно.
+    s2 = re.sub(r'(<svg\b[^>]*?)\swidth="[^"]*"', r'\1 width="' + width_pt + '"', s, count=1)
+    s2 = re.sub(r'(<svg\b[^>]*?)\sheight="[^"]*"', r'\1 height="' + height_pt + '"', s2, count=1)
 
-      const node = zoomLayer
-        .append("g")
-        .attr("class", "nodes")
-        .selectAll("g")
-        .data(graph.nodes)
-        .enter()
-        .append("g")
-        .attr("class", "node")
-        .call(
-          d3.drag()
-            .on("start", dragstarted)
-            .on("drag", dragged)
-            .on("end", dragended)
-        );
+    # Если width/height отсутствуют, вставляем после <svg
+    if s2 == s:
+        s2 = re.sub(r"<svg\b", f'<svg width="{width_pt}" height="{height_pt}"', s, count=1)
 
-      node
-        .append("circle")
-        .attr("r", (d) => Math.max(6, d.neighbors * 1.2 + 6))
-        .attr("fill", (d) => d.fill || "#888")
-        .on("mouseover", (event, d) => {{
-          tooltip
-            .style("opacity", 1)
-            .html(
-              `<strong>${{d.longName}}</strong> [${{d.shortName}}]<br/>` +
-              `${{d.id}}<br/>` +
-              `Role: ${{d.role || "UNKNOWN"}}<br/>` +
-              `Neighbors: ${{d.neighbors}}<br/>` +
-              `Routing: ${{d.routingPct.toFixed(1)}}%<br/>` +
-              `chUtil: ${{d.chUtil === null ? "n/a" : d.chUtil.toFixed(1) + "%"}}`
-            );
-        }})
-        .on("mousemove", (event) => {{
-          tooltip.style("left", event.pageX + 12 + "px").style("top", event.pageY + 12 + "px");
-        }})
-        .on("mouseout", () => {{
-          tooltip.style("opacity", 0);
-        }});
-
-      node
-        .append("text")
-        .attr("x", 10)
-        .attr("y", 4)
-        .text((d) => d.label);
-
-      if (!graph.nodes || graph.nodes.length === 0) {{
-        meta.textContent = "No nodes to display (check filters or input data).";
-        return;
-      }}
-
-      const simulation = d3
-        .forceSimulation(graph.nodes)
-        .force(
-          "link",
-          d3
-            .forceLink(graph.links)
-            .id((d) => d.id)
-            .distance((d) => 160 + Math.min(220, d.count * 8))
-            .strength(0.6)
-        )
-        .force("charge", d3.forceManyBody().strength(-650))
-        .force("center", d3.forceCenter(width / 2, height / 2))
-        .force(
-          "radial",
-          d3
-            .forceRadial((d) => 140 + d.neighbors * 24, width / 2, height / 2)
-            .strength(0.75)
-        )
-        .force(
-          "collision",
-          d3.forceCollide().radius((d) => {{
-            const labelBoost = d.label ? Math.min(24, d.label.length * 0.7) : 0;
-            return Math.max(24, d.neighbors * 1.8 + 16 + labelBoost);
-          }})
-        );
-
-      simulation.on("tick", () => {{
-        link
-          .attr("x1", (d) => d.source.x)
-          .attr("y1", (d) => d.source.y)
-          .attr("x2", (d) => d.target.x)
-          .attr("y2", (d) => d.target.y);
-
-        node.attr("transform", (d) => `translate(${{d.x}},${{d.y}})`);
-      }});
-
-      function dragstarted(event, d) {{
-        if (!event.active) simulation.alphaTarget(0.3).restart();
-        d.fx = d.x;
-        d.fy = d.y;
-      }}
-
-      function dragged(event, d) {{
-        d.fx = event.x;
-        d.fy = event.y;
-      }}
-
-      function dragended(event, d) {{
-        if (!event.active) simulation.alphaTarget(0);
-        d.fx = null;
-        d.fy = null;
-      }}
-
-      window.addEventListener("resize", () => {{
-        const w = window.innerWidth;
-        const h = window.innerHeight;
-        svg.attr("width", w).attr("height", h);
-        simulation.force("center", d3.forceCenter(w / 2, h / 2));
-        simulation.force(
-          "radial",
-          d3.forceRadial((d) => 140 + d.neighbors * 24, w / 2, h / 2).strength(0.75)
-        );
-        simulation.alpha(0.3).restart();
-      }});
-      }});
-    </script>
-  </body>
-</html>
-"""
-    html_path.write_text(html, encoding="utf-8")
+    svg_path.write_text(s2, encoding="utf-8")
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="graphGen.py: build Meshtastic graph (D3.js HTML/JSON) from trace files.")
+    ap = argparse.ArgumentParser(description="graphGen.py: build Meshtastic graph (DOT+SVG+JPG) from trace files.")
 
-    # Keep existing args (as you used)
+    # Сохраняем существующие аргументы (как у вас)
     ap.add_argument("--root", default=".", help="Directory with input files (default: current).")
     ap.add_argument("--min-edge", type=int, default=3, help="Minimum confirmations to keep a directed link (default: 3).")
+    ap.add_argument("--rankdir", default="LR", choices=["LR", "TB", "RL", "BT"], help="Graphviz rankdir (default: LR).")
+    ap.add_argument("--dpi", type=int, default=75, help="JPG DPI (default: 75).")
     ap.add_argument(
         "--include-unknown",
         action="store_true",
@@ -877,7 +683,7 @@ def main() -> int:
     )
     ap.add_argument("--top", type=int, default=15, help="Top N lines in summary lists (default: 15).")
 
-    # Your time window option
+    # Опция временного окна
     ap.add_argument(
         "--datetime",
         default=None,
@@ -888,7 +694,7 @@ def main() -> int:
         ),
     )
 
-    # Only thickness scaling change (relative range)
+    # Изменение только для толщины рёбер (относительная шкала)
     ap.add_argument(
         "--minwidthline",
         type=float,
@@ -905,10 +711,8 @@ def main() -> int:
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
 
-    # Fixed paths
-    trace_root, out_dir, node_search = fixed_paths()
-
-    root = Path(args.root).resolve()  # printed only (kept as before)
+    root = Path(args.root).resolve()
+    trace_root, out_dir, node_search = fixed_paths(root)
     include_unknown = bool(args.include_unknown)
 
     print(f"graphGen.py version {__version__}")
@@ -923,6 +727,13 @@ def main() -> int:
     print(f"  3) home:   {node_search[2]}")
     print("")
 
+    dot_bin = which_dot()
+    if not dot_bin:
+        eprint("ERROR: Graphviz 'dot' not found in PATH. Install graphviz and retry.")
+        return 4
+    print(f"Graphviz: {dot_bin}")
+    print("")
+
     trace_files = find_trace_files(trace_root)
     if not trace_files:
         eprint("ERROR: no trace files found. Expected patterns in ~/meshLogger: 'YYYY-MM-DD !xxxxxxxx*.txt'")
@@ -932,7 +743,7 @@ def main() -> int:
 
     node_meta, nodedb_path, meta_debug = build_node_meta(node_search)
 
-    # --datetime window parse
+    # Разбор окна --datetime
     dt_window: Optional[Tuple[datetime, datetime]] = None
     if args.datetime is not None:
         try:
@@ -946,7 +757,7 @@ def main() -> int:
         print(f"  expr: '{args.datetime}'")
         print(f"  window: {w_start.strftime('%Y-%m-%d %H:%M:%S')} - {w_end.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"  traces in folder: {len(trace_files)}")
-        # selection will be known after parse
+        # выборка будет известна после парсинга
         print("")
 
     edge_count, edge_rssi, transit_count, per_file_stats, parse_debug, selected_files = parse_traces_with_stats(
@@ -970,8 +781,9 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_base = build_auto_out(measurer_id)
-    json_path = out_dir / f"{out_base}.json"
-    html_path = out_dir / f"{out_base}.html"
+    dot_path = out_dir / f"{out_base}.dot"
+    svg_path = out_dir / f"{out_base}.svg"
+    jpg_path = out_dir / f"{out_base}.jpg"
 
     print("Read files:")
     print(f"node database: {nodedb_path if nodedb_path else '(not found)'}")
@@ -1002,7 +814,7 @@ def main() -> int:
     print("")
 
     print("trace log files summary:")
-    # print stats only for files; show window hit counts if window used
+    # печатаем статистику по файлам; при окне показываем попадания
     for st in per_file_stats:
         print(st.path)
         print(f"  size: {human_bytes(st.size_bytes)} | mtime: {st.mtime_iso} | sig: {st.sha1sig[:12]}…")
@@ -1017,7 +829,7 @@ def main() -> int:
         print(f"  unknown mentions: {st.unknown_mentions}")
         print("")
 
-    # filter edges by confirmation count
+    # фильтруем рёбра по числу подтверждений
     edge_count_f = {
         k: v
         for k, v in edge_count.items()
@@ -1025,7 +837,7 @@ def main() -> int:
         and (include_unknown or (k[0] != UNKNOWN_ID and k[1] != UNKNOWN_ID))
     }
 
-    # build neighbors (unique visible)
+    # строим соседей (уникальные видимые)
     neighbors: Dict[str, set] = defaultdict(set)
     for (a, b), _c in edge_count_f.items():
         neighbors[a].add(b)
@@ -1039,7 +851,7 @@ def main() -> int:
     deg_u = {n: len(neighbors[n]) for n in nodes}
     vmax_neighbors = max(deg_u.values()) if deg_u else 1
 
-    # routing percent based on transit_count limited to kept nodes
+    # процент маршрутизации по transit_count, ограниченный сохранёнными узлами
     total_transit = 0
     for n, c in transit_count.items():
         if n in nodes:
@@ -1047,7 +859,7 @@ def main() -> int:
     total_transit = total_transit or 1
     routing_pct = {n: (transit_count.get(n, 0) / total_transit) * 100.0 for n in nodes}
 
-    # rssi global min/max from kept edges only
+    # глобальные min/max RSSI только по сохранённым рёбрам
     all_rssi_vals: List[float] = []
     missing_rssi_edges = 0
     for (a, b), _cnt in edge_count_f.items():
@@ -1058,20 +870,19 @@ def main() -> int:
             missing_rssi_edges += 1
     vmin, vmax = (min(all_rssi_vals), max(all_rssi_vals)) if all_rssi_vals else (-25.0, 5.0)
 
-    # EDGE THICKNESS (RELATIVE) — единственное изменение алгоритма толщины:
-    # max confirmations in THIS run => 100% => maxwidthline
+    # ТОЛЩИНА РЁБЕР (ОТНОСИТЕЛЬНО) — единственное изменение алгоритма толщины:
+    # максимум подтверждений В ЭТОМ запуске => 100% => maxwidthline
     max_conf = max(edge_count_f.values()) if edge_count_f else 1
     min_w = float(args.minwidthline)
     max_w = float(args.maxwidthline)
     if max_w < min_w:
-        # keep deterministic behaviour, but do not change other parts
+        # сохраняем детерминированность, не трогая остальное
         max_w, min_w = min_w, max_w
 
     def penwidth_from_count_relative(cnt: int) -> float:
         if max_conf <= 0:
             return round(min_w, 2)
-        denom = math.log1p(max_conf)
-        t = math.log1p(cnt) / denom if denom > 0 else 0.0  # 0..1, logarithmic
+        t = cnt / float(max_conf)  # от 0 до 1
         w = min_w + t * (max_w - min_w)
         return round(w, 2)
 
@@ -1108,8 +919,14 @@ def main() -> int:
         print(f"  {transit_count.get(n,0):>5}  {pct:>5.1f}%  {pretty_name(n)}")
     print("")
 
-    # D3 payload
-    nodes_payload: List[Dict[str, Any]] = []
+    # сборка DOT
+    dot_lines: List[str] = []
+    dot_lines.append("digraph Meshtastic {")
+    dot_lines.append(f'  graph [rankdir={args.rankdir}, bgcolor="black", nodesep=0.55, ranksep=0.90];')
+    dot_lines.append('  node [shape=box, style="rounded,filled", fontcolor="#000000", color="#333333", fontname="Helvetica"];')
+    dot_lines.append('  edge [arrowsize=0.8];')
+    dot_lines.append("")
+
     for nid in nodes:
         meta = node_meta.get(nid, {"longName": "", "shortName": "", "role": "", "chUtil": None})
         ln = meta.get("longName") or "Unknown"
@@ -1118,66 +935,52 @@ def main() -> int:
         fill = role_fill(role)
 
         cu = meta.get("chUtil")
+        cu_str = f"{cu:.1f}%" if isinstance(cu, (int, float)) else "n/a"
+
         neigh = deg_u.get(nid, 0)
         fs = fontsize_from_neighbors(neigh, vmax_neighbors)
         margin = margin_from_neighbors(neigh, vmax_neighbors)
 
-        nodes_payload.append(
-            {
-                "id": nid,
-                "label": f"{ln} [{sn}]",
-                "longName": ln,
-                "shortName": sn,
-                "role": role or "UNKNOWN",
-                "neighbors": neigh,
-                "routingPct": round(routing_pct.get(nid, 0.0), 2),
-                "chUtil": float(cu) if isinstance(cu, (int, float)) else None,
-                "fill": fill,
-                "fontSize": fs,
-                "margin": margin,
-            }
-        )
+        line1 = f"{ln} [{sn}]"
+        line2 = nid
+        line3 = fmt_role(role)
+        line4 = f"neighbors:{neigh} | routing:{routing_pct.get(nid, 0.0):.1f}% | chUtil:{cu_str}"
 
-    links_payload: List[Dict[str, Any]] = []
+        label = (
+            f'<<FONT POINT-SIZE="{fs}">'
+            f"{esc_html(line1)}<BR/>"
+            f"{esc_html(line2)}<BR/>"
+            f"{esc_html(line3)}<BR/>"
+            f"{esc_html(line4)}"
+            f"</FONT>>"
+        )
+        dot_lines.append(f'  "{nid}" [fillcolor="{fill}", fontsize={fs}, margin="{margin}", label={label}];')
+
+    dot_lines.append("")
     for (a, b), cnt in edge_count_f.items():
         vals = edge_rssi.get((a, b), [])
         avg = (sum(vals) / len(vals)) if vals else None
         color = grad_rssi(avg, vmin, vmax)
 
-        # ONLY thickness formula changed here:
+        # ТОЛЬКО здесь меняется формула толщины:
         pw = penwidth_from_count_relative(cnt)
 
-        links_payload.append(
-            {
-                "source": a,
-                "target": b,
-                "count": cnt,
-                "avgRssi": round(avg, 2) if avg is not None else None,
-                "color": color,
-                "width": pw,
-            }
-        )
+        dot_lines.append(f'  "{a}" -> "{b}" [penwidth={pw}, color="{color}"];')
+    dot_lines.append("}")
 
-    payload = {
-        "meta": {
-            "generatedAt": datetime.now().isoformat(timespec="seconds"),
-            "nodes": len(nodes_payload),
-            "links": len(links_payload),
-            "minEdge": args.min_edge,
-            "includeUnknown": include_unknown,
-            "rssiRange": {"min": round(vmin, 2), "max": round(vmax, 2)},
-            "maxConfirmations": max_conf,
-        },
-        "nodes": nodes_payload,
-        "links": links_payload,
-    }
+    dot_path.write_text("\n".join(dot_lines), encoding="utf-8")
 
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_d3_html(html_path, payload)
+    try:
+        render_svg(dot_path, svg_path)
+        enforce_svg_size(svg_path, width_pt="8000pt", height_pt="4500pt")
+        render_jpg(dot_path, jpg_path, args.dpi)
+    except subprocess.CalledProcessError as e:
+        eprint("ERROR: dot failed:", e)
+        return 5
 
-    print(f"OK: wrote {json_path}")
-    print(f"OK: wrote {html_path}")
-    print("Tip: open HTML via a local web server to avoid browser file:// restrictions.")
+    print(f"OK: wrote {dot_path}")
+    print(f"OK: wrote {svg_path}")
+    print(f"OK: wrote {jpg_path}")
     print("")
     return 0
 
