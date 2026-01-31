@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-graphGen.py — генератор графов Graphviz DOT/SVG/JPG по трассам Meshtastic (болтливый вывод в терминал)
+graphGen.py — генератор графов Meshtastic:
+  - Graphviz DOT/SVG
+  - D3.js HTML/JSON (интерактив и normalized stacked area chart)
 
-Версия: 0.7.9
-Дата: 2026-01-25
+Версия: 0.8.1
+Дата: 2026-01-31
 
 ИСТОРИЯ ИЗМЕНЕНИЙ:
+0.8.1 (2026-01-31)
+  - Добавлен D3.js HTML/JSON вывод, включая normalized stacked area chart по важности узлов.
+  - Переключатель --no-d3 для отключения D3.
+  - Graphviz метки переведены на обычный label (не HTML) + charset UTF-8 + шрифт DejaVu Sans.
+
 0.7.9 (2026-01-25)
   - Фильтр окна --datetime теперь берёт временные метки СТРОГО с начала КАЖДОЙ СТРОКИ ТРАССЫ
     внутри файла (НЕ из имени файла и НЕ из mtime/ctime).
@@ -14,7 +21,7 @@ graphGen.py — генератор графов Graphviz DOT/SVG/JPG по тра
       максимум подтверждений => 100% => maxwidthline
       остальные => пропорционально между minwidthline..maxwidthline
     Добавлено: --minwidthline / --maxwidthline (по умолчанию 1..30).
-  - JPG DPI по умолчанию установлен на 75.
+  - PNG отключён, рендерится только SVG.
   - Постобработка SVG: width="8000pt" height="4500pt".
 
 0.7.5 (2026-01-19)
@@ -25,7 +32,7 @@ graphGen.py — генератор графов Graphviz DOT/SVG/JPG по тра
     Флаг --include-unknown возвращает старое поведение.
   - В терминале выводится, сколько рёбер отброшено из-за Unknown.
   - Имя выходных файлов по шаблону: "YYYY-MM-DD HH:MM:SS !<measurer_id>"
-  - Автоопределение measurer id по именам файлов; DOT+SVG+JPG по умолчанию
+  - Автоопределение measurer id по именам файлов; DOT+SVG по умолчанию
 
 ВАЖНЫЕ ПУТИ:
   - папка трасс:     <root>/meshLogger
@@ -36,7 +43,7 @@ graphGen.py — генератор графов Graphviz DOT/SVG/JPG по тра
   'YYYY-MM-DD !xxxxxxxx*.txt'
 """
 
-__version__ = "0.7.9"
+__version__ = "0.8.1"
 
 import argparse
 import colorsys
@@ -49,7 +56,7 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,15 +75,18 @@ ROLE_COLORS = {
     "UNKNOWN": "#e0e0e0",
 }
 
-# разбор hop в строках трассировки
+# hop parsing in trace lines
+# RU: разбор hop в строках трассировки
 NODE_RE = re.compile(r"(![0-9a-fA-F]{8}|Unknown)")
 DB_RE = re.compile(r"\((-?\d+(?:\.\d+)?|\?)dB\)")
 
-# извлечение measurer-id из имени файла
+# measurer-id extraction from filename
+# RU: извлечение measurer-id из имени файла
 TRACE_NAME_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+(![0-9a-fA-F]{8})", re.I)
 
-# временная метка в начале каждой строки трассы (фильтруем ТОЛЬКО по ней)
-# Принимаем:
+# timestamp at the start of each trace line (filter ONLY by it)
+# RU: временная метка в начале каждой строки трассы (фильтруем ТОЛЬКО по ней)
+# Accepted / RU: Принимаем:
 #   2026-01-24 16:30:12 ...
 #   2026-01-24 16:30 ...
 LINE_TS_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})(?:[ T]+(\d{2}:\d{2})(?::(\d{2}))?)?")
@@ -175,8 +185,10 @@ def fixed_paths(root: Path) -> Tuple[Path, Path, List[Path]]:
     script_dir = Path(__file__).resolve().parent
     home = Path.home().resolve()
 
-    # В вашем сценарии запуск из ~/meshTools и скрипт там же.
-    # Берём root как cwd, чтобы сохранить текущее поведение.
+    # In your scenario, run from ~/meshTools and script is there.
+    # RU: В вашем сценарии запуск из ~/meshTools и скрипт там же.
+    # Use root as cwd to keep current behavior.
+    # RU: Берём root как cwd, чтобы сохранить текущее поведение.
     trace_root = root / "meshLogger"
     out_dir = root / "graphGen"
     node_search = [root, script_dir, home]
@@ -243,6 +255,10 @@ def esc_html(s: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def esc_dot_label(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
 
 
 def grad_rssi(value_db: Optional[float], vmin: float, vmax: float) -> str:
@@ -321,14 +337,16 @@ def parse_datetime_point(s: str) -> Tuple[datetime, bool]:
     has_time=True, если строка содержит HH:MM (и опционально :SS).
     """
     s = (s or "").strip()
-    # пробуем полные форматы
+    # try full formats
+    # RU: пробуем полные форматы
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(s, fmt)
             return dt, True
         except Exception:
             pass
-    # только дата
+    # date only
+    # RU: только дата
     try:
         dt = datetime.strptime(s, "%Y-%m-%d")
         return dt, False
@@ -354,11 +372,13 @@ def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
         a_dt, a_has_time = parse_datetime_point(a_str)
         b_dt, b_has_time = parse_datetime_point(b_str)
 
-        # Если конец — только дата, берём конец дня
+        # If end is date-only, use end of day.
+        # RU: Если конец — только дата, берём конец дня
         if not b_has_time:
             b_dt = b_dt + timedelta(days=1) - timedelta(seconds=1)
 
-        # Если начало — только дата, это уже начало дня
+        # If start is date-only, it's start of day.
+        # RU: Если начало — только дата, это уже начало дня
         if not a_has_time:
             a_dt = a_dt.replace(hour=0, minute=0, second=0)
 
@@ -366,14 +386,45 @@ def parse_datetime_window(expr: str) -> Tuple[datetime, datetime]:
             raise ValueError("bad --datetime format")
         return a_dt, b_dt
 
-    # одиночная точка:
+    # single point:
+    # RU: одиночная точка:
     a_dt, a_has_time = parse_datetime_point(expr)
     if a_has_time:
-        # точная минута/секунда => считаем [dt .. dt] (один момент)
+        # exact minute/second => [dt .. dt] (single moment)
+        # RU: точная минута/секунда => считаем [dt .. dt] (один момент)
         return a_dt, a_dt
-    # только дата => весь день
+    # date only => full day
+    # RU: только дата => весь день
     b_dt = a_dt + timedelta(days=1) - timedelta(seconds=1)
     return a_dt, b_dt
+
+
+def parse_ts_to_epoch(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            s_norm = s.replace("Z", "+00:00")
+            dt_obj = datetime.fromisoformat(s_norm)
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+            return dt_obj.timestamp()
+        except Exception:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    dt_obj = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                    return dt_obj.timestamp()
+                except Exception:
+                    continue
+    return None
 
 
 @dataclass
@@ -410,7 +461,8 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
             nodedb_path = cand
             break
     if nodedb_path is None:
-        # запасной поиск по шаблонам
+        # fallback search by patterns
+        # RU: запасной поиск по шаблонам
         for base in node_search:
             cand = find_latest_file(["nodeDb*.txt", "nodeDb*.TXT"], base)
             if cand:
@@ -429,8 +481,10 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                 short_name = ""
                 role = ""
                 ch_util = None
+                first_seen_epoch: Optional[float] = None
 
-                # Вариант A: current.user — словарь
+                # Variant A: current.user is a dict
+                # RU: Вариант A: current.user — словарь
                 user = cur.get("user")
                 if isinstance(user, dict):
                     long_name = user.get("longName") or ""
@@ -438,19 +492,24 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                     if user.get("role"):
                         role = (user.get("role") or "").upper()
 
-                # Вариант B: nodeDb как у вас: current.raw_nodes_row — словарь
+                # Variant B: your nodeDb format: current.raw_nodes_row is a dict
+                # RU: Вариант B: nodeDb как у вас: current.raw_nodes_row — словарь
                 raw = cur.get("raw_nodes_row")
                 if isinstance(raw, dict):
-                    # 'User' — длинное имя из вашего экспорта
+                    # 'User' is long name from your export
+                    # RU: 'User' — длинное имя из вашего экспорта
                     if not long_name and isinstance(raw.get("User"), str):
                         long_name = raw.get("User") or ""
-                    # 'AKA' часто содержит короткий тег
+                    # 'AKA' often contains short tag
+                    # RU: 'AKA' часто содержит короткий тег
                     if not short_name and isinstance(raw.get("AKA"), str):
                         short_name = raw.get("AKA") or ""
-                    # Роль
+                    # Role
+                    # RU: Роль
                     if not role and isinstance(raw.get("Role"), str):
                         role = (raw.get("Role") or "").upper()
-                    # Утилизация канала.
+                    # Channel utilization.
+                    # RU: Утилизация канала.
                     for k in ("Channel util.", "Channel util", "channel util.", "channel util"):
                         v = raw.get(k)
                         if isinstance(v, (int, float)):
@@ -465,18 +524,22 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                                 except Exception:
                                     pass
 
-                # Вариант C: current.aka или current.user (строка) как последний шанс
+                # Variant C: current.aka or current.user (string) as last resort
+                # RU: Вариант C: current.aka или current.user (строка) как последний шанс
                 aka = cur.get("aka")
                 if isinstance(aka, str) and not short_name:
                     short_name = aka
                 if isinstance(user, str) and not long_name:
                     long_name = user
 
+                first_seen_epoch = parse_ts_to_epoch(rec.get("first_seen_utc"))
+
                 node_meta[nid] = {
                     "longName": long_name,
                     "shortName": short_name,
                     "role": role,
                     "chUtil": ch_util,
+                    "firstSeenEpoch": first_seen_epoch,
                 }
                 debug["nodeDb_nodes_loaded"] += 1
                 if long_name:
@@ -484,7 +547,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
 
     node_meta.setdefault(
         UNKNOWN_ID,
-        {"longName": "Unknown node", "shortName": "ffff", "role": "", "chUtil": None},
+        {"longName": "Unknown node", "shortName": "ffff", "role": "", "chUtil": None, "firstSeenEpoch": None},
     )
     return node_meta, nodedb_path, debug
 
@@ -497,6 +560,8 @@ def parse_traces_with_stats(
     Dict[Tuple[str, str], int],
     Dict[Tuple[str, str], List[float]],
     Dict[str, int],
+    List[Dict[str, Any]],
+    Dict[str, Any],
     List[TraceFileStats],
     Dict[str, int],
     List[Path],
@@ -524,6 +589,12 @@ def parse_traces_with_stats(
     dropped_unknown_edges = 0
     dropped_unknown_edges_with_rssi = 0
 
+    base_bin_minutes = 5
+    bin_seconds = base_bin_minutes * 60
+    routing_by_bin: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    neighbors_by_bin: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
+    presence_by_bin: Dict[int, set] = defaultdict(set)
+
     selected_files: List[Path] = []
 
     w_start: Optional[datetime] = None
@@ -545,14 +616,23 @@ def parse_traces_with_stats(
         lines_in_window = 0
 
         for line in lines:
-            # фильтр окна использует метку времени ТОЛЬКО с начала строки
+            ts_line = parse_line_ts(line)
+            bin_key: Optional[int] = None
+
+            # window filter uses timestamp ONLY from line start
+            # RU: фильтр окна использует метку времени ТОЛЬКО с начала строки
             if w_start and w_end:
-                ts = parse_line_ts(line)
-                if ts is None:
+                if ts_line is None:
                     continue
-                if ts < w_start or ts > w_end:
+                if ts_line < w_start or ts_line > w_end:
                     continue
                 lines_in_window += 1
+
+            if ts_line is not None:
+                if ts_line.tzinfo is None:
+                    ts_line = ts_line.replace(tzinfo=timezone.utc)
+                epoch = int(ts_line.timestamp())
+                bin_key = epoch - (epoch % bin_seconds)
 
             if "-->" not in line:
                 continue
@@ -574,12 +654,21 @@ def parse_traces_with_stats(
             for n in seq:
                 unique_nodes_in_file.add(n)
 
-            # статистика транзита (Unknown исключаем, если явно не включён)
+            if bin_key is not None:
+                for n in seq:
+                    if include_unknown or n != UNKNOWN_ID:
+                        presence_by_bin[bin_key].add(n)
+
+            # transit stats (exclude Unknown unless included)
+            # RU: статистика транзита (Unknown исключаем, если явно не включён)
             for n in seq[1:-1]:
                 if include_unknown or n != UNKNOWN_ID:
                     transit_count[n] += 1
+                    if bin_key is not None:
+                        routing_by_bin[bin_key][n] += 1
 
-            # извлечение выборок RSSI
+            # extract RSSI samples
+            # RU: извлечение выборок RSSI
             dbs: List[Optional[float]] = []
             for mdb in DB_RE.finditer(line):
                 v = mdb.group(1)
@@ -595,7 +684,8 @@ def parse_traces_with_stats(
                     hop += 1
                     continue
 
-                # удаляем рёбра, смежные с Unknown, если Unknown исключён
+                # drop edges adjacent to Unknown if excluded
+                # RU: удаляем рёбра, смежные с Unknown, если Unknown исключён
                 if (not include_unknown) and (a == UNKNOWN_ID or b == UNKNOWN_ID):
                     dropped_unknown_edges += 1
                     if hop < len(dbs) and dbs[hop] is not None:
@@ -611,7 +701,12 @@ def parse_traces_with_stats(
                     edge_rssi[(a, b)].append(float(dbs[hop]))
                 hop += 1
 
-        # Если окно активно: выбираем файл только если есть >=1 строка в окне
+                if bin_key is not None:
+                    neighbors_by_bin[bin_key][a].add(b)
+                    neighbors_by_bin[bin_key][b].add(a)
+
+        # If window active: include file only if >=1 line in window
+        # RU: Если окно активно: выбираем файл только если есть >=1 строка в окне
         if w_start and w_end:
             if lines_in_window > 0:
                 selected_files.append(tf)
@@ -640,15 +735,30 @@ def parse_traces_with_stats(
         "dropped_unknown_edges": dropped_unknown_edges,
         "dropped_unknown_edges_with_rssi": dropped_unknown_edges_with_rssi,
     }
-    return dict(edge_count), dict(edge_rssi), dict(transit_count), stats_list, debug, selected_files
+    time_bins = sorted(set(list(routing_by_bin.keys()) + list(neighbors_by_bin.keys()) + list(presence_by_bin.keys())))
+    time_series: List[Dict[str, Any]] = []
+    for t in time_bins:
+        routing_counts = dict(routing_by_bin.get(t, {}))
+        neighbors_counts = {n: len(s) for n, s in neighbors_by_bin.get(t, {}).items()}
+        uptime_counts = {n: 1 for n in presence_by_bin.get(t, set())}
+        time_series.append(
+            {
+                "t": t,
+                "routing": routing_counts,
+                "neighbors": neighbors_counts,
+                "uptime": uptime_counts,
+            }
+        )
+    time_meta = {
+        "baseBinMinutes": base_bin_minutes,
+        "timeRangeStart": time_bins[0] if time_bins else None,
+        "timeRangeEnd": time_bins[-1] if time_bins else None,
+    }
+    return dict(edge_count), dict(edge_rssi), dict(transit_count), time_series, time_meta, stats_list, debug, selected_files
 
 
 def render_svg(dot_path: Path, svg_path: Path) -> None:
     subprocess.run(["dot", "-Tsvg", str(dot_path), "-o", str(svg_path)], check=True)
-
-
-def render_jpg(dot_path: Path, jpg_path: Path, dpi: int) -> None:
-    subprocess.run(["dot", "-Tjpg", f"-Gdpi={dpi}", str(dot_path), "-o", str(jpg_path)], check=True)
 
 
 def enforce_svg_size(svg_path: Path, width_pt: str = "8000pt", height_pt: str = "4500pt") -> None:
@@ -656,56 +766,363 @@ def enforce_svg_size(svg_path: Path, width_pt: str = "8000pt", height_pt: str = 
     Постобработка корневого SVG-элемента, чтобы задать нужные ширину/высоту.
     """
     s = svg_path.read_text(errors="ignore")
-    # Заменяем width="...pt" и height="...pt" в теге <svg ...>
-    # Делаем минимально и детерминированно.
+    # Replace width/height in <svg ...> tag.
+    # RU: Заменяем width="...pt" и height="...pt" в теге <svg ...>
+    # Minimal, deterministic changes.
+    # RU: Делаем минимально и детерминированно.
     s2 = re.sub(r'(<svg\b[^>]*?)\swidth="[^"]*"', r'\1 width="' + width_pt + '"', s, count=1)
     s2 = re.sub(r'(<svg\b[^>]*?)\sheight="[^"]*"', r'\1 height="' + height_pt + '"', s2, count=1)
 
-    # Если width/height отсутствуют, вставляем после <svg
+    # If width/height missing, insert after <svg
+    # RU: Если width/height отсутствуют, вставляем после <svg
     if s2 == s:
         s2 = re.sub(r"<svg\b", f'<svg width="{width_pt}" height="{height_pt}"', s, count=1)
 
     svg_path.write_text(s2, encoding="utf-8")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="graphGen.py: build Meshtastic graph (DOT+SVG+JPG) from trace files.")
+def write_d3_html(html_path: Path, graph_payload: Dict[str, Any]) -> None:
+    payload_json = json.dumps(graph_payload, ensure_ascii=False)
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meshtastic Graph (D3)</title>
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+        background: #0b0b0b;
+        color: #f5f5f5;
+        font-family: "Helvetica Neue", Arial, sans-serif;
+        height: 100%;
+      }}
+      .toolbar {{
+        position: fixed;
+        left: 16px;
+        top: 16px;
+        background: rgba(20, 20, 20, 0.9);
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 12px 14px;
+        font-size: 13px;
+        z-index: 10;
+      }}
+      .toolbar h1 {{
+        font-size: 16px;
+        margin: 0 0 8px 0;
+        font-weight: 600;
+      }}
+      .toolbar label {{
+        display: block;
+        margin-top: 6px;
+      }}
+      .toolbar input[type="number"] {{
+        width: 64px;
+        background: #101010;
+        color: #f5f5f5;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 2px 4px;
+        margin-left: 6px;
+      }}
+      #graph {{
+        width: 100vw;
+        height: 100vh;
+      }}
+    </style>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+  </head>
+  <body>
+    <div class="toolbar">
+      <h1>Meshtastic D3</h1>
+      <div id="meta"></div>
+      <label>Sort by:
+        <select id="sortMetric">
+          <option value="routing">routing</option>
+          <option value="neighbors">neighbors</option>
+          <option value="uptime">uptime</option>
+        </select>
+      </label>
+      <label>Top N:
+        <input type="number" id="topN" min="5" max="200" value="30" />
+      </label>
+      <label>Min neighbors:
+        <input type="number" id="minNeighbors" min="0" max="200" value="0" />
+      </label>
+      <label>Time window:
+        <input type="datetime-local" id="timeStart" />
+        <input type="datetime-local" id="timeEnd" />
+      </label>
+    </div>
+    <svg id="graph"></svg>
+    <script>
+      const graph = {payload_json};
+      const meta = document.getElementById("meta");
+      const tsCount = (graph.timeSeries || []).length;
+      meta.textContent = `Nodes: ${{graph.meta.nodes}} | Links: ${{graph.meta.links}} | Min edge: ${{graph.meta.minEdge}} | Unknown: ${{graph.meta.includeUnknown ? "yes" : "no"}} | TS bins: ${{tsCount}}`;
 
-    # Сохраняем существующие аргументы (как у вас)
-    ap.add_argument("--root", default=".", help="Directory with input files (default: current).")
-    ap.add_argument("--min-edge", type=int, default=3, help="Minimum confirmations to keep a directed link (default: 3).")
-    ap.add_argument("--rankdir", default="LR", choices=["LR", "TB", "RL", "BT"], help="Graphviz rankdir (default: LR).")
-    ap.add_argument("--dpi", type=int, default=75, help="JPG DPI (default: 75).")
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const svg = d3.select("#graph");
+      svg.attr("width", width).attr("height", height);
+      const zoomLayer = svg.append("g");
+
+      svg.call(
+        d3.zoom().scaleExtent([0.2, 4]).on("zoom", (event) => {{
+          zoomLayer.attr("transform", event.transform);
+        }})
+      );
+
+      const link = zoomLayer
+        .append("g")
+        .attr("class", "links")
+        .selectAll("line")
+        .data(graph.links)
+        .enter()
+        .append("line")
+        .attr("stroke", (d) => d.color || "#666")
+        .attr("stroke-width", (d) => d.width || 1.5)
+        .attr("stroke-opacity", 0.75);
+
+      const node = zoomLayer
+        .append("g")
+        .attr("class", "nodes")
+        .selectAll("g")
+        .data(graph.nodes)
+        .enter()
+        .append("g")
+        .call(d3.drag().on("start", dragstarted).on("drag", dragged).on("end", dragended));
+
+      node.append("circle")
+        .attr("r", (d) => Math.max(6, d.neighbors * 1.2 + 6))
+        .attr("fill", (d) => d.fill || "#888");
+
+      node.append("text")
+        .attr("x", 10)
+        .attr("y", 4)
+        .attr("fill", "#f5f5f5")
+        .text((d) => d.label || d.id);
+
+      const simulation = d3.forceSimulation(graph.nodes)
+        .force("link", d3.forceLink(graph.links).id((d) => d.id).distance((d) => 160 + Math.min(220, d.count * 8)).strength(0.6))
+        .force("charge", d3.forceManyBody().strength(-650))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("collision", d3.forceCollide().radius((d) => Math.max(24, d.neighbors * 1.8 + 16)));
+
+      simulation.on("tick", () => {{
+        link
+          .attr("x1", (d) => d.source.x)
+          .attr("y1", (d) => d.source.y)
+          .attr("x2", (d) => d.target.x)
+          .attr("y2", (d) => d.target.y);
+        node.attr("transform", (d) => `translate(${{d.x}},${{d.y}})`);
+      }});
+
+      function dragstarted(event, d) {{
+        if (!event.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+      }}
+      function dragged(event, d) {{
+        d.fx = event.x;
+        d.fy = event.y;
+      }}
+      function dragended(event, d) {{
+        if (!event.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+      }}
+
+      const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
+
+      function toLocalInputValue(d) {{
+        const pad = (v) => String(v).padStart(2, "0");
+        return (
+          d.getFullYear() +
+          "-" +
+          pad(d.getMonth() + 1) +
+          "-" +
+          pad(d.getDate()) +
+          "T" +
+          pad(d.getHours()) +
+          ":" +
+          pad(d.getMinutes())
+        );
+      }}
+
+      function initTimeInputs() {{
+        const s = graph.meta.timeRangeStart ? new Date(graph.meta.timeRangeStart * 1000) : null;
+        const e = graph.meta.timeRangeEnd ? new Date(graph.meta.timeRangeEnd * 1000) : null;
+        const timeStart = document.getElementById("timeStart");
+        const timeEnd = document.getElementById("timeEnd");
+        if (s && timeStart) {{
+          timeStart.value = toLocalInputValue(s);
+          timeStart.min = toLocalInputValue(s);
+          timeStart.max = e ? toLocalInputValue(e) : "";
+        }}
+        if (e && timeEnd) {{
+          timeEnd.value = toLocalInputValue(e);
+          timeEnd.min = s ? toLocalInputValue(s) : "";
+          timeEnd.max = toLocalInputValue(e);
+        }}
+      }}
+
+      function getTimeWindow() {{
+        const timeStart = document.getElementById("timeStart");
+        const timeEnd = document.getElementById("timeEnd");
+        const sVal = timeStart && timeStart.value ? new Date(timeStart.value) : null;
+        const eVal = timeEnd && timeEnd.value ? new Date(timeEnd.value) : null;
+        const startEpoch = sVal ? Math.floor(sVal.getTime() / 1000) : graph.meta.timeRangeStart;
+        const endEpoch = eVal ? Math.floor(eVal.getTime() / 1000) : graph.meta.timeRangeEnd;
+        return {{
+          start: startEpoch || 0,
+          end: endEpoch || 0
+        }};
+      }}
+
+      function applyFilters() {{
+        if (!graph.timeSeries || graph.timeSeries.length === 0) {{
+          node.attr("opacity", 1).attr("display", null);
+          link.attr("opacity", 0.75).attr("display", null);
+          return;
+        }}
+        const sortKey = document.getElementById("sortMetric").value;
+        const metrics = {{
+          routing: (d) => Math.max(0, d.routingPct || 0),
+          neighbors: (d) => Math.max(0, d.neighbors || 0),
+          uptime: (d) => Math.max(0, d.uptimeHours || 0),
+        }};
+        const metricKey = sortKey;
+
+        const minNeighbors = Math.max(
+          0,
+          Math.min(200, parseInt(document.getElementById("minNeighbors").value || "0", 10))
+        );
+        const topN = Math.max(5, Math.min(200, parseInt(document.getElementById("topN").value || "30", 10)));
+        const binMinutes = 5;
+        const window = getTimeWindow();
+
+        const baseSeries = (graph.timeSeries || []).filter((d) => d.t >= window.start && d.t <= window.end);
+        const activeNodes = new Set();
+        for (const b of baseSeries) {{
+          for (const nid of Object.keys(b.routing || {{}})) activeNodes.add(nid);
+          for (const nid of Object.keys(b.neighbors || {{}})) activeNodes.add(nid);
+          for (const nid of Object.keys(b.uptime || {{}})) activeNodes.add(nid);
+        }}
+        const buckets = new Map();
+        for (let i = 0; i < baseSeries.length; i++) {{
+          const b = baseSeries[i];
+          const idx = Math.floor((b.t - window.start) / (binMinutes * 60));
+          const key = window.start + idx * binMinutes * 60;
+          if (!buckets.has(key)) buckets.set(key, {{ t: key, routing: {{}}, neighbors: {{}}, uptime: {{}} }});
+          const bucket = buckets.get(key);
+          for (const [nid, val] of Object.entries(b.routing || {{}})) {{
+            bucket.routing[nid] = (bucket.routing[nid] || 0) + val;
+          }}
+          for (const [nid, val] of Object.entries(b.neighbors || {{}})) {{
+            bucket.neighbors[nid] = Math.max(bucket.neighbors[nid] || 0, val);
+          }}
+          for (const [nid, val] of Object.entries(b.uptime || {{}})) {{
+            bucket.uptime[nid] = Math.max(bucket.uptime[nid] || 0, val);
+          }}
+        }}
+
+        const merged = Array.from(buckets.values()).sort((a, b) => a.t - b.t);
+        const totals = new Map();
+        for (const b of merged) {{
+          const series = b[metricKey] || {{}};
+          for (const [nid, val] of Object.entries(series)) {{
+            const node = nodeById.get(nid);
+            if (!node || (node.neighbors || 0) < minNeighbors) continue;
+            totals.set(nid, (totals.get(nid) || 0) + Number(val || 0));
+          }}
+        }}
+
+        const topNodes = Array.from(totals.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, topN)
+          .map((x) => x[0]);
+
+        const topSet = new Set(topNodes);
+        node
+          .attr("display", null)
+          .attr("opacity", (d) => {{
+            if (activeNodes.size > 0 && !activeNodes.has(d.id)) return 0.12;
+            return topSet.has(d.id) ? 1.0 : 0.2;
+          }});
+        link
+          .attr("display", null)
+          .attr("opacity", (d) => {{
+            const active = activeNodes.size === 0 || (activeNodes.has(d.source.id) && activeNodes.has(d.target.id));
+            if (!active) return 0.06;
+            return (topSet.has(d.source.id) && topSet.has(d.target.id)) ? 0.75 : 0.12;
+          }});
+      }}
+
+      const topNInput = document.getElementById("topN");
+      const minNeighborsInput = document.getElementById("minNeighbors");
+      if (topNInput) topNInput.value = String(graph.meta.d3TopN || 30);
+      if (minNeighborsInput) minNeighborsInput.value = String(graph.meta.d3MinNeighbors || 0);
+      initTimeInputs();
+
+      document.getElementById("sortMetric").addEventListener("change", applyFilters);
+      document.getElementById("topN").addEventListener("input", applyFilters);
+      document.getElementById("minNeighbors").addEventListener("input", applyFilters);
+      document.getElementById("timeStart").addEventListener("change", applyFilters);
+      document.getElementById("timeEnd").addEventListener("change", applyFilters);
+      applyFilters();
+    </script>
+  </body>
+</html>
+"""
+    html_path.write_text(html, encoding="utf-8")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="graphGen.py: build Meshtastic graph (DOT+SVG) from trace files. RU: построение графа Meshtastic (DOT+SVG) из трасс."
+    )
+
+    # Keep existing args. RU: Сохраняем существующие аргументы.
+    ap.add_argument("--root", default=".", help="Directory with input files (default: current). RU: Папка входных файлов (по умолчанию: текущая).")
+    ap.add_argument("--min-edge", type=int, default=3, help="Minimum confirmations to keep a directed link (default: 3). RU: минимум подтверждений (по умолчанию: 3).")
+    ap.add_argument("--rankdir", default="LR", choices=["LR", "TB", "RL", "BT"], help="Graphviz rankdir (default: LR). RU: направление rankdir (по умолчанию: LR).")
+    ap.add_argument("--no-d3", action="store_true", help="Disable D3.js output (HTML/JSON). RU: отключить D3.js (HTML/JSON).")
+    ap.add_argument("--d3-top", type=int, default=30, help="D3 filter: top N nodes (default: 30). RU: D3 фильтр top N (по умолчанию: 30).")
+    ap.add_argument("--d3-min-neighbors", type=int, default=0, help="D3 filter: min neighbors (default: 0). RU: D3 фильтр по соседям (по умолчанию: 0).")
     ap.add_argument(
         "--include-unknown",
         action="store_true",
-        help="Include Unknown node (!ffffffff) and all edges adjacent to it (default: excluded).",
+        help="Include Unknown node (!ffffffff) and all adjacent edges (default: excluded). RU: включить Unknown (!ffffffff) и смежные рёбра (по умолчанию: исключено).",
     )
-    ap.add_argument("--top", type=int, default=15, help="Top N lines in summary lists (default: 15).")
+    ap.add_argument("--top", type=int, default=15, help="Top N lines in summary lists (default: 15). RU: top N в сводках (по умолчанию: 15).")
 
-    # Опция временного окна
+    # Time window option. RU: Опция временного окна.
     ap.add_argument(
         "--datetime",
         default=None,
         help=(
             "Date/time window filter STRICTLY by timestamps at the BEGINNING of EACH TRACE LINE inside the files "
             "(NOT filename, NOT mtime). Examples: '2026-01-22', '2026-01-22 - 2026-01-23', "
-            "'2026-01-22 23:33 - 2026-01-22 23:40', '2026-01-22 23:33:08 - 2026-01-22 23:33:20'."
+            "'2026-01-22 23:33 - 2026-01-22 23:40', '2026-01-22 23:33:08 - 2026-01-22 23:33:20'. "
+            "RU: фильтр по времени берётся ТОЛЬКО из начала строки трассы (НЕ имя файла, НЕ mtime)."
         ),
     )
 
-    # Изменение только для толщины рёбер (относительная шкала)
+    # Edge width scaling. RU: Масштаб толщины рёбер.
     ap.add_argument(
         "--minwidthline",
         type=float,
         default=1.0,
-        help="Min edge penwidth in relative scaling (default: 1.0).",
+        help="Min edge penwidth in relative scaling (default: 1.0). RU: минимум толщины (по умолчанию: 1.0).",
     )
     ap.add_argument(
         "--maxwidthline",
         type=float,
         default=30.0,
-        help="Max edge penwidth in relative scaling (default: 30.0).",
+        help="Max edge penwidth in relative scaling (default: 30.0). RU: максимум толщины (по умолчанию: 30.0).",
     )
 
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -714,6 +1131,7 @@ def main() -> int:
     root = Path(args.root).resolve()
     trace_root, out_dir, node_search = fixed_paths(root)
     include_unknown = bool(args.include_unknown)
+    d3_enabled = not bool(args.no_d3)
 
     print(f"graphGen.py version {__version__}")
     print(f"cwd: {Path.cwd()}")
@@ -743,7 +1161,8 @@ def main() -> int:
 
     node_meta, nodedb_path, meta_debug = build_node_meta(node_search)
 
-    # Разбор окна --datetime
+    # Parse --datetime window
+    # RU: Разбор окна --datetime
     dt_window: Optional[Tuple[datetime, datetime]] = None
     if args.datetime is not None:
         try:
@@ -757,10 +1176,11 @@ def main() -> int:
         print(f"  expr: '{args.datetime}'")
         print(f"  window: {w_start.strftime('%Y-%m-%d %H:%M:%S')} - {w_end.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"  traces in folder: {len(trace_files)}")
-        # выборка будет известна после парсинга
+        # selection known after parsing
+        # RU: выборка будет известна после парсинга
         print("")
 
-    edge_count, edge_rssi, transit_count, per_file_stats, parse_debug, selected_files = parse_traces_with_stats(
+    edge_count, edge_rssi, transit_count, time_series, time_meta, per_file_stats, parse_debug, selected_files = parse_traces_with_stats(
         trace_files=trace_files,
         include_unknown=include_unknown,
         dt_window=dt_window,
@@ -783,7 +1203,8 @@ def main() -> int:
     out_base = build_auto_out(measurer_id)
     dot_path = out_dir / f"{out_base}.dot"
     svg_path = out_dir / f"{out_base}.svg"
-    jpg_path = out_dir / f"{out_base}.jpg"
+    json_path = out_dir / f"{out_base}.json"
+    html_path = out_dir / f"{out_base}.html"
 
     print("Read files:")
     print(f"node database: {nodedb_path if nodedb_path else '(not found)'}")
@@ -814,7 +1235,8 @@ def main() -> int:
     print("")
 
     print("trace log files summary:")
-    # печатаем статистику по файлам; при окне показываем попадания
+    # print per-file stats; show hits for window
+    # RU: печатаем статистику по файлам; при окне показываем попадания
     for st in per_file_stats:
         print(st.path)
         print(f"  size: {human_bytes(st.size_bytes)} | mtime: {st.mtime_iso} | sig: {st.sha1sig[:12]}…")
@@ -829,7 +1251,8 @@ def main() -> int:
         print(f"  unknown mentions: {st.unknown_mentions}")
         print("")
 
-    # фильтруем рёбра по числу подтверждений
+    # filter edges by confirmations
+    # RU: фильтруем рёбра по числу подтверждений
     edge_count_f = {
         k: v
         for k, v in edge_count.items()
@@ -837,7 +1260,8 @@ def main() -> int:
         and (include_unknown or (k[0] != UNKNOWN_ID and k[1] != UNKNOWN_ID))
     }
 
-    # строим соседей (уникальные видимые)
+    # build neighbors (unique visible)
+    # RU: строим соседей (уникальные видимые)
     neighbors: Dict[str, set] = defaultdict(set)
     for (a, b), _c in edge_count_f.items():
         neighbors[a].add(b)
@@ -851,7 +1275,8 @@ def main() -> int:
     deg_u = {n: len(neighbors[n]) for n in nodes}
     vmax_neighbors = max(deg_u.values()) if deg_u else 1
 
-    # процент маршрутизации по transit_count, ограниченный сохранёнными узлами
+    # routing percentage by transit_count, limited to kept nodes
+    # RU: процент маршрутизации по transit_count, ограниченный сохранёнными узлами
     total_transit = 0
     for n, c in transit_count.items():
         if n in nodes:
@@ -859,7 +1284,8 @@ def main() -> int:
     total_transit = total_transit or 1
     routing_pct = {n: (transit_count.get(n, 0) / total_transit) * 100.0 for n in nodes}
 
-    # глобальные min/max RSSI только по сохранённым рёбрам
+    # global min/max RSSI only for kept edges
+    # RU: глобальные min/max RSSI только по сохранённым рёбрам
     all_rssi_vals: List[float] = []
     missing_rssi_edges = 0
     for (a, b), _cnt in edge_count_f.items():
@@ -870,19 +1296,22 @@ def main() -> int:
             missing_rssi_edges += 1
     vmin, vmax = (min(all_rssi_vals), max(all_rssi_vals)) if all_rssi_vals else (-25.0, 5.0)
 
-    # ТОЛЩИНА РЁБЕР (ОТНОСИТЕЛЬНО) — единственное изменение алгоритма толщины:
-    # максимум подтверждений В ЭТОМ запуске => 100% => maxwidthline
+    # EDGE WIDTH (RELATIVE) — only algorithm change:
+    # RU: ТОЛЩИНА РЁБЕР (ОТНОСИТЕЛЬНО) — единственное изменение алгоритма толщины:
+    # max confirmations in THIS run => 100% => maxwidthline
+    # RU: максимум подтверждений В ЭТОМ запуске => 100% => maxwidthline
     max_conf = max(edge_count_f.values()) if edge_count_f else 1
     min_w = float(args.minwidthline)
     max_w = float(args.maxwidthline)
     if max_w < min_w:
-        # сохраняем детерминированность, не трогая остальное
+        # keep determinism, do not touch the rest
+        # RU: сохраняем детерминированность, не трогая остальное
         max_w, min_w = min_w, max_w
 
     def penwidth_from_count_relative(cnt: int) -> float:
         if max_conf <= 0:
             return round(min_w, 2)
-        t = cnt / float(max_conf)  # от 0 до 1
+        t = cnt / float(max_conf)  # 0..1. RU: от 0 до 1
         w = min_w + t * (max_w - min_w)
         return round(w, 2)
 
@@ -919,11 +1348,92 @@ def main() -> int:
         print(f"  {transit_count.get(n,0):>5}  {pct:>5.1f}%  {pretty_name(n)}")
     print("")
 
-    # сборка DOT
+    if d3_enabled:
+        now_epoch = datetime.now(tz=timezone.utc).timestamp()
+        nodes_payload: List[Dict[str, Any]] = []
+        for nid in nodes:
+            meta = node_meta.get(
+                nid, {"longName": "", "shortName": "", "role": "", "chUtil": None, "firstSeenEpoch": None}
+            )
+            ln = meta.get("longName") or "Unknown"
+            sn = meta.get("shortName") or (nid[-4:] if nid.startswith("!") else "")
+            role = (meta.get("role") or "").upper()
+            fill = role_fill(role)
+
+            cu = meta.get("chUtil")
+            neigh = deg_u.get(nid, 0)
+            first_seen_epoch = meta.get("firstSeenEpoch")
+            uptime_hours = None
+            if isinstance(first_seen_epoch, (int, float)):
+                uptime_hours = max(0.0, (now_epoch - float(first_seen_epoch)) / 3600.0)
+
+            nodes_payload.append(
+                {
+                    "id": nid,
+                    "label": f"{ln} [{sn}]",
+                    "longName": ln,
+                    "shortName": sn,
+                    "role": role or "UNKNOWN",
+                    "neighbors": neigh,
+                    "routingPct": round(routing_pct.get(nid, 0.0), 2),
+                    "chUtil": float(cu) if isinstance(cu, (int, float)) else None,
+                    "uptimeHours": round(uptime_hours, 2) if uptime_hours is not None else None,
+                    "fill": fill,
+                }
+            )
+
+        links_payload: List[Dict[str, Any]] = []
+        for (a, b), cnt in edge_count_f.items():
+            vals = edge_rssi.get((a, b), [])
+            avg = (sum(vals) / len(vals)) if vals else None
+            color = grad_rssi(avg, vmin, vmax)
+            pw = penwidth_from_count_relative(cnt)
+            links_payload.append(
+                {
+                    "source": a,
+                    "target": b,
+                    "count": cnt,
+                    "avgRssi": round(avg, 2) if avg is not None else None,
+                    "color": color,
+                    "width": pw,
+                }
+            )
+
+        payload = {
+            "meta": {
+                "generatedAt": datetime.now().isoformat(timespec="seconds"),
+                "nodes": len(nodes_payload),
+                "links": len(links_payload),
+                "minEdge": args.min_edge,
+                "includeUnknown": include_unknown,
+                "rssiRange": {"min": round(vmin, 2), "max": round(vmax, 2)},
+                "maxConfirmations": max_conf,
+                "d3TopN": args.d3_top,
+                "d3MinNeighbors": args.d3_min_neighbors,
+                "baseBinMinutes": time_meta.get("baseBinMinutes"),
+                "timeRangeStart": time_meta.get("timeRangeStart"),
+                "timeRangeEnd": time_meta.get("timeRangeEnd"),
+            },
+            "nodes": nodes_payload,
+            "links": links_payload,
+            "timeSeries": time_series,
+        }
+
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_d3_html(html_path, payload)
+        print(f"OK: wrote {json_path}")
+        print(f"OK: wrote {html_path}")
+        print("Tip: open HTML via a local web server to avoid browser file:// restrictions.")
+        print("")
+
+    # build DOT
+    # RU: сборка DOT
     dot_lines: List[str] = []
     dot_lines.append("digraph Meshtastic {")
-    dot_lines.append(f'  graph [rankdir={args.rankdir}, bgcolor="black", nodesep=0.55, ranksep=0.90];')
-    dot_lines.append('  node [shape=box, style="rounded,filled", fontcolor="#000000", color="#333333", fontname="Helvetica"];')
+    dot_lines.append(f'  graph [rankdir={args.rankdir}, bgcolor="black", nodesep=0.55, ranksep=0.90, charset="UTF-8"];')
+    dot_lines.append(
+        '  node [shape=box, style="rounded,filled", fontcolor="#000000", color="#333333", fontname="DejaVu Sans"];'
+    )
     dot_lines.append('  edge [arrowsize=0.8];')
     dot_lines.append("")
 
@@ -946,15 +1456,17 @@ def main() -> int:
         line3 = fmt_role(role)
         line4 = f"neighbors:{neigh} | routing:{routing_pct.get(nid, 0.0):.1f}% | chUtil:{cu_str}"
 
-        label = (
-            f'<<FONT POINT-SIZE="{fs}">'
-            f"{esc_html(line1)}<BR/>"
-            f"{esc_html(line2)}<BR/>"
-            f"{esc_html(line3)}<BR/>"
-            f"{esc_html(line4)}"
-            f"</FONT>>"
+        label = "\\n".join(
+            [
+                esc_dot_label(line1),
+                esc_dot_label(line2),
+                esc_dot_label(line3),
+                esc_dot_label(line4),
+            ]
         )
-        dot_lines.append(f'  "{nid}" [fillcolor="{fill}", fontsize={fs}, margin="{margin}", label={label}];')
+        dot_lines.append(
+            f'  "{nid}" [fillcolor="{fill}", fontsize={fs}, margin="{margin}", label="{label}"];'
+        )
 
     dot_lines.append("")
     for (a, b), cnt in edge_count_f.items():
@@ -962,7 +1474,8 @@ def main() -> int:
         avg = (sum(vals) / len(vals)) if vals else None
         color = grad_rssi(avg, vmin, vmax)
 
-        # ТОЛЬКО здесь меняется формула толщины:
+        # ONLY here the width formula is applied:
+        # RU: ТОЛЬКО здесь меняется формула толщины:
         pw = penwidth_from_count_relative(cnt)
 
         dot_lines.append(f'  "{a}" -> "{b}" [penwidth={pw}, color="{color}"];')
@@ -973,14 +1486,12 @@ def main() -> int:
     try:
         render_svg(dot_path, svg_path)
         enforce_svg_size(svg_path, width_pt="8000pt", height_pt="4500pt")
-        render_jpg(dot_path, jpg_path, args.dpi)
     except subprocess.CalledProcessError as e:
         eprint("ERROR: dot failed:", e)
         return 5
 
     print(f"OK: wrote {dot_path}")
     print(f"OK: wrote {svg_path}")
-    print(f"OK: wrote {jpg_path}")
     print("")
     return 0
 

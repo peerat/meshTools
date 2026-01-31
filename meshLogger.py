@@ -15,7 +15,8 @@ from typing import Dict, List, Optional, Tuple
 VERSION = "1.8.5"
 
 # ----------------------------
-# Глобальная остановка + текущий дочерний процесс (для мгновенного Ctrl+C)
+# Global stop + current child process (fast Ctrl+C shutdown)
+# RU: Глобальная остановка + текущий дочерний процесс (для мгновенного Ctrl+C)
 # ----------------------------
 
 STOP = False
@@ -30,7 +31,8 @@ def _sigint_handler(_signum, _frame):
 
 
 # ----------------------------
-# Утилиты: время / вывод
+# Utilities: time / output
+# RU: Утилиты: время / вывод
 # ----------------------------
 
 def ts_now() -> str:
@@ -50,13 +52,30 @@ def clean_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
 
 
+def detect_device_not_found(text: str) -> bool:
+    s = (text or "").lower()
+    if not s:
+        return False
+    if "file not found error" in s:
+        return True
+    if "serial device" in s and "not found" in s:
+        return True
+    if "no such file or directory" in s and ("/dev/" in s or "tty" in s):
+        return True
+    if "device at" in s and "was not found" in s:
+        return True
+    return False
+
+
 def fmt_line(ts: str, pct: str, cyc: str, hop: str, msg: str) -> str:
-    # TS<пробел>PCT<TAB>[cycle][i/n]<пробел>HOP<TAB>MESSAGE
+    # TS<space>PCT<TAB>[cycle][i/n]<space>HOP<TAB>MESSAGE
+    # RU: TS<пробел>PCT<TAB>[cycle][i/n]<пробел>HOP<TAB>MESSAGE
     return f"{ts} {pct}\t{cyc} {hop}\t{msg}"
 
 
 # ----------------------------
-# Нормализация id узла
+# Node ID normalization
+# RU: Нормализация id узла
 # ----------------------------
 
 _NODE_HEX8 = re.compile(r"^[0-9a-fA-F]{8}$")
@@ -82,7 +101,8 @@ def normalize_node_id(s: str) -> Optional[str]:
 
 
 # ----------------------------
-# Запуск CLI
+# CLI launch
+# RU: Запуск CLI
 # ----------------------------
 
 def _popen_new_process_group(cmd: List[str]) -> subprocess.Popen:
@@ -177,7 +197,8 @@ def run_cmd(cmd: List[str], timeout: int, tick: float = 0.2) -> Tuple[int, str, 
 
 
 # ----------------------------
-# Парсинг Meshtastic --info
+# Meshtastic --info parsing
+# RU: Парсинг Meshtastic --info
 # ----------------------------
 
 def extract_balanced_braces(text: str, start_idx: int) -> Optional[str]:
@@ -319,7 +340,8 @@ def detect_self_id(mesh_info_text: str, nodes: Dict[str, dict]) -> str:
 
 
 # ----------------------------
-# Модель узла / отбор
+# Node model / filtering
+# RU: Модель узла / отбор
 # ----------------------------
 
 @dataclass
@@ -398,7 +420,8 @@ def filter_hops(all_nodes: List[NodeRec], minhops: Optional[int], maxhops: Optio
 
 
 # ----------------------------
-# Парсинг traceroute -> маршруты с человекочитаемыми именами
+# traceroute parsing -> human readable routes
+# RU: Парсинг traceroute -> маршруты с человекочитаемыми именами
 # ----------------------------
 
 def parse_routes_from_meshtastic_output(raw: str) -> Tuple[Optional[str], Optional[str]]:
@@ -444,16 +467,19 @@ def count_edges(route_line: str) -> int:
 
 
 # ----------------------------
-# Логирование
+# Logging
+# RU: Логирование
 # ----------------------------
 
 def log_filename_for_day(self_id: str) -> str:
-    # ИЗМЕНЕНО: пишем логи в подпапку meshLogger/ (относительно cwd скрипта)
+    # CHANGED: write logs to meshLogger/ subfolder (relative to script cwd).
+    # RU: ИЗМЕНЕНО: пишем логи в подпапку meshLogger/ (относительно cwd скрипта)
     return f"meshLogger/{date_today()} {self_id}.txt"
 
 
 def append_log_line(path: str, line: str) -> None:
-    # ИЗМЕНЕНО: гарантируем существование meshLogger
+    # CHANGED: ensure meshLogger exists.
+    # RU: ИЗМЕНЕНО: гарантируем существование meshLogger
     import os
     os.makedirs("meshLogger", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -461,67 +487,103 @@ def append_log_line(path: str, line: str) -> None:
 
 
 # ----------------------------
-# Текст справки (подробно)
+# Help text (detailed)
+# RU: Текст справки (подробно)
 # ----------------------------
 
 HELP_TEXT = """\
 usage: meshLogger.py [options]
 
 Meshtastic route logger.
+RU: Логгер маршрутов Meshtastic.
 Periodically performs "meshtastic --traceroute" to selected mesh nodes and logs raw routes to a daily file:
+  meshTools/YYYY-MM-DD !selfid.txt
+RU: Периодически выполняет "meshtastic --traceroute" к выбранным узлам и пишет сырой маршрут в ежедневный файл:
   meshTools/YYYY-MM-DD !selfid.txt
 
 Terminal output:
+RU: Вывод в терминал:
   3 lines per node:
+  RU: 3 строки на узел:
     1) request line
+    RU: 1) строка запроса
     2) if ok: route towards ("> ..."), else: "<name>[<short>] is no response..."
+    RU: 2) если ок: маршрут туда ("> ..."), иначе: "<name>[<short>] is no response..."
     3) if ok: route back ("< ...")
+    RU: 3) если ок: маршрут обратно ("< ...")
 
 Node IDs and Bash:
+RU: ID узлов и Bash:
   Bash treats '!' as history expansion ("event not found").
+  RU: Bash воспринимает '!' как историю команд ("event not found").
   This logger accepts node IDs BOTH ways:
+  RU: Этот логгер принимает ID узла ОБОИМИ способами:
     - with bang:  !aca96d48
+    RU: - с восклицательным знаком: !aca96d48
     - without:    aca96d48   (recommended; no quoting needed)
+    RU: - без знака:          aca96d48   (рекомендуется; без кавычек)
 
 options:
   -h, --help
         Show this help message and exit
+        RU: Показать помощь и выйти
 
   --port PORT
         Serial port for Meshtastic device.
         Default: /dev/ttyUSB0
+        RU: Серийный порт устройства Meshtastic.
+        RU: По умолчанию: /dev/ttyUSB0 (Windows: COM3 и т.п.)
 
   --hours HOURS
         Consider nodes active if they were heard within the last HOURS (by lastHeard).
         Used to build polling list from "meshtastic --info".
         Default: 24
+        RU: Узел активен, если был слышен за последние HOURS (по lastHeard).
+        RU: Используется для списка опроса из "meshtastic --info".
+        RU: По умолчанию: 24
 
   --timeout SECONDS
         Timeout for single "meshtastic --traceroute" command.
         If exceeded, the request is treated as "no response".
         Default: 30
+        RU: Таймаут одного "meshtastic --traceroute".
+        RU: Если превышен — считаем, что ответа нет.
+        RU: По умолчанию: 30
 
   --pause SECONDS
         Pause between traceroute requests (after both success and fail).
         Default: 30
+        RU: Пауза между запросами traceroute (после успеха и неудачи).
+        RU: По умолчанию: 30
 
   --minhops N
         Poll only nodes with hopsAway >= N (from "meshtastic --info").
         Nodes without hopsAway are excluded when hop filtering is used.
         Default: not set
+        RU: Опрос только узлов с hopsAway >= N (из "meshtastic --info").
+        RU: Узлы без hopsAway исключаются при фильтрации.
+        RU: По умолчанию: не задано
 
   --maxhops N
         Poll only nodes with hopsAway <= N (from "meshtastic --info").
         Default: not set
+        RU: Опрос только узлов с hopsAway <= N (из "meshtastic --info").
+        RU: По умолчанию: не задано
 
   --once
         Do exactly one full pass over the selected nodes and exit.
         Default: off (continuous loop)
+        RU: Сделать один полный проход и выйти.
+        RU: По умолчанию: выключено (бесконечный цикл)
 
   --node NODEID
         Poll only one specific node.
         NODEID can be "!xxxxxxxx" or "xxxxxxxx".
         Example:
+          --node aca96d48
+        RU: Опросить только один узел.
+        RU: NODEID может быть "!xxxxxxxx" или "xxxxxxxx".
+        RU: Пример:
           --node aca96d48
 
   --id-list FILE
@@ -530,17 +592,25 @@ options:
         This filter is applied on top of --hours selection.
         Example:
           --id-list nodes.txt
+        RU: Опросить только ID, найденные в FILE.
+        RU: Файл может содержать ЛЮБОЙ текст; извлекаются шаблоны "!xxxxxxxx".
+        RU: Фильтр применяется поверх --hours.
+        RU: Пример:
+          --id-list nodes.txt
 
   --quiet
         Less terminal output (do not print the initial numbered node list).
+        RU: Меньше вывода (не печатать стартовый список узлов).
 
   --version
         Print program version and exit
+        RU: Показать версию и выйти
 """
 
 
 # ----------------------------
-# Баннер
+# Banner
+# RU: Баннер
 # ----------------------------
 
 def print_banner(
@@ -581,7 +651,8 @@ def print_banner(
 
 
 # ----------------------------
-# Основной код
+# Main loop
+# RU: Основной код
 # ----------------------------
 
 def main() -> int:
@@ -601,21 +672,21 @@ def main() -> int:
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    ap.add_argument("-h", "--help", action="store_true", help="show this help message and exit")
-    ap.add_argument("--port", default=DEFAULTS["port"], help=f"serial port (default: {DEFAULTS['port']})")
-    ap.add_argument("--hours", type=int, default=DEFAULTS["hours"], help=f"active window by lastHeard hours (default: {DEFAULTS['hours']})")
-    ap.add_argument("--timeout", type=int, default=DEFAULTS["timeout"], help=f"timeout for traceroute (default: {DEFAULTS['timeout']})")
-    ap.add_argument("--pause", type=int, default=DEFAULTS["pause"], help=f"pause between requests (default: {DEFAULTS['pause']})")
+    ap.add_argument("-h", "--help", action="store_true", help="show this help message and exit. RU: показать помощь и выйти.")
+    ap.add_argument("--port", default=DEFAULTS["port"], help=f"serial port (default: {DEFAULTS['port']}, Windows: COM3). RU: серийный порт (по умолчанию: {DEFAULTS['port']}, Windows: COM3).")
+    ap.add_argument("--hours", type=int, default=DEFAULTS["hours"], help=f"active window by lastHeard hours (default: {DEFAULTS['hours']}). RU: окно активности по lastHeard (по умолчанию: {DEFAULTS['hours']}).")
+    ap.add_argument("--timeout", type=int, default=DEFAULTS["timeout"], help=f"timeout for traceroute (default: {DEFAULTS['timeout']}). RU: таймаут traceroute (по умолчанию: {DEFAULTS['timeout']}).")
+    ap.add_argument("--pause", type=int, default=DEFAULTS["pause"], help=f"pause between requests (default: {DEFAULTS['pause']}). RU: пауза между запросами (по умолчанию: {DEFAULTS['pause']}).")
 
-    ap.add_argument("--minhops", type=int, default=None, help="min hopsAway filter (default: not set)")
-    ap.add_argument("--maxhops", type=int, default=None, help="max hopsAway filter (default: not set)")
+    ap.add_argument("--minhops", type=int, default=None, help="min hopsAway filter (default: not set). RU: минимум hopsAway (по умолчанию: не задан).")
+    ap.add_argument("--maxhops", type=int, default=None, help="max hopsAway filter (default: not set). RU: максимум hopsAway (по умолчанию: не задан).")
 
-    ap.add_argument("--once", action="store_true", help="one pass then exit (default: continuous loop)")
-    ap.add_argument("--node", default=None, help="poll only one node (accepts !xxxxxxxx or xxxxxxxx)")
-    ap.add_argument("--id-list", dest="id_list", default=None, help="file to extract !xxxxxxxx ids from (any text allowed)")
+    ap.add_argument("--once", action="store_true", help="one pass then exit (default: continuous loop). RU: один проход и выход (по умолчанию: бесконечный цикл).")
+    ap.add_argument("--node", default=None, help="poll only one node (accepts !xxxxxxxx or xxxxxxxx). RU: опрашивать только один узел (!xxxxxxxx или xxxxxxxx).")
+    ap.add_argument("--id-list", dest="id_list", default=None, help="file to extract !xxxxxxxx ids from (any text allowed). RU: файл для извлечения !xxxxxxxx (любой текст).")
 
-    ap.add_argument("--quiet", action="store_true", help="less terminal output")
-    ap.add_argument("--version", action="store_true", help="print version and exit")
+    ap.add_argument("--quiet", action="store_true", help="less terminal output. RU: меньше вывода в терминал.")
+    ap.add_argument("--version", action="store_true", help="print version and exit. RU: вывести версию и выйти.")
 
     args = ap.parse_args()
 
@@ -711,6 +782,11 @@ def main() -> int:
                 timeout=max(60, args.timeout + 15),
             )
             mesh_info_text = clean_ansi((so or "") + ("\n" + se if se else ""))
+            if detect_device_not_found(mesh_info_text):
+                raise RuntimeError(
+                    f"device not found on port {args.port} (meshtastic). Check cable/port/drivers (Windows: COM3). "
+                    f"RU: устройство не найдено на порту {args.port}. Проверьте кабель/порт/драйверы (Windows: COM3)."
+                )
             try:
                 nodes = parse_nodes_block(mesh_info_text)
                 parse_error = None
@@ -737,7 +813,8 @@ def main() -> int:
         active = filter_ids(active, want_ids)
         active = filter_hops(active, args.minhops, args.maxhops)
 
-        # ЭТИ ДВЕ СТРОКИ ДОЛЖНЫ ОСТАТЬСЯ
+        # THESE TWO LINES MUST STAY
+        # RU: ЭТИ ДВЕ СТРОКИ ДОЛЖНЫ ОСТАТЬСЯ
         out(f"{ts_now()} meshtastic --info updated from {self_id} {self_long}[{self_short}]")
         out(
             f"{ts_now()} a total of {len(nodes)} nodes were found, of which {len(active)} were active within the last {args.hours} hours. "
@@ -770,7 +847,8 @@ def main() -> int:
         if not args.quiet:
             for i, n in enumerate(active, 1):
                 hops = "?" if n.hops_away is None else str(n.hops_away)
-                # N.\t!id\t<HO>h\tДлинное[Короткое]
+                # N.\t!id\t<HO>h\tLong[Short]
+                # RU: N.\t!id\t<HO>h\tДлинное[Короткое]
                 out(f"{i}.\t{n.node_id}\t{hops}h\t{n.long}[{n.short}]")
 
         return active
@@ -841,6 +919,12 @@ def main() -> int:
                 return 0
 
             raw = clean_ansi((so or "") + ("\n" + se if se else ""))
+            if detect_device_not_found(raw):
+                out(
+                    f"{ts_now()} ERROR: device not found on port {args.port} (meshtastic). "
+                    f"Windows: COM3. RU: устройство не найдено на порту {args.port} (Windows: COM3)."
+                )
+                return 2
             towards, back = parse_routes_from_meshtastic_output(raw)
 
             if not towards:

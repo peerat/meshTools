@@ -3,16 +3,25 @@
 """
 node_db_update.py
 
-Одноразовый обновитель базы узлов Meshtastic с накопительным JSON‑хранилищем.
+One-shot Meshtastic node DB updater with a cumulative JSON store.
+RU: Одноразовый обновитель базы узлов Meshtastic с накопительным JSON‑хранилищем.
 
-Возможности:
+Features:
+- Captures channel utilization and TX air utilization from --nodes output
+- Stores full --info output in the DB
+- Keeps a raw snapshot per node from --nodes parsing
+- Tracks node property changes over time
+- Prints new nodes and changed fields
+RU:
 - Снимает channel utilization и TX air utilization из вывода --nodes
 - Сохраняет полный вывод --info в базе
 - Хранит сырой снимок по каждому узлу из парсинга --nodes
 - Отслеживает изменения свойств узлов со временем
 - Печатает новые узлы и изменения свойств
 
-Использование:
+Usage:
+    python node_db_update.py --port /dev/ttyUSB0 --db nodeDb.txt
+RU:
     python node_db_update.py --port /dev/ttyUSB0 --db nodeDb.txt
 """
 
@@ -30,24 +39,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ==============================================================================
-# Вспомогательные функции
+# Helper functions
+# RU: Вспомогательные функции
 # ==============================================================================
 
 def iso_now() -> str:
-    """Вернуть текущее время UTC в формате ISO."""
+    """Return current UTC time in ISO format. RU: Вернуть текущее время UTC в формате ISO."""
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def run_cmd(cmd: List[str], timeout: int) -> Tuple[int, str, str]:
     """
-    Выполнить команду и вернуть (returncode, stdout, stderr).
+    Run a command and return (returncode, stdout, stderr).
+    RU: Выполнить команду и вернуть (returncode, stdout, stderr).
 
-    Аргументы:
-        cmd: Команда и аргументы списком
-        timeout: Максимальное время выполнения в секундах
+    Args:
+        cmd: Command and args list. RU: Команда и аргументы списком.
+        timeout: Max runtime seconds. RU: Максимальное время выполнения в секундах.
 
-    Возвращает:
-        Кортеж (return_code, stdout, stderr)
+    Returns:
+        Tuple (return_code, stdout, stderr). RU: Кортеж (return_code, stdout, stderr).
     """
     proc = subprocess.run(
         cmd,
@@ -61,11 +72,12 @@ def run_cmd(cmd: List[str], timeout: int) -> Tuple[int, str, str]:
 
 def atomic_write_text(path: str, data: str) -> None:
     """
-    Атомарно записать текст в файл через временный файл и переименование.
+    Atomically write text to file via temp file + rename.
+    RU: Атомарно записать текст в файл через временный файл и переименование.
 
-    Аргументы:
-        path: Путь назначения
-        data: Текст для записи
+    Args:
+        path: Target path. RU: Путь назначения.
+        data: Text to write. RU: Текст для записи.
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
@@ -122,7 +134,8 @@ def try_parse_json(stdout: str) -> Optional[Any]:
     if not text:
         return None
     
-    # Удаляем известные префиксные строки
+    # Remove known prefix lines.
+    # RU: Удаляем известные префиксные строки
     lines = [
         line for line in text.splitlines()
         if line.strip() and line.strip() != "Connected to radio"
@@ -139,7 +152,8 @@ def try_parse_json(stdout: str) -> Optional[Any]:
 
 
 # ==============================================================================
-# Парсинг ASCII-таблицы
+# ASCII table parsing
+# RU: Парсинг ASCII-таблицы
 # ==============================================================================
 
 BOX_ROW_RE = re.compile(r"^\s*│")
@@ -147,23 +161,24 @@ DATA_ROW_START_RE = re.compile(r"^\s*│\s*\d+\s*│")
 
 
 def split_box_row(line: str) -> List[str]:
-    """Разбить строку ASCII-таблицы по разделителю │ и обрезать пробелы."""
+    """Split ASCII table row by │ and trim spaces. RU: Разбить строку ASCII-таблицы по разделителю │ и обрезать пробелы."""
     parts = [part.strip() for part in line.strip().strip("│").split("│")]
     return parts
 
 
 def parse_nodes_table(stdout: str) -> List[Dict[str, Any]]:
     """
-    Парсинг ASCII-таблицы из вывода --nodes.
+    Parse ASCII table from --nodes output.
+    RU: Парсинг ASCII-таблицы из вывода --nodes.
 
-    Возвращает список строк-словарей с ключами по заголовкам колонок, плюс
-    служебный ключ "__cols__" с именами колонок по порядку.
+    Returns list of row dicts keyed by column headers + "__cols__" key.
+    RU: Возвращает список строк-словарей с ключами по заголовкам колонок, плюс "__cols__".
 
-    Аргументы:
-        stdout: Сырой вывод команды --nodes
+    Args:
+        stdout: Raw --nodes output. RU: Сырой вывод команды --nodes.
 
-    Возвращает:
-        Список словарей строк
+    Returns:
+        List of row dicts. RU: Список словарей строк.
     """
     lines = [ln.rstrip("\n") for ln in stdout.splitlines() if ln.strip()]
     header_cols: Optional[List[str]] = None
@@ -173,23 +188,23 @@ def parse_nodes_table(stdout: str) -> List[Dict[str, Any]]:
         if not BOX_ROW_RE.match(line):
             continue
         
-        # Находим заголовок
+        # Find header. RU: Находим заголовок.
         if header_cols is None:
             if "│" in line and "User" in line and "ID" in line and "Hardware" in line:
                 header_cols = split_box_row(line)
             continue
         
-        # Парсим строки данных (начинаются с │ <число> │)
+        # Parse data rows (start with │ <number> │). RU: Парсим строки данных (начинаются с │ <число> │).
         if not DATA_ROW_START_RE.match(line):
             continue
         
         parts = split_box_row(line)
         
-        # Обрезаем до длины заголовка
+        # Trim to header length. RU: Обрезаем до длины заголовка.
         if len(parts) >= len(header_cols):
             parts = parts[:len(header_cols)]
         
-        # Проверяем длину строки
+        # Validate row length. RU: Проверяем длину строки.
         if len(parts) != len(header_cols):
             continue
         
@@ -201,7 +216,8 @@ def parse_nodes_table(stdout: str) -> List[Dict[str, Any]]:
 
 
 # ==============================================================================
-# Сопоставление колонок и парсинг значений
+# Column mapping and parsing values
+# RU: Сопоставление колонок и парсинг значений
 # ==============================================================================
 
 def _normalize_column_name(name: str) -> str:
@@ -239,7 +255,8 @@ def _get_column_value(row: Dict[str, Any], candidates: List[str]) -> Optional[st
     Возвращает:
         Значение колонки или None
     """
-    # Пробуем точное совпадение нормализованного имени
+    # Try exact match for normalized name.
+    # RU: Пробуем точное совпадение нормализованного имени
     for key in row.keys():
         if key == "__cols__":
             continue
@@ -254,7 +271,8 @@ def _get_column_value(row: Dict[str, Any], candidates: List[str]) -> Optional[st
                 value_str = str(value).strip()
                 return value_str if value_str and value_str != "N/A" else None
     
-    # Запасной вариант: совпадение по подстроке
+    # Fallback: substring match.
+    # RU: Запасной вариант: совпадение по подстроке
     for key in row.keys():
         if key == "__cols__":
             continue
@@ -281,7 +299,7 @@ def _parse_percentage(value: Optional[str]) -> Optional[float]:
 
 
 def _parse_degrees(value: Optional[str]) -> Optional[float]:
-    """Парсинг строки градусов (например, '45.2°') в float."""
+    """Parse degrees string (e.g. '45.2°') to float. RU: Парсинг строки градусов (например, '45.2°') в float."""
     if not value:
         return None
     cleaned = value.replace("°", "").strip()
@@ -289,7 +307,7 @@ def _parse_degrees(value: Optional[str]) -> Optional[float]:
 
 
 def _parse_altitude_meters(value: Optional[str]) -> Optional[float]:
-    """Парсинг высоты (например, '123m') в float."""
+    """Parse altitude (e.g. '123m') to float. RU: Парсинг высоты (например, '123m') в float."""
     if not value:
         return None
     cleaned = value.lower().replace("m", "").strip()
@@ -297,45 +315,67 @@ def _parse_altitude_meters(value: Optional[str]) -> Optional[float]:
 
 
 def _parse_decibels(value: Optional[str]) -> Optional[float]:
-    """Парсинг децибел (например, '10dB') в float."""
+    """Parse decibels (e.g. '10dB') to float. RU: Парсинг децибел (например, '10dB') в float."""
     if not value:
         return None
     cleaned = value.replace("dB", "").replace("db", "").strip()
     return safe_float(cleaned)
 
 
+def detect_device_not_found(text: str) -> bool:
+    s = (text or "").lower()
+    if not s:
+        return False
+    if "file not found error" in s:
+        return True
+    if "serial device" in s and "not found" in s:
+        return True
+    if "no such file or directory" in s and ("/dev/" in s or "tty" in s):
+        return True
+    if "device at" in s and "was not found" in s:
+        return True
+    return False
+
+
 def _parse_battery(value: Optional[str]) -> Dict[str, Any]:
     """
-    Парсинг состояния батареи.
+    Parse battery state.
+    RU: Парсинг состояния батареи.
 
-    Возвращает словарь с ключами 'state' и 'percent'.
-    Обрабатывает 'Powered', процентные значения и текстовые состояния.
+    Returns dict with 'state' and 'percent'.
+    RU: Возвращает словарь с ключами 'state' и 'percent'.
+    Handles 'Powered', percent values, and text states.
+    RU: Обрабатывает 'Powered', процентные значения и текстовые состояния.
 
-    Аргументы:
-        value: Строка состояния батареи
+    Args:
+        value: Battery state string. RU: Строка состояния батареи.
 
-    Возвращает:
-        Словарь с полями state и percent
+    Returns:
+        Dict with state and percent. RU: Словарь с полями state и percent.
     """
     if not value:
         return {"state": None, "percent": None}
     
     value_lower = value.strip().lower()
     
-    # Состояние "Powered"
+    # "Powered" state
+    # RU: Состояние "Powered"
     if value_lower == "powered":
         return {"state": "Powered", "percent": None}
     
-    # Процент
+    # Percent value
+    # RU: Процент
     if value.strip().endswith("%"):
         return {"state": None, "percent": _parse_percentage(value)}
     
-    # Остальные состояния
+    # Other states
+    # RU: Остальные состояния
     return {"state": value.strip(), "percent": None}
 
 
 # ==============================================================================
-# Нормализация данных узла
+# Node data normalization
+# RU: Нормализация данных узла
 # ==============================================================================
 
 def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -351,24 +391,28 @@ def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
     Возвращает:
         Нормализованный словарь узла со стандартными ключами
     """
-    # Извлекаем ID узла
+    # Extract node ID.
+    # RU: Извлекаем ID узла
     node_id = _get_column_value(row, ["id"])
     if not node_id or not node_id.startswith("!"):
         return {}
     
-    # Извлекаем основные поля
+    # Extract main fields.
+    # RU: Извлекаем основные поля
     user = _get_column_value(row, ["user"])
     aka = _get_column_value(row, ["aka"])
     hardware = _get_column_value(row, ["hardware"])
     pubkey = _get_column_value(row, ["pubkey"])
     role = _get_column_value(row, ["role"])
     
-    # Извлекаем координаты
+    # Extract coordinates.
+    # RU: Извлекаем координаты
     lat_str = _get_column_value(row, ["latitude", "lat"])
     lon_str = _get_column_value(row, ["longitude", "lon"])
     alt_str = _get_column_value(row, ["altitude", "alt", "alt m", "altitude m"])
     
-    # Извлекаем телеметрию
+    # Extract telemetry.
+    # RU: Извлекаем телеметрию
     battery_str = _get_column_value(row, ["battery", "batt"])
     channel_util_str = _get_column_value(row, [
         "channel util", "channel utilization", "chan util", "ch util"
@@ -380,11 +424,13 @@ def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
     hops_str = _get_column_value(row, ["hops"])
     channel_str = _get_column_value(row, ["channel", "channel index", "ch index"])
     
-    # Извлекаем временные метки
+    # Extract timestamps.
+    # RU: Извлекаем временные метки
     last_heard = _get_column_value(row, ["lastheard", "last heard"])
     since = _get_column_value(row, ["since"])
     
-    # Собираем нормализованные данные узла
+    # Build normalized node data.
+    # RU: Собираем нормализованные данные узла.
     node_data: Dict[str, Any] = {
         "id": node_id,
         "user": user,
@@ -405,7 +451,8 @@ def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "channel_index": safe_int(channel_str) if channel_str else None,
         "last_heard": last_heard,
         "since": since,
-        # Сохраняем исходные данные строки
+        # Keep raw row data.
+        # RU: Сохраняем исходные данные строки.
         "raw_nodes_row": {k: v for k, v in row.items() if k != "__cols__"},
     }
     
@@ -413,27 +460,30 @@ def normalize_node_from_table_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ==============================================================================
-# Парсинг команды Info
+# --info parsing
+# RU: Парсинг команды Info
 # ==============================================================================
 
 def parse_info_output(stdout: str) -> Dict[str, Any]:
     """
-    Парсинг вывода meshtastic --info.
+    Parse meshtastic --info output.
+    RU: Парсинг вывода meshtastic --info.
 
-    Сначала пытается JSON, при неудаче — сырой текст.
+    Tries JSON first, then raw text.
+    RU: Сначала пытается JSON, при неудаче — сырой текст.
 
-    Аргументы:
-        stdout: Сырой вывод команды --info
+    Args:
+        stdout: Raw --info output. RU: Сырой вывод команды --info.
 
-    Возвращает:
-        Словарь с ключом 'json' или 'raw_text'
+    Returns:
+        Dict with 'json' or 'raw_text'. RU: Словарь с ключом 'json' или 'raw_text'.
     """
     parsed_json = try_parse_json(stdout)
     
     if isinstance(parsed_json, (dict, list)):
         return {"json": parsed_json}
     
-    # Запасной вариант: сырой текст
+    # Fallback: raw text. RU: Запасной вариант: сырой текст.
     text_lines = [
         line for line in stdout.splitlines()
         if line.strip() and line.strip() != "Connected to radio"
@@ -444,7 +494,8 @@ def parse_info_output(stdout: str) -> Dict[str, Any]:
 
 
 # ==============================================================================
-# Форматирование вывода
+# Output formatting
+# RU: Форматирование вывода
 # ==============================================================================
 
 def _format_cell(value: Any) -> str:
@@ -460,7 +511,7 @@ def _display_width(s: str) -> int:
         if ch == "\t":
             width += 4
             continue
-        # Комбинируемые символы ширины не добавляют
+        # Combining marks do not add width. RU: Комбинируемые символы ширины не добавляют.
         if unicodedata.combining(ch):
             continue
         eaw = unicodedata.east_asian_width(ch)
@@ -556,10 +607,12 @@ def parse_ts_to_epoch(value: Any) -> Optional[float]:
 
 
 # ==============================================================================
-# Операции с базой данных
+# DB operations
+# RU: Операции с базой данных
 # ==============================================================================
 
-# Поля для отслеживания изменений
+# Fields to track changes
+# RU: Поля для отслеживания изменений
 TRACKED_FIELDS = [
     ("user", "user"),
     ("aka", "aka"),
@@ -608,13 +661,15 @@ def deep_set(data: Dict[str, Any], path: str, value: Any) -> None:
     parts = path.split(".")
     current: Any = data
     
-    # Переходим к родителю
+    # Move to parent.
+    # RU: Переходим к родителю
     for part in parts[:-1]:
         if part not in current or not isinstance(current[part], dict):
             current[part] = {}
         current = current[part]
     
-    # Устанавливаем значение
+    # Set value.
+    # RU: Устанавливаем значение
     current[parts[-1]] = value
 
 
@@ -644,7 +699,8 @@ def load_database(path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, ValueError):
-        # Бэкап повреждённого файла
+        # Backup corrupted file.
+        # RU: Бэкап повреждённого файла
         backup_path = f"{path}.corrupt_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         os.replace(path, backup_path)
         
@@ -675,7 +731,7 @@ def ensure_node_record(node_id: str, db_nodes: Dict[str, Any]) -> Dict[str, Any]
             "first_seen_utc": iso_now(),
             "last_seen_utc": None,
             "current": {},
-            "history": [],  # формат истории: [{ts_utc, changes: {field: {from, to}}}]
+            "history": [],  # history format: [{ts_utc, changes: {field: {from, to}}}] RU: формат истории: [{ts_utc, changes: {field: {from, to}}}]
         }
     
     return db_nodes[node_id]
@@ -703,17 +759,20 @@ def apply_node_update(
     current = node_record.get("current", {})
     changes: Dict[str, Any] = {}
     
-    # Проверяем отслеживаемые поля на изменения
+    # Check tracked fields for changes.
+    # RU: Проверяем отслеживаемые поля на изменения
     for field_path, source_path in TRACKED_FIELDS:
         new_value = deep_get(new_data, source_path)
         old_value = deep_get(current, field_path)
         
-        # Учитываем числовой шум для float
+        # Ignore minor float noise.
+        # RU: Учитываем числовой шум для float
         if isinstance(new_value, float) and isinstance(old_value, float):
             if abs(new_value - old_value) < 1e-6:
                 continue
         
-        # Фиксируем изменение при различии значений
+        # Record change when values differ.
+        # RU: Фиксируем изменение при различии значений
         if new_value != old_value and not (new_value is None and old_value is None):
             changes[field_path] = {
                 "from": old_value,
@@ -721,20 +780,24 @@ def apply_node_update(
             }
             deep_set(current, field_path, new_value)
     
-    # Всегда обновляем телеметрию
+    # Always update telemetry.
+    # RU: Всегда обновляем телеметрию
     for key in ("last_heard", "since"):
         value = new_data.get(key)
         if value is not None:
             current[key] = value
     
-    # Сохраняем сырой снимок строки
+    # Store raw row snapshot.
+    # RU: Сохраняем сырой снимок строки
     raw_row = new_data.get("raw_nodes_row")
     if isinstance(raw_row, dict):
         current["raw_nodes_row"] = raw_row
     
-    # Обновляем запись
+    # Update record.
+    # RU: Обновляем запись
     node_record["current"] = current
-    # last_seen_utc при наличии выравниваем по last_heard
+    # Align last_seen_utc to last_heard when available.
+    # RU: last_seen_utc при наличии выравниваем по last_heard
     last_heard = new_data.get("last_heard")
     if isinstance(last_heard, str) and last_heard.strip():
         node_record["last_seen_utc"] = last_heard.strip()
@@ -748,7 +811,8 @@ def apply_node_update(
     else:
         node_record["last_seen_utc"] = timestamp_utc
     
-    # Добавляем в историю, если были изменения
+    # Append history if changed.
+    # RU: Добавляем в историю, если были изменения
     if changes:
         node_record["history"].append({
             "ts_utc": timestamp_utc,
@@ -759,16 +823,22 @@ def apply_node_update(
 
 
 # ==============================================================================
-# Основная функция
+# Main function
+# RU: Основная функция
 # ==============================================================================
 
 def main() -> int:
-    """Основная точка входа."""
+    """Main entry point. RU: Основная точка входа."""
     parser = argparse.ArgumentParser(
-        description="Одноразовый обновитель базы узлов Meshtastic",
+        description="One-shot Meshtastic node DB updater. RU: Одноразовый обновитель базы узлов Meshtastic.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
-            "Примеры:\n"
+            "Examples:\n"
+            "  python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt\n"
+            "  python nodeDbUpdater.py --regenerate\n"
+            "  python nodeDbUpdater.py --prune-days 30\n"
+            "\n"
+            "RU: Примеры:\n"
             "  python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt\n"
             "  python nodeDbUpdater.py --regenerate\n"
             "  python nodeDbUpdater.py --prune-days 30\n"
@@ -777,46 +847,46 @@ def main() -> int:
     parser.add_argument(
         "--port",
         default="/dev/ttyUSB0",
-        help="Серийный порт (по умолчанию: /dev/ttyUSB0)"
+        help="Serial port (default: /dev/ttyUSB0, Windows: COM3). RU: Серийный порт (по умолчанию: /dev/ttyUSB0, Windows: COM3)."
     )
     parser.add_argument(
         "--db",
         default="nodeDb.txt",
-        help="Путь к файлу базы (по умолчанию: nodeDb.txt)"
+        help="DB file path (default: nodeDb.txt). RU: Путь к файлу базы (по умолчанию: nodeDb.txt)."
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=40,
-        help="Таймаут команд в секундах (по умолчанию: 40)"
+        help="Command timeout in seconds (default: 40). RU: Таймаут команд в секундах (по умолчанию: 40)."
     )
     parser.add_argument(
         "--meshtastic-bin",
         default="meshtastic",
-        help="Имя/путь до Meshtastic CLI"
+        help="Meshtastic CLI name/path. RU: Имя/путь до Meshtastic CLI."
     )
     parser.add_argument(
         "--channel",
         type=int,
         default=None,
-        help="Опциональный индекс канала для запроса"
+        help="Optional channel index. RU: Опциональный индекс канала для запроса."
     )
     parser.add_argument(
         "--regenerate",
         action="store_true",
-        help="Пересоздать базу с нуля (игнорировать существующую)"
+        help="Recreate DB from scratch (ignore existing). RU: Пересоздать базу с нуля (игнорировать существующую)."
     )
     parser.add_argument(
         "--prune-days",
         type=int,
         default=None,
-        help="Удалить узлы, не замеченные дольше N дней"
+        help="Delete nodes not seen for N days. RU: Удалить узлы, не замеченные дольше N дней."
     )
     
     args = parser.parse_args()
     timestamp = iso_now()
     
-    # Загружаем базу
+    # Load DB. RU: Загружаем базу.
     if args.regenerate:
         db = {
             "meta": {
@@ -832,21 +902,31 @@ def main() -> int:
     db["meta"]["updated_utc"] = timestamp
     db["meta"]["last_port"] = args.port
     
-    # Собираем базовую команду
+    # Build base command. RU: Собираем базовую команду.
     base_cmd = [args.meshtastic_bin, "--port", args.port]
     if args.channel is not None:
         base_cmd += ["--ch-index", str(args.channel)]
     
-    # ===== Получение данных узлов =====
+    # ===== Nodes retrieval =====
+    # RU: Получение данных узлов
     nodes_json = None
     nodes_stdout = ""
     nodes_stderr = ""
     
-    # Пробуем разные флаги JSON-вывода
+    # Try JSON output flags.
+    # RU: Пробуем разные флаги JSON-вывода
     for json_flag in (["--format", "json"], ["--json"], []):
         cmd = base_cmd + ["--nodes"] + json_flag
         returncode, stdout, stderr = run_cmd(cmd, timeout=args.timeout)
         
+        if detect_device_not_found((stdout or "") + "\n" + (stderr or "")):
+            print(
+                f"[ERROR] Device not found on port {args.port}. Check cable/port/drivers (Windows: COM3). "
+                f"RU: Устройство не найдено на порту {args.port}. Проверьте кабель/порт/драйверы (Windows: COM3).",
+                file=sys.stderr,
+            )
+            return 2
+
         if returncode != 0:
             nodes_stdout, nodes_stderr = stdout, stderr
             continue
@@ -858,20 +938,22 @@ def main() -> int:
             break
         
         nodes_stdout, nodes_stderr = stdout, stderr
-        if not json_flag:  # Последняя попытка
+        if not json_flag:  # Last attempt. RU: Последняя попытка
             break
     
-    # Проверяем, что команда не провалилась
+    # Check command success. RU: Проверяем, что команда не провалилась.
     if not nodes_stdout.strip() and nodes_stderr.strip():
         print("[ERROR] meshtastic --nodes returned no output.", file=sys.stderr)
         print(nodes_stderr.strip(), file=sys.stderr)
         return 2
     
-    # ===== Нормализация данных узлов =====
+    # ===== Node normalization =====
+    # RU: Нормализация данных узлов
     normalized_nodes: List[Dict[str, Any]] = []
     
     if isinstance(nodes_json, list):
-        # Парсим JSON-формат
+        # Parse JSON format.
+        # RU: Парсим JSON-формат
         for item in nodes_json:
             if not isinstance(item, dict):
                 continue
@@ -912,18 +994,28 @@ def main() -> int:
                 "raw_nodes_row": item,
             })
     else:
-        # Парсим формат ASCII-таблицы
+        # Parse ASCII table format.
+        # RU: Парсим формат ASCII-таблицы
         table_rows = parse_nodes_table(nodes_stdout)
         for row in table_rows:
             normalized = normalize_node_from_table_row(row)
             if normalized.get("id"):
                 normalized_nodes.append(normalized)
     
-    # ===== Получение данных info =====
+    # ===== Info retrieval =====
+    # RU: Получение данных info
     info_returncode, info_stdout, info_stderr = run_cmd(
         base_cmd + ["--info"],
         timeout=args.timeout
     )
+
+    if detect_device_not_found((info_stdout or "") + "\n" + (info_stderr or "")):
+        print(
+            f"[ERROR] Device not found on port {args.port}. Check cable/port/drivers (Windows: COM3). "
+            f"RU: Устройство не найдено на порту {args.port}. Проверьте кабель/порт/драйверы (Windows: COM3).",
+            file=sys.stderr,
+        )
+        return 2
     
     info_output = info_stdout if info_returncode == 0 else (info_stdout + "\n" + info_stderr)
     info_data = parse_info_output(info_output)
@@ -933,12 +1025,13 @@ def main() -> int:
         "info": info_data
     }
     
-    # ===== Обновление базы =====
+    # ===== DB update =====
+    # RU: Обновление базы
     db_nodes = db["nodes"]
     new_nodes: List[str] = []
     changed_nodes: List[Tuple[str, Dict[str, Any]]] = []
     
-    # Счётчики изменений
+    # Change counters. RU: Счётчики изменений.
     rename_count = 0
     aka_count = 0
     role_count = 0
@@ -961,7 +1054,8 @@ def main() -> int:
         if changes:
             changed_nodes.append((node_id, changes))
             
-            # Считаем конкретные типы изменений
+            # Count specific change types.
+            # RU: Считаем конкретные типы изменений
             if "user" in changes:
                 rename_count += 1
             if "aka" in changes:
@@ -973,7 +1067,8 @@ def main() -> int:
             if "pubkey" in changes:
                 pubkey_count += 1
     
-    # Записываем статистику запуска
+    # Record run stats.
+    # RU: Записываем статистику запуска
     db["meta"]["last_run_stats"] = {
         "ts_utc": timestamp,
         "nodes_seen": len(seen_node_ids),
@@ -981,7 +1076,8 @@ def main() -> int:
         "nodes_changed": len(changed_nodes),
     }
 
-    # Удаляем старые записи по времени последнего появления
+    # Prune old records by last seen time.
+    # RU: Удаляем старые записи по времени последнего появления
     pruned_count = 0
     if args.prune_days is not None and args.prune_days >= 0:
         cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - (args.prune_days * 86400)
@@ -999,17 +1095,19 @@ def main() -> int:
             del db_nodes[node_id]
             pruned_count += 1
     
-    # ===== Сохраняем базу =====
+    # ===== Save DB =====
+    # RU: Сохраняем базу
     db_json = json.dumps(db, ensure_ascii=False, indent=2, sort_keys=True)
     atomic_write_text(args.db, db_json)
     
-    # ===== Выводим результаты =====
+    # ===== Output results =====
+    # RU: Выводим результаты
     print(f"[OK] Database updated: {args.db}")
     print(f"     Seen: {len(seen_node_ids)} | New: {len(new_nodes)} | Changed: {len(changed_nodes)}")
     if args.prune_days is not None and args.prune_days >= 0:
         print(f"     Pruned: {pruned_count} (older than {args.prune_days} days)")
     
-    # Вывод новых узлов
+    # New nodes output. RU: Вывод новых узлов.
     if new_nodes:
         print("\n[NEW NODES]")
         new_rows: List[List[Any]] = []
@@ -1033,10 +1131,13 @@ def main() -> int:
         ):
             print(line)
 
-    # Вывод изменений
+    # Changes output. RU: Вывод изменений.
     if changed_nodes:
         print("\n[CHANGES]")
         for node_id, changes in changed_nodes:
+            changes_view = {k: v for k, v in changes.items() if k != "snr_db"}
+            if not changes_view:
+                continue
             current = db_nodes[node_id]["current"]
             name = current.get("user")
             aka = current.get("aka")
@@ -1049,7 +1150,7 @@ def main() -> int:
             print(f"{header}  last_seen_utc={format_ts_display(last_seen)!r}  last_heard={format_ts_display(last_heard)!r}")
             
             change_rows: List[List[Any]] = []
-            for field, change_info in changes.items():
+            for field, change_info in changes_view.items():
                 change_rows.append([
                     field,
                     change_info.get("from"),
