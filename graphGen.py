@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+graphGen.py — Meshtastic graph generator:
+  - Graphviz DOT/SVG
+  - D3.js HTML/JSON (interactive)
+RU:
 graphGen.py — генератор графов Meshtastic:
   - Graphviz DOT/SVG
-  - D3.js HTML/JSON (интерактив и normalized stacked area chart)
+  - D3.js HTML/JSON (интерактив)
 
-Версия: 0.8.1
-Дата: 2026-01-31
+Version: 0.8.1
+Date: 2026-01-31
 
+CHANGELOG (RU below):
 ИСТОРИЯ ИЗМЕНЕНИЙ:
 0.8.1 (2026-01-31)
   - Добавлен D3.js HTML/JSON вывод, включая normalized stacked area chart по важности узлов.
@@ -37,6 +42,7 @@ graphGen.py — генератор графов Meshtastic:
 ВАЖНЫЕ ПУТИ:
   - папка трасс:     <root>/meshLogger
   - папка вывода:    <root>/graphGen
+  - поиск SQLite:    meshLogger.db (1) root, 2) папка скрипта, 3) домашняя папка
   - поиск nodeDb:    1) root, 2) папка скрипта, 3) домашняя папка
 
 Ожидаемый шаблон имени файлов трасс в <root>/meshLogger:
@@ -52,6 +58,7 @@ import json
 import math
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -427,6 +434,36 @@ def parse_ts_to_epoch(value: Any) -> Optional[float]:
     return None
 
 
+def load_nodes_from_sqlite(db_path: Path) -> Dict[str, Dict[str, Any]]:
+    node_meta: Dict[str, Dict[str, Any]] = {}
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except Exception:
+        return node_meta
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, long_name, short_name, role, channel_util, first_seen_utc
+            FROM nodes
+            """
+        )
+        for row in cur.fetchall():
+            nid, ln, sn, role, ch_util, first_seen = row
+            if not (isinstance(nid, str) and re.fullmatch(r"![0-9a-fA-F]{8}", nid)):
+                continue
+            node_meta[nid] = {
+                "longName": ln or "",
+                "shortName": sn or "",
+                "role": (role or ""),
+                "chUtil": float(ch_util) if isinstance(ch_util, (int, float)) else None,
+                "firstSeenEpoch": parse_ts_to_epoch(first_seen),
+            }
+    finally:
+        conn.close()
+    return node_meta
+
+
 @dataclass
 class TraceFileStats:
     path: str
@@ -452,7 +489,25 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
       (это соответствует вашему nodeDb.txt)
     """
     node_meta: Dict[str, Dict[str, Any]] = {}
-    debug = {"nodeDb_nodes_loaded": 0, "nodeDb_nodes_with_longName": 0}
+    debug = {
+        "nodeDb_nodes_loaded": 0,
+        "nodeDb_nodes_with_longName": 0,
+        "sqlite_nodes_loaded": 0,
+        "sqlite_nodes_with_longName": 0,
+    }
+
+    sqlite_path = None
+    for base in node_search:
+        cand = base / "meshLogger.db"
+        if cand.is_file():
+            sqlite_path = cand
+            break
+
+    if sqlite_path:
+        sqlite_nodes = load_nodes_from_sqlite(sqlite_path)
+        node_meta.update(sqlite_nodes)
+        debug["sqlite_nodes_loaded"] = len(sqlite_nodes)
+        debug["sqlite_nodes_with_longName"] = sum(1 for v in sqlite_nodes.values() if v.get("longName"))
 
     nodedb_path = None
     for base in node_search:
@@ -469,7 +524,7 @@ def build_node_meta(node_search: List[Path]) -> Tuple[Dict[str, Dict[str, Any]],
                 nodedb_path = cand
                 break
 
-    if nodedb_path:
+    if nodedb_path and not node_meta:
         ndb = load_json_fuzzy(nodedb_path)
         if isinstance(ndb, dict) and isinstance(ndb.get("nodes"), dict):
             for nid, rec in ndb["nodes"].items():
@@ -1207,7 +1262,16 @@ def main() -> int:
     html_path = out_dir / f"{out_base}.html"
 
     print("Read files:")
-    print(f"node database: {nodedb_path if nodedb_path else '(not found)'}")
+    sqlite_path = None
+    for base in node_search:
+        cand = base / "meshLogger.db"
+        if cand.is_file():
+            sqlite_path = cand
+            break
+    print(f"sqlite database: {sqlite_path if sqlite_path else '(not found)'}")
+    print(f"sqlite nodes loaded: {meta_debug.get('sqlite_nodes_loaded', 0)}")
+    print(f"sqlite nodes with longName: {meta_debug.get('sqlite_nodes_with_longName', 0)}")
+    print(f"nodeDb file: {nodedb_path if nodedb_path else '(not found)'}")
     print(f"nodeDb nodes loaded: {meta_debug.get('nodeDb_nodes_loaded', 0)}")
     print(f"nodeDb nodes with longName: {meta_debug.get('nodeDb_nodes_with_longName', 0)}")
     if nodedb_path and meta_debug.get("nodeDb_nodes_loaded", 0) > 0 and meta_debug.get("nodeDb_nodes_with_longName", 0) == 0:

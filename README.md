@@ -5,10 +5,12 @@ RU: Небольшие утилиты вокруг Meshtastic.
 
 - `meshLogger.py` polls traceroute and writes daily logs to `meshLogger/`.  
   RU: `meshLogger.py` опрашивает traceroute и пишет ежедневные логи в `meshLogger/`.
-- `nodeDbUpdater.py` updates `nodeDb.txt` from `meshtastic --nodes` and `--info`.  
-  RU: `nodeDbUpdater.py` обновляет `nodeDb.txt` из `meshtastic --nodes` и `--info`.
-- `graphGen.py` builds Graphviz (DOT/SVG) and D3.js (HTML/JSON) graphs from logs and node DB in `graphGen/`.  
-  RU: `graphGen.py` строит графы Graphviz (DOT/SVG) и D3.js (HTML/JSON) из логов и базы узлов в `graphGen/`.
+- `meshLogger.py` also writes an SQLite DB (`meshLogger.db`) once per hour using `meshtastic --nodes`.  
+  RU: `meshLogger.py` также пишет SQLite‑базу (`meshLogger.db`) раз в час через `meshtastic --nodes`.
+- `nodeDbUpdater.py` is legacy (text DB); keep only if you still need `nodeDb.txt`.  
+  RU: `nodeDbUpdater.py` — устаревший (текстовый) вариант; нужен только если нужен `nodeDb.txt`.
+- `graphGen.py` builds Graphviz (DOT/SVG) and D3.js (HTML/JSON) graphs from logs and node DB in `graphGen/` (SQLite preferred, `nodeDb.txt` fallback).  
+  RU: `graphGen.py` строит графы Graphviz (DOT/SVG) и D3.js (HTML/JSON) из логов и базы узлов в `graphGen/` (предпочитает SQLite, fallback — `nodeDb.txt`).
 
 ## Requirements
 
@@ -70,12 +72,25 @@ RU: Обновить базу узлов (однократно):
 python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt
 ```
 
+Hourly DB updates (SQLite) are built into `meshLogger.py`.  
+RU: Почасовое обновление SQLite‑базы встроено в `meshLogger.py`.
+Traceroutes and listen‑events are stored in SQLite only (no text logs).  
+RU: Traceroute и события listen сохраняются только в SQLite (без текстовых логов).
+
+Print DB schema:
+RU: Показать схему БД:
+
+```bash
+python meshLogger.py --db-schema
+```
+
 Generate graph from recent logs (Graphviz + D3.js):  
 RU: Сгенерировать граф из свежих логов (Graphviz + D3.js):
 
 ```bash
 python graphGen.py --root .
 ```
+
 
 ## First run checklist
 
@@ -97,7 +112,8 @@ meshTools/
   graphGen.py
   meshLogger/   # generated daily traceroute logs
   graphGen/     # generated graphs (dot/svg/html/json)
-  nodeDb.txt    # generated node DB
+  meshLogger.db # generated SQLite DB
+  nodeDb.txt    # generated node DB (legacy)
 ```
 
 RU:
@@ -108,7 +124,8 @@ meshTools/
   graphGen.py
   meshLogger/   # сгенерированные ежедневные логи traceroute
   graphGen/     # сгенерированные графы (dot/svg/html/json)
-  nodeDb.txt    # сгенерированная база узлов
+  meshLogger.db # сгенерированная SQLite-база
+  nodeDb.txt    # сгенерированная база узлов (legacy)
 ```
 
 ## Notes

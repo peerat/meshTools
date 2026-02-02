@@ -3,9 +3,10 @@ meshLogger/
 graphGen/
 nodeDb*.txt
 nodes.txt
+meshLogger.db
+*.db
 *.dot
 *.svg
-*.jpg
 
 # Python artifacts
 __pycache__/
