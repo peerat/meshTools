@@ -1,6 +1,8 @@
 # Generated data and artifacts
 meshLogger/
 graphGen/
+meshTalk/
+keyRings/
 nodeDb*.txt
 nodes.txt
 meshLogger.db
