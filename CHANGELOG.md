@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 alfa
+- UI: message bubbles aligned with fixed margins and gaps; timestamp offset refined.
+- UI: unread indicator dot position adjusted.
+- Logs: timestamps added to unprefixed log lines; self-id logged on connect.
+- Radio: auto-reconnect, screen cleared on disconnect, per-node config reload.
+- Storage: per-node queue reset on node switch; incoming multipart resume.
+- Fixes: history dedupe on reload; removed double recv logging; send/discovery error handling.
+
 ## 0.2.1 alfa
 - GUI: auto‑start even without radio, with retry and status in top bar.
 - GUI: top bar shows `Client ID` + names + masked pub key; click copies Client ID.
@@ -18,3 +26,5 @@
 - Data: per‑node storage for config/history/state/keys (<node_id>/ рядом с приложением).
 - Data: settings/history loaded only after node initialization.
 - UI: unread indicator (orange dot) in contact list.
+- Fix: history reload shows only sent/received (no duplicate attempts).
+- Fix: multipart receive resumes after restart.

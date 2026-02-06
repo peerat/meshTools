@@ -2,6 +2,7 @@
 
 License: MIT (Open Source)
 Author: Anton Vologzhanin (R3VAF)
+Current version: 0.2.2 alfa
 
 Small utilities around Meshtastic.
 

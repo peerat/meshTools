@@ -34,7 +34,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
-VERSION = "0.2.1 alfa"
+VERSION = "0.2.2 alfa"
 PROTO_VERSION = 1
 TYPE_MSG = 1
 TYPE_ACK = 2
@@ -48,6 +48,7 @@ DATA_DIR = BASE_DIR
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+INCOMING_FILE = os.path.join(DATA_DIR, "incoming.json")
 keydir = os.path.join(DATA_DIR, "keyRings")
 
 
@@ -60,7 +61,7 @@ def ensure_data_dir() -> None:
 
 
 def set_data_dir_for_node(node_id_norm: Optional[str]) -> None:
-    global DATA_DIR, STATE_FILE, HISTORY_FILE, CONFIG_FILE, keydir
+    global DATA_DIR, STATE_FILE, HISTORY_FILE, CONFIG_FILE, INCOMING_FILE, keydir
     if node_id_norm:
         DATA_DIR = os.path.join(BASE_DIR, node_id_norm)
     else:
@@ -68,6 +69,7 @@ def set_data_dir_for_node(node_id_norm: Optional[str]) -> None:
     STATE_FILE = os.path.join(DATA_DIR, "state.json")
     HISTORY_FILE = os.path.join(DATA_DIR, "history.log")
     CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+    INCOMING_FILE = os.path.join(DATA_DIR, "incoming.json")
     keydir = os.path.join(DATA_DIR, "keyRings")
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(keydir, exist_ok=True)
@@ -133,6 +135,89 @@ def save_state(pending_by_peer: Dict[str, Dict[str, Dict[str, object]]]) -> None
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, STATE_FILE)
+
+
+def load_incoming_state() -> Dict[str, Dict[str, object]]:
+    if not os.path.isfile(INCOMING_FILE):
+        return {}
+    try:
+        import json
+        data = json.loads(open(INCOMING_FILE, "r", encoding="utf-8").read())
+        incoming: Dict[str, Dict[str, object]] = {}
+        for item in data.get("incoming", []):
+            if not isinstance(item, dict):
+                continue
+            peer = item.get("peer")
+            group_id = item.get("group_id")
+            total = item.get("total")
+            parts = item.get("parts") or {}
+            if not isinstance(peer, str) or not peer or not isinstance(group_id, str) or not group_id:
+                continue
+            if not isinstance(total, int) or total <= 0:
+                continue
+            if not isinstance(parts, dict):
+                continue
+            parts_int: Dict[int, str] = {}
+            for k, v in parts.items():
+                try:
+                    ki = int(k)
+                except Exception:
+                    continue
+                parts_int[ki] = str(v)
+            key = f"{peer}:{group_id}"
+            incoming[key] = {
+                "peer": peer,
+                "group_id": group_id,
+                "total": total,
+                "parts": parts_int,
+                "delivery": item.get("delivery"),
+                "hops_sum": float(item.get("hops_sum", 0.0)),
+                "hops_n": int(item.get("hops_n", 0)),
+                "attempts_sum": float(item.get("attempts_sum", 0.0)),
+                "attempts_n": int(item.get("attempts_n", 0)),
+            }
+        return incoming
+    except Exception:
+        return {}
+
+
+def save_incoming_state(incoming: Dict[str, Dict[str, object]]) -> None:
+    import json
+    tmp = INCOMING_FILE + ".tmp"
+    flat = []
+    for rec in incoming.values():
+        if not isinstance(rec, dict):
+            continue
+        peer = rec.get("peer")
+        group_id = rec.get("group_id")
+        total = rec.get("total")
+        parts = rec.get("parts") or {}
+        if not isinstance(peer, str) or not peer or not isinstance(group_id, str) or not group_id:
+            continue
+        if not isinstance(total, int) or total <= 0:
+            continue
+        if not isinstance(parts, dict):
+            continue
+        parts_str: Dict[str, str] = {}
+        for k, v in parts.items():
+            parts_str[str(k)] = str(v)
+        flat.append(
+            {
+                "peer": peer,
+                "group_id": group_id,
+                "total": total,
+                "parts": parts_str,
+                "delivery": rec.get("delivery"),
+                "hops_sum": float(rec.get("hops_sum", 0.0)),
+                "hops_n": int(rec.get("hops_n", 0)),
+                "attempts_sum": float(rec.get("attempts_sum", 0.0)),
+                "attempts_n": int(rec.get("attempts_n", 0)),
+            }
+        )
+    data = {"incoming": flat}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, INCOMING_FILE)
 
 
 def append_history(direction: str, peer_id: str, msg_id: str, text: str, extra: str = "") -> None:
@@ -413,6 +498,7 @@ def main() -> int:
 
 
     args = ap.parse_args()
+    initial_port_arg = args.port
 
     if args.help:
         ap.print_help()
@@ -439,6 +525,7 @@ def main() -> int:
     peer_id_norm, peer_path = (None, None)
     known_peers: Dict[str, x25519.X25519PublicKey] = {}
     peer_names: Dict[str, Dict[str, str]] = {}
+    incoming_state: Dict[str, Dict[str, object]] = {}
 
     def update_peer_names_from_nodes(peer_norm: Optional[str] = None) -> None:
         try:
@@ -495,6 +582,7 @@ def main() -> int:
             return (False, "Waiting for radio (no self id)")
         startup_events.append(f"{ts_local()} NODE: self id {self_id_raw}")
         self_id = norm_id_for_filename(self_id_raw)
+        peer_id_norm = self_id
         set_data_dir_for_node(self_id)
         migrate_data_dir(os.path.join(LEGACY_BASE_DIR, self_id), DATA_DIR)
         migrate_data_dir(LEGACY_BASE_DIR, DATA_DIR)
@@ -529,8 +617,18 @@ def main() -> int:
         known_peers = load_known_peers(keydir, self_id)
         radio_ready = True
         update_peer_names_from_nodes()
+        ui_emit("log", f"{ts_local()} RADIO: self {wire_id_from_norm(self_id)}")
         try:
             pub.subscribe(on_receive, "meshtastic.receive.data")
+            def _on_conn_status(*_args, **_kwargs):
+                try:
+                    evt = _kwargs.get("evt")
+                    if isinstance(evt, dict) and evt.get("connected") is False:
+                        ui_emit("radio_lost", None)
+                        return
+                except Exception:
+                    pass
+            pub.subscribe(_on_conn_status, "meshtastic.connection.status")
         except Exception:
             pass
         ui_emit("config_reload", load_config())
@@ -725,7 +823,6 @@ def main() -> int:
                 st.rtt_count += 1
                 st.rtt_avg = st.rtt_avg + (rtt - st.rtt_avg) / float(st.rtt_count)
                 print(f"ACK: {msg_hex} rtt={rtt:.2f}s avg={st.rtt_avg:.2f}s attempts={attempts}")
-                append_history("sent", str(from_id), msg_hex, str(rec.get("text", "")), f"rtt={rtt:.2f}s attempts={attempts}")
                 ui_emit("log", f"{ts_local()} ACK: {msg_hex} rtt={rtt:.2f}s attempts={attempts}")
                 if peer_norm:
                     hop_start = packet.get("hopStart")
@@ -796,7 +893,8 @@ def main() -> int:
                 text = repr(pt)
             print(f"RECV from {from_id}: {text}")
             if not (total and int(total) > 1):
-                append_history("recv", str(from_id), msg_hex, text)
+                # history is written on assembled message in UI layer
+                pass
             last_activity_ts = time.time()
             if peer_norm:
                 hop_start = packet.get("hopStart")
@@ -817,17 +915,24 @@ def main() -> int:
                     ack_payload = pack_message(TYPE_ACK, msg_id, st.aes, b"ACK")
                 else:
                     ack_payload = pack_message(TYPE_ACK, msg_id, st.aes, f"ACK|hops={hops}".encode("utf-8"))
-                interface.sendData(
-                    ack_payload,
-                    destinationId=from_id,
-                    wantAck=False,
-                    portNum=DEFAULT_PORTNUM,
-                    channelIndex=(args.channel if args.channel is not None else 0),
-                )
+                try:
+                    interface.sendData(
+                        ack_payload,
+                        destinationId=from_id,
+                        wantAck=False,
+                        portNum=DEFAULT_PORTNUM,
+                        channelIndex=(args.channel if args.channel is not None else 0),
+                    )
+                except Exception:
+                    ui_emit("radio_lost", None)
+                    return
             return
 
     print(f"meshTalk.py v{VERSION}")
-    print(f"Port: {args.port} (Windows: COM3 or auto)")
+    if sys.platform.startswith("win"):
+        print(f"Port: {args.port} (Windows: COM3 or auto)")
+    else:
+        print(f"Port: {args.port} (Linux: /dev/ttyUSB0 or /dev/ttyACM0 or auto)")
     print("Listening: ON")
     max_plain = max(0, int(args.max_bytes) - PAYLOAD_OVERHEAD)
     print(f"Max plaintext bytes: {max_plain} (payload limit {args.max_bytes}, overhead {PAYLOAD_OVERHEAD})")
@@ -889,13 +994,17 @@ def main() -> int:
             return
         dest_id = wire_id_from_norm(peer_norm)
         req = KEY_REQ_PREFIX + self_id.encode("utf-8") + b"|" + b64e(pub_self_raw).encode("ascii")
-        interface.sendData(
-            req,
-            destinationId=dest_id,
-            wantAck=False,
-            portNum=DEFAULT_PORTNUM,
-            channelIndex=(args.channel if args.channel is not None else 0),
-        )
+        try:
+            interface.sendData(
+                req,
+                destinationId=dest_id,
+                wantAck=False,
+                portNum=DEFAULT_PORTNUM,
+                channelIndex=(args.channel if args.channel is not None else 0),
+            )
+        except Exception:
+            ui_emit("radio_lost", None)
+            return
         print(f"{ts_local()} KEY: request sent to {dest_id}")
         last_activity_ts = now
         last_key_sent_ts = last_activity_ts
@@ -908,14 +1017,18 @@ def main() -> int:
         if not radio_ready or interface is None:
             return
         req = KEY_REQ_PREFIX + self_id.encode("utf-8") + b"|" + b64e(pub_self_raw).encode("ascii")
-        interface.sendData(
-            req,
-            destinationId=meshtastic.BROADCAST_ADDR,
-            wantAck=False,
-            portNum=DEFAULT_PORTNUM,
-            channelIndex=(args.channel if args.channel is not None else 0),
-        )
-        ui_emit("log", f"{ts_local()} DISCOVERY: broadcast")
+        try:
+            interface.sendData(
+                req,
+                destinationId=meshtastic.BROADCAST_ADDR,
+                wantAck=False,
+                portNum=DEFAULT_PORTNUM,
+                channelIndex=(args.channel if args.channel is not None else 0),
+            )
+            ui_emit("log", f"{ts_local()} DISCOVERY: broadcast")
+        except Exception:
+            ui_emit("radio_lost", None)
+            return
 
     def split_text_utf8(text: str, max_bytes: int) -> list[str]:
         if max_bytes <= 0:
@@ -1085,13 +1198,17 @@ def main() -> int:
                     ui_emit("log", f"{ts_local()} DROP: {rec['id']} payload too big for {peer_norm}")
                     return
 
-                interface.sendData(
-                    payload,
-                    destinationId=wire_id_from_norm(peer_norm),
-                    wantAck=False,
-                    portNum=DEFAULT_PORTNUM,
-                    channelIndex=(args.channel if args.channel is not None else 0),
-                )
+                try:
+                    interface.sendData(
+                        payload,
+                        destinationId=wire_id_from_norm(peer_norm),
+                        wantAck=False,
+                        portNum=DEFAULT_PORTNUM,
+                        channelIndex=(args.channel if args.channel is not None else 0),
+                    )
+                except Exception:
+                    ui_emit("radio_lost", None)
+                    return
                 rec["attempts"] = attempts_next
                 rec["last_send"] = now
                 with pending_lock:
@@ -1599,7 +1716,7 @@ def main() -> int:
             btn_copy = QtWidgets.QPushButton("Copy log")
             copy_row.addWidget(btn_copy)
             layout.addLayout(copy_row)
-            author_label = QtWidgets.QLabel("meshTalk v0.2.1 alfa\nAuthor: Anton Vologzhanin\nCallsign: R3VAF\nTelegram: @peerat33\nLicense: MIT")
+            author_label = QtWidgets.QLabel("meshTalk v0.2.2 alfa\nAuthor: Anton Vologzhanin\nCallsign: R3VAF\nTelegram: @peerat33\nLicense: MIT")
             author_label.setObjectName("muted")
             layout.addWidget(author_label)
             buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -1765,6 +1882,9 @@ def main() -> int:
             tx_hex = mix_hex("#eeeeec", accent, 0.35)
             return (bg_hex, tx_hex)
 
+        def color_pair_for_message(seed: str) -> Tuple[str, str]:
+            return color_pair_for_id(seed)
+
         avatar_cache: Dict[Tuple[str, int], str] = {}
 
         def avatar_data_uri(seed: str, size: int) -> str:
@@ -1825,7 +1945,7 @@ def main() -> int:
                 return "\n".join(lines)
 
             icon = avatar_data_uri(peer_id, 36)
-            bg, tx = color_pair_for_id(peer_id)
+            bg, tx = color_pair_for_message(peer_id)
             if " " in text and len(text) >= 6:
                 ts = text[:5]
                 msg = text[6:]
@@ -1864,33 +1984,36 @@ def main() -> int:
             tag = short_tag(peer_id)
             tag_html = html_escape(tag) if tag else "&nbsp;"
             msg_align = "right" if outgoing else "left"
-            avatar_img_cell = (
-                f"<td width='46' align='center' valign='top' style='padding:0;'>"
+            avatar_cell = (
+                f"<td width='46' align='center' valign='top' style='padding:0;' rowspan='2'>"
+                f"<div style='display:flex;flex-direction:column;align-items:center;gap:2px;'>"
                 f"<img src='{icon}' width='36' height='36'>"
-                f"</td>"
-            )
-            avatar_tag_cell = (
-                f"<td width='46' align='center' valign='top' style='padding:0;'>"
-                f"<div style='color:{text_color};font-size:13px;line-height:1.0;text-align:center;'>{tag_html}</div>"
+                f"<div style='color:{text_color};font-size:13px;font-weight:600;line-height:1.0;text-align:center;'>{tag_html}</div>"
+                f"</div>"
                 f"</td>"
             )
             msg_text_cell = (
-                f"<td width='100%' align='{msg_align}' valign='top' style='padding:4px 8px 0 8px;color:{text_color};text-align:{msg_align};line-height:1.25;margin:0;'>"
+                f"<td width='100%' align='{msg_align}' valign='top' style='padding:4px 8px 0 8px;color:{text_color};text-align:{msg_align};line-height:1.25;margin:0;height:100%;'>"
                 f"{html_escape(msg)}"
                 f"</td>"
             )
             ts_cell = (
-                f"<td width='100%' align='right' valign='top' style='padding:2px 8px 4px 8px;color:{ts_color};font-size:10px;line-height:1.0;margin:0;text-align:right;'>"
+                f"<td width='100%' align='right' valign='bottom' style='padding:0 6px 1px 0;color:{ts_color};font-size:10px;line-height:1.0;margin:0;text-align:right;'>"
                 f"{ts_html}"
                 f"</td>"
             )
+            bubble_align = "right" if outgoing else "left"
+            bubble_pad = "padding-left:40px;padding-right:0;" if outgoing else "padding-right:40px;padding-left:0;"
             row = (
                 f"<table width='100%' style='margin:0;padding:0;border-collapse:collapse;' cellpadding='0' cellspacing='0'>"
+                f"<tr><td style='padding:0 0 2px 0;{bubble_pad}'>"
+                f"<table width='100%' align='{bubble_align}' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
                 f"<tr><td style='background:{bg};padding:6px 0;'>"
-                f"<table width='100%' cellpadding='0' cellspacing='0' style='margin:0;padding:0;border-collapse:collapse;'>"
-                f"<tr>{avatar_img_cell}{msg_text_cell}</tr>"
-                f"<tr>{avatar_tag_cell}{ts_cell}</tr>"
+                f"<table width='100%' cellpadding='0' cellspacing='0' style='margin:0;padding:0;border-collapse:collapse;height:100%;'>"
+                f"<tr>{avatar_cell}{msg_text_cell}</tr>"
+                f"<tr>{ts_cell}</tr>"
                 f"</table>"
+                f"</td></tr></table>"
                 f"</td></tr></table>"
             )
             view.moveCursor(QtGui.QTextCursor.End)
@@ -2333,6 +2456,44 @@ def main() -> int:
                 append_chat_entry(chat_text, line, peer_id, outgoing, idx, meta=meta)
             update_status()
 
+        def history_has_msg(dialog_id: str, msg_id: str) -> bool:
+            if not msg_id:
+                return False
+            for entry in chat_history.get(dialog_id, []):
+                if isinstance(entry, dict) and entry.get("msg_id") == msg_id:
+                    return True
+            return False
+
+        def restore_incoming_state() -> None:
+            for rec in incoming_state.values():
+                peer_norm = str(rec.get("peer", "")).strip()
+                group_id = str(rec.get("group_id", "")).strip()
+                if not peer_norm or not group_id:
+                    continue
+                if history_has_msg(peer_norm, group_id):
+                    continue
+                parts = rec.get("parts") or {}
+                total = int(rec.get("total", 0) or 0)
+                if total <= 0 or not isinstance(parts, dict):
+                    continue
+                full = "".join(str(parts.get(i, "")) for i in range(1, total + 1))
+                if len(parts) < total:
+                    full = full + "..."
+                avg_hops = None
+                if rec.get("hops_n", 0):
+                    avg_hops = float(rec.get("hops_sum", 0.0)) / float(rec.get("hops_n", 1))
+                avg_attempts = None
+                if rec.get("attempts_n", 0):
+                    avg_attempts = float(rec.get("attempts_sum", 0.0)) / float(rec.get("attempts_n", 1))
+                meta = format_meta(
+                    rec.get("delivery"),
+                    avg_attempts if avg_attempts is not None else 1,
+                    avg_hops,
+                    None,
+                    (len(parts), total),
+                )
+                chat_line(peer_norm, full, "#66d9ef", meta=meta, msg_id=group_id, replace_msg_id=group_id)
+
         log_buffer: list[tuple[str, str]] = []
         for line in log_startup:
             log_buffer.append((line, "info"))
@@ -2347,6 +2508,8 @@ def main() -> int:
             append_html(view, text, color)
 
         def log_line(text: str, level: str = "info") -> None:
+            if not re.match(r"^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\b", text):
+                text = f"{ts_local()} {text}"
             lvl = level
             if ("ERROR" in text) or ("Exception" in text) or ("Traceback" in text):
                 lvl = "error"
@@ -2440,6 +2603,11 @@ def main() -> int:
                     render_chat(dialog_id)
                 else:
                     refresh_list()
+                if packets is not None:
+                    done, total = packets
+                    if int(done) >= int(total) and not entry.get("logged"):
+                        append_history("sent", dialog_id, msg_id, msg)
+                        entry["logged"] = True
                 return
 
         def send_message() -> None:
@@ -2503,14 +2671,16 @@ def main() -> int:
                 if len(parts) < 5:
                     continue
                 direction = parts[1]
+                if direction not in ("recv", "sent"):
+                    continue
                 peer_id = parts[2]
                 msg_id = parts[3]
-                key = (peer_id, msg_id)
+                peer_norm = norm_id_for_filename(peer_id)
+                key = (peer_norm, msg_id)
                 if msg_id and key in seen_ids:
                     continue
                 if msg_id:
                     seen_ids.add(key)
-                peer_norm = norm_id_for_filename(peer_id)
                 if peer_id.startswith("group:") and peer_id[6:] not in groups:
                     continue
                 text = parts[4]
@@ -2518,7 +2688,10 @@ def main() -> int:
                 time_only = ts_part.split(" ")[1][:5] if " " in ts_part else ts_part[:5]
                 dialog_id = peer_id if peer_id.startswith("group:") else peer_norm
                 dir_flag = "out" if direction in ("send", "sent") else "in"
-                chat_history.setdefault(dialog_id, []).append({"text": f"{time_only} {text}", "dir": dir_flag})
+                entry = {"text": f"{time_only} {text}", "dir": dir_flag}
+                if msg_id:
+                    entry["msg_id"] = msg_id
+                chat_history.setdefault(dialog_id, []).append(entry)
                 update_dialog(dialog_id, text, recv=(dir_flag == "in"))
 
         initializing = True
@@ -2530,6 +2703,9 @@ def main() -> int:
             nonlocal current_lang, verbose_log, pinned_dialogs, hidden_contacts, groups
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
+            nonlocal incoming_state
+            nonlocal interface, self_id, self_id_raw, radio_ready, known_peers, peer_states, peer_names
+            nonlocal initial_port_arg
             if initializing:
                 now = time.time()
                 if (now - last_init_label_ts) >= 0.5:
@@ -2574,10 +2750,12 @@ def main() -> int:
                     try:
                         with pending_lock:
                             pending_by_peer.clear()
-                            pending_by_peer.update(load_state(default_peer=peer_id_norm))
+                            save_state(pending_by_peer)
                     except Exception:
                         pass
+                    incoming_state = load_incoming_state()
                     load_history()
+                    restore_incoming_state()
                     apply_language()
                     refresh_list()
                     render_chat(current_dialog)
@@ -2586,10 +2764,7 @@ def main() -> int:
                     peer_norm = norm_id_for_filename(from_id)
                     if peer_norm:
                         key = f"{peer_norm}:{group_id}"
-                        if not hasattr(process_ui_events, "_incoming"):
-                            process_ui_events._incoming = {}
-                        incoming = process_ui_events._incoming
-                        rec = incoming.get(key) or {
+                        rec = incoming_state.get(key) or {
                             "total": total,
                             "parts": {},
                             "delivery": delivery,
@@ -2597,6 +2772,8 @@ def main() -> int:
                             "hops_n": 0,
                             "attempts_sum": 0.0,
                             "attempts_n": 0,
+                            "peer": peer_norm,
+                            "group_id": group_id,
                         }
                         rec["total"] = total
                         if delivery is not None:
@@ -2609,7 +2786,8 @@ def main() -> int:
                             rec["attempts_n"] = int(rec.get("attempts_n", 0)) + 1
                         rec["parts"][int(part)] = text
                         rec["last_part"] = int(part)
-                        incoming[key] = rec
+                        incoming_state[key] = rec
+                        save_incoming_state(incoming_state)
                         full = "".join(rec["parts"].get(i, "") for i in range(1, int(total) + 1))
                         if len(rec["parts"]) < int(total):
                             full = full + "..."
@@ -2629,7 +2807,8 @@ def main() -> int:
                         chat_line(peer_norm, full, "#66d9ef", meta=meta, msg_id=group_id, replace_msg_id=group_id)
                         if len(rec["parts"]) >= int(total):
                             append_history("recv", peer_norm, group_id, full)
-                            incoming.pop(key, None)
+                            incoming_state.pop(key, None)
+                            save_incoming_state(incoming_state)
                 elif evt == "queued":
                     peer_norm, text = payload
                     log_line(f"QUEUE -> {peer_norm}: {text}", "info")
@@ -2683,6 +2862,35 @@ def main() -> int:
                     log_line(str(payload), "info")
                 elif evt == "self_update":
                     chat_label.setText(self_title())
+                elif evt == "radio_lost":
+                    if radio_ready:
+                        ui_emit("log", f"{ts_local()} RADIO: disconnected")
+                    radio_ready = False
+                    interface = None
+                    self_id = ""
+                    self_id_raw = None
+                    args.port = initial_port_arg
+                    known_peers.clear()
+                    peer_states.clear()
+                    peer_names.clear()
+                    incoming_state.clear()
+                    with pending_lock:
+                        pending_by_peer.clear()
+                    dialogs.clear()
+                    chat_history.clear()
+                    list_index.clear()
+                    current_dialog = None
+                    try:
+                        chat_text.clear()
+                        items_list.clear()
+                        search_field.clear()
+                        msg_entry.clear()
+                    except Exception:
+                        pass
+                    initializing = True
+                    chat_label.setText("Waiting for radio...")
+                    refresh_list()
+                    start_radio_loop()
             update_status()
 
         def copy_client_id() -> None:
@@ -2807,7 +3015,8 @@ def main() -> int:
 
         refresh_list()
         initializing = True
-        log_line(f"{ts_local()} GUI: started | port={args.port} | self={self_id}", "info")
+        radio_loop_running = False
+        log_line(f"{ts_local()} GUI: started | port={args.port} | self=waiting", "info")
         log_line(f"{ts_local()} RADIO: listening ON", "info")
         update_status()
 
@@ -2816,21 +3025,60 @@ def main() -> int:
         timer.start(200)
 
         def radio_loop() -> None:
-            nonlocal initializing
+            nonlocal initializing, radio_loop_running
+            radio_loop_running = True
             while True:
                 if radio_ready:
+                    radio_loop_running = False
                     return
                 ok, msg = try_init_radio()
                 if ok:
                     ui_emit("log", f"{ts_local()} RADIO: connected")
+                    ui_emit("log", f"{ts_local()} GUI: ready | self={wire_id_from_norm(self_id)}")
                     initializing = False
                     refresh_list()
                     chat_label.setText(self_title())
+                    radio_loop_running = False
                     return
                 chat_label.setText(msg)
                 time.sleep(5.0)
+            radio_loop_running = False
 
-        threading.Thread(target=radio_loop, daemon=True).start()
+        def start_radio_loop() -> None:
+            if not radio_loop_running:
+                threading.Thread(target=radio_loop, daemon=True).start()
+
+        def monitor_radio() -> None:
+            while True:
+                if radio_ready and interface is not None:
+                    try:
+                        # Port presence check (USB unplug)
+                        try:
+                            ports = {p.device for p in list_ports.comports()}
+                            if args.port and args.port not in ("auto", "") and args.port not in ports:
+                                ui_emit("radio_lost", None)
+                                time.sleep(2.0)
+                                continue
+                        except Exception:
+                            pass
+                        is_conn = None
+                        try:
+                            is_conn = interface.isConnected if isinstance(getattr(interface, "isConnected", None), bool) else None
+                        except Exception:
+                            is_conn = None
+                        if is_conn is False:
+                            ui_emit("radio_lost", None)
+                            time.sleep(2.0)
+                            continue
+                        nid = get_self_id(interface)
+                        if not nid:
+                            ui_emit("radio_lost", None)
+                    except Exception:
+                        ui_emit("radio_lost", None)
+                time.sleep(2.0)
+
+        start_radio_loop()
+        threading.Thread(target=monitor_radio, daemon=True).start()
 
         win.show()
         return app.exec()
