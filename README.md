@@ -1,5 +1,8 @@
 # meshTools
 
+License: MIT (Open Source)
+Author: Anton Vologzhanin (R3VAF)
+
 Small utilities around Meshtastic.
 
 ## Contents
@@ -9,6 +12,7 @@ Small utilities around Meshtastic.
 - `nodeDbUpdater.py` is legacy (text DB); keep only if you still need `nodeDb.txt`.
 - `graphGen.py` builds Graphviz (DOT/SVG) and D3.js (HTML/JSON) graphs from logs and node DB in `graphGen/` (SQLite preferred, `nodeDb.txt` fallback).
 - `meshTalk.py` provides encrypted, ACK-based point-to-point messaging over Meshtastic (Python API).
+- meshTalk UI: unread indicator (orange dot) in contact list.
 
 ## Requirements
 
