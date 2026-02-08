@@ -847,7 +847,7 @@ def main() -> int:
                 peer_id=peer_id,
                 from_id_raw=from_id_raw,
                 to_id=to_id,
-                broadcast_addr=int(meshtastic.BROADCAST_ADDR),
+                broadcast_addr=meshtastic.BROADCAST_ADDR,
                 discovery_reply=bool(discovery_reply),
             )
             if not accepted_frame and reject_reason == "broadcast_disabled":

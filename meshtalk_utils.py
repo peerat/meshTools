@@ -415,12 +415,35 @@ def validate_key_frame_source(
     return (True, trusted_capabilities, "")
 
 
-def is_broadcast_destination(to_id: object, broadcast_addr: int) -> bool:
+def is_broadcast_destination(to_id: object, broadcast_addr: object) -> bool:
+    aliases = {"^all", "all", "broadcast"}
+    broadcast_int: Optional[int] = None
+    if isinstance(broadcast_addr, int):
+        broadcast_int = int(broadcast_addr)
+        aliases.add(str(broadcast_int))
+    elif isinstance(broadcast_addr, str):
+        addr_text = broadcast_addr.strip().lower()
+        if addr_text:
+            aliases.add(addr_text)
+        try:
+            broadcast_int = int(broadcast_addr, 0)
+        except Exception:
+            broadcast_int = None
+
     if isinstance(to_id, int):
-        return to_id == int(broadcast_addr)
+        return bool((broadcast_int is not None) and (int(to_id) == int(broadcast_int)))
+
     if isinstance(to_id, str):
         text = to_id.strip().lower()
-        return text in ("^all", "all", "broadcast") or text == str(int(broadcast_addr))
+        if text in aliases:
+            return True
+        if broadcast_int is not None:
+            if text == str(int(broadcast_int)):
+                return True
+            try:
+                return int(to_id, 0) == int(broadcast_int)
+            except Exception:
+                return False
     return False
 
 
@@ -428,7 +451,7 @@ def key_frame_receive_policy(
     peer_id: str,
     from_id_raw: object,
     to_id: object,
-    broadcast_addr: int,
+    broadcast_addr: object,
     discovery_reply: bool,
 ) -> Tuple[bool, bool, str, bool, Optional[str]]:
     from_id = str(from_id_raw).strip() if from_id_raw else None

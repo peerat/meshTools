@@ -582,6 +582,20 @@ class MeshTalkUtilsTests(unittest.TestCase):
         self.assertTrue(is_broadcast)
         self.assertEqual(from_id, "!11223344")
 
+    def test_key_frame_receive_policy_broadcast_addr_as_string(self) -> None:
+        accepted, trusted, reason, is_broadcast, from_id = key_frame_receive_policy(
+            peer_id="!11223344",
+            from_id_raw="!11223344",
+            to_id="^all",
+            broadcast_addr="^all",
+            discovery_reply=True,
+        )
+        self.assertTrue(accepted)
+        self.assertFalse(trusted)
+        self.assertEqual(reason, "")
+        self.assertTrue(is_broadcast)
+        self.assertEqual(from_id, "!11223344")
+
     def test_key_frame_receive_policy_unicast_mismatch(self) -> None:
         accepted, trusted, reason, is_broadcast, from_id = key_frame_receive_policy(
             peer_id="!11223344",
