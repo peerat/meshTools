@@ -444,14 +444,37 @@ def load_nodes_from_sqlite(db_path: Path) -> Dict[str, Dict[str, Any]]:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, long_name, short_name, role, channel_util, first_seen_utc
+            SELECT id, long_name, short_name, role, first_seen_utc
             FROM nodes
             """
         )
-        for row in cur.fetchall():
-            nid, ln, sn, role, ch_util, first_seen = row
+        node_rows = cur.fetchall()
+        sample_ch_util: Dict[str, Optional[float]] = {}
+        try:
+            cur.execute(
+                """
+                SELECT ns.node_id, ns.channel_util
+                FROM node_samples ns
+                JOIN (
+                    SELECT node_id, MAX(ts_utc) AS max_ts
+                    FROM node_samples
+                    WHERE channel_util IS NOT NULL
+                    GROUP BY node_id
+                ) last
+                ON last.node_id = ns.node_id AND last.max_ts = ns.ts_utc
+                """
+            )
+            for row in cur.fetchall():
+                nid, ch_util = row
+                if isinstance(nid, str):
+                    sample_ch_util[nid] = float(ch_util) if isinstance(ch_util, (int, float)) else None
+        except Exception:
+            sample_ch_util = {}
+        for row in node_rows:
+            nid, ln, sn, role, first_seen = row
             if not (isinstance(nid, str) and re.fullmatch(r"![0-9a-fA-F]{8}", nid)):
                 continue
+            ch_util = sample_ch_util.get(nid)
             node_meta[nid] = {
                 "longName": ln or "",
                 "shortName": sn or "",
@@ -810,6 +833,242 @@ def parse_traces_with_stats(
         "timeRangeEnd": time_bins[-1] if time_bins else None,
     }
     return dict(edge_count), dict(edge_rssi), dict(transit_count), time_series, time_meta, stats_list, debug, selected_files
+
+
+def parse_traceroutes_with_stats_from_db(
+    db_path: Path,
+    include_unknown: bool,
+    dt_window: Optional[Tuple[datetime, datetime]],
+) -> Tuple[
+    Dict[Tuple[str, str], int],
+    Dict[Tuple[str, str], List[float]],
+    Dict[str, int],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+    List[TraceFileStats],
+    Dict[str, int],
+    List[Path],
+]:
+    edge_count: Dict[Tuple[str, str], int] = defaultdict(int)
+    edge_rssi: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    transit_count: Dict[str, int] = defaultdict(int)
+
+    dropped_unknown_edges = 0
+    dropped_unknown_edges_with_rssi = 0
+
+    base_bin_minutes = 5
+    bin_seconds = base_bin_minutes * 60
+    routing_by_bin: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    neighbors_by_bin: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
+    presence_by_bin: Dict[int, set] = defaultdict(set)
+
+    w_start: Optional[datetime] = None
+    w_end: Optional[datetime] = None
+    w_start_epoch: Optional[float] = None
+    w_end_epoch: Optional[float] = None
+    if dt_window:
+        w_start, w_end = dt_window
+        # --datetime parser returns naive datetime values.
+        # Interpret them as UTC for DB ts_utc comparison.
+        w_start_epoch = w_start.replace(tzinfo=timezone.utc).timestamp()
+        w_end_epoch = w_end.replace(tzinfo=timezone.utc).timestamp()
+
+    lines_total = 0
+    hops_total = 0
+    edges_added = 0
+    rssi_samples = 0
+    unknown_mentions = 0
+    lines_in_window = 0
+    unique_edges_in_source = set()
+    unique_nodes_in_source = set()
+    selected_any = False
+    selected_rows = 0
+
+    rows = []
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ts_utc, route_raw
+            FROM traceroutes
+            WHERE route_raw IS NOT NULL AND route_raw != ''
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+    finally:
+        if conn is not None:
+            conn.close()
+
+    for ts_utc, route_raw in rows:
+        line = str(route_raw or "")
+        lines_total += 1
+        ts_epoch = parse_ts_to_epoch(ts_utc)
+        bin_key: Optional[int] = None
+
+        if w_start_epoch is not None and w_end_epoch is not None:
+            if ts_epoch is None:
+                continue
+            if ts_epoch < w_start_epoch or ts_epoch > w_end_epoch:
+                continue
+            lines_in_window += 1
+            selected_any = True
+            selected_rows += 1
+        else:
+            selected_any = True
+            selected_rows += 1
+
+        if ts_epoch is not None:
+            epoch = int(ts_epoch)
+            bin_key = epoch - (epoch % int(bin_seconds))
+
+        if "-->" not in line:
+            continue
+
+        parts = [s.strip() for s in line.split("-->")]
+        seq: List[str] = []
+        for part in parts:
+            m = NODE_RE.search(part)
+            if m:
+                token = m.group(1)
+                if token == "Unknown":
+                    unknown_mentions += 1
+                seq.append(norm_node(token))
+
+        if len(seq) < 2:
+            continue
+
+        hops_total += (len(seq) - 1)
+        for n in seq:
+            unique_nodes_in_source.add(n)
+
+        if bin_key is not None:
+            for n in seq:
+                if include_unknown or n != UNKNOWN_ID:
+                    presence_by_bin[bin_key].add(n)
+
+        for n in seq[1:-1]:
+            if include_unknown or n != UNKNOWN_ID:
+                transit_count[n] += 1
+                if bin_key is not None:
+                    routing_by_bin[bin_key][n] += 1
+
+        dbs: List[Optional[float]] = []
+        for mdb in DB_RE.finditer(line):
+            v = mdb.group(1)
+            if v != "?":
+                rssi_samples += 1
+                dbs.append(float(v))
+            else:
+                dbs.append(None)
+
+        hop = 0
+        for a, b in zip(seq, seq[1:]):
+            if a == b:
+                hop += 1
+                continue
+            if (not include_unknown) and (a == UNKNOWN_ID or b == UNKNOWN_ID):
+                dropped_unknown_edges += 1
+                if hop < len(dbs) and dbs[hop] is not None:
+                    dropped_unknown_edges_with_rssi += 1
+                hop += 1
+                continue
+
+            edge_count[(a, b)] += 1
+            edges_added += 1
+            unique_edges_in_source.add((a, b))
+            if hop < len(dbs) and dbs[hop] is not None:
+                edge_rssi[(a, b)].append(float(dbs[hop]))
+            hop += 1
+
+            if bin_key is not None:
+                neighbors_by_bin[bin_key][a].add(b)
+                neighbors_by_bin[bin_key][b].add(a)
+
+    stats_list: List[TraceFileStats] = []
+    try:
+        st = db_path.stat()
+        mtime_iso = datetime.fromtimestamp(st.st_mtime).isoformat(sep=" ", timespec="seconds")
+        sig = sha1_file(db_path)
+        size_bytes = int(st.st_size)
+    except Exception:
+        mtime_iso = "-"
+        sig = "-"
+        size_bytes = 0
+
+    stats_list.append(
+        TraceFileStats(
+            path=f"{db_path} [sqlite:traceroutes]",
+            size_bytes=size_bytes,
+            mtime_iso=mtime_iso,
+            sha1sig=sig,
+            lines_total=lines_total,
+            hops_total=hops_total,
+            edges_added=edges_added,
+            edges_unique=len(unique_edges_in_source),
+            rssi_samples=rssi_samples,
+            nodes_unique=len(unique_nodes_in_source),
+            unknown_mentions=unknown_mentions,
+            lines_in_window=lines_in_window,
+        )
+    )
+
+    debug = {
+        "dropped_unknown_edges": dropped_unknown_edges,
+        "dropped_unknown_edges_with_rssi": dropped_unknown_edges_with_rssi,
+        "selected_rows": selected_rows,
+    }
+    time_bins = sorted(set(list(routing_by_bin.keys()) + list(neighbors_by_bin.keys()) + list(presence_by_bin.keys())))
+    time_series: List[Dict[str, Any]] = []
+    for t in time_bins:
+        routing_counts = dict(routing_by_bin.get(t, {}))
+        neighbors_counts = {n: len(s) for n, s in neighbors_by_bin.get(t, {}).items()}
+        uptime_counts = {n: 1 for n in presence_by_bin.get(t, set())}
+        time_series.append(
+            {
+                "t": t,
+                "routing": routing_counts,
+                "neighbors": neighbors_counts,
+                "uptime": uptime_counts,
+            }
+        )
+    time_meta = {
+        "baseBinMinutes": base_bin_minutes,
+        "timeRangeStart": time_bins[0] if time_bins else None,
+        "timeRangeEnd": time_bins[-1] if time_bins else None,
+    }
+    selected_files = [db_path] if selected_any else []
+    return dict(edge_count), dict(edge_rssi), dict(transit_count), time_series, time_meta, stats_list, debug, selected_files
+
+
+def detect_measurer_id_from_db(db_path: Path) -> str:
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT self_id, COUNT(*) AS cnt
+            FROM traceroutes
+            WHERE self_id GLOB '![0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]'
+            GROUP BY self_id
+            ORDER BY cnt DESC, self_id ASC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        if row and isinstance(row[0], str):
+            return str(row[0]).lower()
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+    return UNKNOWN_ID
 
 
 def render_svg(dot_path: Path, svg_path: Path) -> None:
@@ -1208,11 +1467,26 @@ def main() -> int:
     print("")
 
     trace_files = find_trace_files(trace_root)
+    sqlite_path = None
+    for base in node_search:
+        cand = base / "meshLogger.db"
+        if cand.is_file():
+            sqlite_path = cand
+            break
+    use_db_traceroutes = False
     if not trace_files:
-        eprint("ERROR: no trace files found. Expected patterns in ~/meshLogger: 'YYYY-MM-DD !xxxxxxxx*.txt'")
-        return 2
+        if sqlite_path is None:
+            eprint("ERROR: no trace files found and meshLogger.db is not available.")
+            return 2
+        use_db_traceroutes = True
+        print("Trace source: SQLite fallback (table traceroutes)")
+        print("")
 
-    measurer_id, id_counts = detect_measurer_id_from_filenames(trace_files)
+    if use_db_traceroutes:
+        measurer_id = detect_measurer_id_from_db(sqlite_path) if sqlite_path else UNKNOWN_ID
+        id_counts = Counter({measurer_id: 1}) if measurer_id != UNKNOWN_ID else Counter()
+    else:
+        measurer_id, id_counts = detect_measurer_id_from_filenames(trace_files)
 
     node_meta, nodedb_path, meta_debug = build_node_meta(node_search)
 
@@ -1235,23 +1509,39 @@ def main() -> int:
         # RU: выборка будет известна после парсинга
         print("")
 
-    edge_count, edge_rssi, transit_count, time_series, time_meta, per_file_stats, parse_debug, selected_files = parse_traces_with_stats(
-        trace_files=trace_files,
-        include_unknown=include_unknown,
-        dt_window=dt_window,
-    )
+    if use_db_traceroutes and sqlite_path is not None:
+        edge_count, edge_rssi, transit_count, time_series, time_meta, per_file_stats, parse_debug, selected_files = parse_traceroutes_with_stats_from_db(
+            db_path=sqlite_path,
+            include_unknown=include_unknown,
+            dt_window=dt_window,
+        )
+    else:
+        edge_count, edge_rssi, transit_count, time_series, time_meta, per_file_stats, parse_debug, selected_files = parse_traces_with_stats(
+            trace_files=trace_files,
+            include_unknown=include_unknown,
+            dt_window=dt_window,
+        )
 
     if args.datetime is not None:
         print("date/time window filter (--datetime):")
         print(f"  expr: '{args.datetime}'")
         w_start, w_end = dt_window  # type: ignore
         print(f"  window: {w_start.strftime('%Y-%m-%d %H:%M:%S')} - {w_end.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"  traces in folder: {len(trace_files)}")
-        print(f"  traces selected:  {len([p for p in selected_files if p in trace_files])}")
+        if use_db_traceroutes:
+            print(f"  traceroute rows source: {sqlite_path}")
+            print(f"  rows selected: {int(parse_debug.get('selected_rows', 0))}")
+        else:
+            print(f"  traces in folder: {len(trace_files)}")
+            print(f"  traces selected:  {len([p for p in selected_files if p in trace_files])}")
         print("")
-        if len([p for p in selected_files if p in trace_files]) == 0:
-            eprint("ERROR: --datetime window selected 0 trace files (by line timestamps).")
-            return 7
+        if use_db_traceroutes:
+            if int(parse_debug.get("selected_rows", 0)) == 0:
+                eprint("ERROR: --datetime window selected 0 traceroute rows in meshLogger.db.")
+                return 7
+        else:
+            if len([p for p in selected_files if p in trace_files]) == 0:
+                eprint("ERROR: --datetime window selected 0 trace files (by line timestamps).")
+                return 7
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1262,12 +1552,6 @@ def main() -> int:
     html_path = out_dir / f"{out_base}.html"
 
     print("Read files:")
-    sqlite_path = None
-    for base in node_search:
-        cand = base / "meshLogger.db"
-        if cand.is_file():
-            sqlite_path = cand
-            break
     print(f"sqlite database: {sqlite_path if sqlite_path else '(not found)'}")
     print(f"sqlite nodes loaded: {meta_debug.get('sqlite_nodes_loaded', 0)}")
     print(f"sqlite nodes with longName: {meta_debug.get('sqlite_nodes_with_longName', 0)}")
@@ -1280,7 +1564,13 @@ def main() -> int:
     print("")
 
     print("Trace filenames measurer-id detection:")
-    if id_counts:
+    if use_db_traceroutes:
+        if measurer_id != UNKNOWN_ID:
+            print(f"  Selected self_id from DB: {measurer_id}")
+        else:
+            print("  Could not detect self_id from DB; fallback to !ffffffff")
+        print(f"Selected measurer-id: {measurer_id}")
+    elif id_counts:
         for k, v in id_counts.most_common():
             print(f"  {k} : {v} file(s)")
         print(f"Selected measurer-id: {measurer_id}")
@@ -1298,7 +1588,7 @@ def main() -> int:
     print(f"Output basename (auto): {out_base}")
     print("")
 
-    print("trace log files summary:")
+    print("trace source summary:")
     # print per-file stats; show hits for window
     # RU: печатаем статистику по файлам; при окне показываем попадания
     for st in per_file_stats:
@@ -1380,7 +1670,14 @@ def main() -> int:
         return round(w, 2)
 
     print("global:")
-    print(f"  Traces used: {len(trace_files)} file(s)")
+    if use_db_traceroutes:
+        if args.datetime is not None:
+            rows_used = int(parse_debug.get("selected_rows", 0))
+        else:
+            rows_used = int(per_file_stats[0].lines_total) if per_file_stats else 0
+        print(f"  Traceroute rows used (SQLite): {rows_used}")
+    else:
+        print(f"  Traces used: {len(trace_files)} file(s)")
     print(f"  Nodes kept: {len(nodes)}")
     print(f"  Links kept: {len(edge_count_f)} (min_edge={args.min_edge})")
     print(f"  Links kept without RSSI: {missing_rssi_edges}")

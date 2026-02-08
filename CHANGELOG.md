@@ -1,30 +1,145 @@
 # Changelog
 
-## 0.2.2 alfa
-- UI: message bubbles aligned with fixed margins and gaps; timestamp offset refined.
-- UI: unread indicator dot position adjusted.
-- Logs: timestamps added to unprefixed log lines; self-id logged on connect.
-- Radio: auto-reconnect, screen cleared on disconnect, per-node config reload.
-- Storage: per-node queue reset on node switch; incoming multipart resume.
-- Fixes: history dedupe on reload; removed double recv logging; send/discovery error handling.
+## EN
 
-## 0.2.1 alfa
-- GUI: auto‑start even without radio, with retry and status in top bar.
-- GUI: top bar shows `Client ID` + names + masked pub key; click copies Client ID.
-- GUI: triple‑click on `pub:` regenerates keys and broadcasts new key.
-- UI: improved message layout, timestamps, and contact spacing.
-- Logging: unified debug log in Settings (colored) + Copy log button.
-- Discovery: optional broadcast discovery (send/allow) with burst on start and idle schedule.
-- Keys: auto refresh with jitter; auto re‑request on decrypt failures.
-- Messages: multi‑packet support with progress `pK/N`, avg attempts/hops.
-- History: de‑duplication on load and cleaner logging.
-- Build: Windows exe in windowed mode; reduced PySide6 modules.
-- Fix: settings discovery flags saving and Qt6 click deprecation.
-- Fix: top bar refresh after key regeneration.
-- Fix: settings persist across restarts (runtime options, discovery, UI).
-- Docs: MIT license and author info added.
-- Data: per‑node storage for config/history/state/keys (<node_id>/ рядом с приложением).
-- Data: settings/history loaded only after node initialization.
-- UI: unread indicator (orange dot) in contact list.
-- Fix: history reload shows only sent/received (no duplicate attempts).
-- Fix: multipart receive resumes after restart.
+### 0.3.1
+
+Added
+- Key-frame receive policy helper with dedicated tests for unicast/broadcast validation paths.
+- Extra tests for invalid key length and case-insensitive peer id matching.
+
+Changed
+- Key exchange now rejects frames without `fromId` and frames where `fromId` does not match payload peer id.
+- Peer id comparison in key-frame validation is now case-insensitive.
+- Public key is validated (`32` bytes, X25519 parse) before writing to keyring.
+- Documentation synchronized with implementation: compression modes `0..5`, `DICT_ID=2`, discovery send/reply toggles.
+
+### 0.3.0
+
+Added
+- Optional message-payload compression block (`MC`) with CRC8 validation.
+- Two compression modes: `BYTE_DICT` and `FIXED_BITS`.
+- Peer capability marker (`mc=1`) and per-peer compression enable flow.
+- New delivery status model for outgoing/incoming single-part and multipart messages.
+- Dynamic elapsed timer refresh for pending delivery/receive states.
+- Runtime log file (`runtime.log`) with compression marker on send/recv lines.
+- Safer history/incoming parsing and multipart receive resume after restart.
+
+Changed
+- Compression is applied before encryption and only when size gain reaches `min_gain_bytes`.
+- Status text is rebuilt from metadata on language switch.
+- Pending state highlight uses orange status/meta text only.
+- Group send is marked as sent only if at least one recipient is actually queued.
+- First-run discovery defaults are enabled when config is missing.
+
+Removed
+- Legacy status wording with `avg/ср`.
+- Old legal-policy wording from docs and settings UI (replaced by project vision text).
+
+### 0.2.2 alfa
+
+Added
+- Exponential retry backoff with jitter.
+- Per-peer queue limit and explicit fail statuses (`timeout`, `queue_limit`, `too_long`, `payload_too_big`).
+- Health summary log line (`peers`, `tracked`, `pending`, `avg_rtt`).
+- Settings switch for writing `runtime.log`.
+- Unit tests for status formatting and runtime-state snapshot concurrency.
+
+Changed
+- Message list layout spacing, margins, timestamp anchor, unread dot position.
+- Message body text kept neutral; state color remains on status/time area.
+- Incoming complete timestamp persisted as `received_at_ts` for stable rendering.
+- Settings save path works even when radio is disconnected.
+
+Removed
+- Duplicate history records from repeated reload paths.
+
+### 0.2.1 alfa
+
+Added
+- GUI startup without radio with auto-reconnect and waiting state.
+- Top header with `Client ID`, names, masked `pub`, ID copy, and key-regen triple click.
+- Unified settings log view with copy button.
+- Discovery broadcast workflow with startup burst and idle schedule.
+- Per-node profile storage (`<node_id>/config.json`, `state.json`, `history.log`, `incoming.json`, `keyRings/`).
+- Multipart message progress and resume support.
+
+Changed
+- Contact/message spacing and bubble/timestamp placement.
+- Key refresh flow with jitter and decrypt-failure auto-request.
+- Settings persistence across restarts.
+
+Removed
+- Duplicate "attempt" lines from chat history view after restart.
+
+## RU
+
+### 0.3.1
+
+Добавлено
+- Вынесена отдельная политика приема key-frame с отдельными тестами для unicast/broadcast веток.
+- Добавлены тесты на невалидную длину ключа и case-insensitive сравнение id peer.
+
+Изменено
+- В key exchange отклоняются кадры без `fromId` и кадры, где `fromId` не совпадает с peer id из payload.
+- Сравнение id в проверке key-frame теперь регистронезависимое.
+- Публичный ключ валидируется (`32` байта, X25519 parse) до записи в keyring.
+- Документация синхронизирована с реализацией: режимы сжатия `0..5`, `DICT_ID=2`, раздельные галки discovery send/reply.
+
+### 0.3.0
+
+Добавлено
+- Опциональное сжатие payload сообщений блоком `MC` с проверкой CRC8.
+- Два режима сжатия: `BYTE_DICT` и `FIXED_BITS`.
+- Маркер возможностей peer (`mc=1`) и включение сжатия по peer.
+- Новая модель статусов доставки для исходящих/входящих однопакетных и multipart сообщений.
+- Динамическое обновление таймера для состояний "в процессе".
+- Полный runtime-лог (`runtime.log`) с пометкой метода сжатия в send/recv.
+- Более строгий разбор history/incoming и возобновление приема multipart после перезапуска.
+
+Изменено
+- Сжатие выполняется до шифрования и только при выигрыше не меньше `min_gain_bytes`.
+- Статусы пересобираются из метаданных при переключении языка.
+- Оранжевый цвет в ожидании применяется только к статусу/времени.
+- Group send помечается как отправленный только если реально поставлен в очередь хотя бы одному получателю.
+- Discovery по умолчанию включается при первом запуске при отсутствии настроек.
+
+Удалено
+- Старые формулировки статусов с `avg/ср`.
+- Старые юридические формулировки из документации и окна настроек (заменены на текст о назначении проекта).
+
+### 0.2.2 alfa
+
+Добавлено
+- Экспоненциальный retry backoff с jitter.
+- Лимит очереди на peer и явные fail-статусы (`timeout`, `queue_limit`, `too_long`, `payload_too_big`).
+- Периодическая health-строка в логе (`peers`, `tracked`, `pending`, `avg_rtt`).
+- Галка в Settings для включения/выключения `runtime.log`.
+- Unit-тесты для форматирования статусов и конкурентного snapshot runtime-состояния.
+
+Изменено
+- Отступы/интервалы списка сообщений, привязка временной метки, позиция индикатора непрочитанных.
+- Текст сообщения оставлен нейтральным; цвет состояния только у зоны статуса/времени.
+- Для завершенных входящих сохраняется `received_at_ts` для стабильного отображения.
+- Сохранение настроек работает и при отключенном радио.
+
+Удалено
+- Дубли записей истории при повторной загрузке.
+
+### 0.2.1 alfa
+
+Добавлено
+- Запуск GUI без радио с авто‑переподключением и состоянием ожидания.
+- Верхняя строка с `Client ID`, именами, маской `pub`, копированием ID и тройным кликом для регенерации ключей.
+- Единое окно лога в настройках с кнопкой копирования.
+- Discovery broadcast со стартовым burst и idle-режимом.
+- Хранение данных по профилям нод (`<node_id>/config.json`, `state.json`, `history.log`, `incoming.json`, `keyRings/`).
+- Прогресс multipart и возобновление приема.
+
+Изменено
+- Компоновка контактов/сообщений и позиционирование временной метки.
+- Автообновление ключей (jitter + автозапрос при decrypt-fail).
+- Сохранение настроек между перезапусками.
+
+Удалено
+- Повторы "attempt" в истории чата после перезапуска.

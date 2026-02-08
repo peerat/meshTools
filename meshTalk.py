@@ -20,6 +20,7 @@ import math
 import colorsys
 import re
 import random
+import struct
 from typing import Dict, Optional, Tuple
 
 from meshtastic.serial_interface import SerialInterface
@@ -33,8 +34,38 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from meshtalk_utils import (
+    format_meta_text,
+    snapshot_runtime_state,
+    normalize_log_text_line,
+    maybe_decompress_after_decrypt,
+    compress_for_encrypt_with_method,
+    compression_method_from_payload,
+    build_legacy_chunks,
+    build_legacy_wire_payload,
+    build_compact_wire_payload,
+    parse_compact_meta,
+    parse_key_exchange_frame,
+    key_frame_receive_policy,
+    merge_compact_compression,
+    encode_history_text,
+    parse_history_line,
+    assemble_compact_parts,
+)
+from message_text_compression import (
+    MODE_BZ2,
+    MODE_DEFLATE,
+    MODE_BYTE_DICT,
+    MODE_FIXED_BITS,
+    MODE_LZMA,
+    MODE_ZLIB,
+    SUPPORTED_MODES,
+    compress_text,
+    mode_name,
+)
 
-VERSION = "0.2.2 alfa"
+
+VERSION = "0.3.1"
 PROTO_VERSION = 1
 TYPE_MSG = 1
 TYPE_ACK = 2
@@ -42,6 +73,12 @@ DEFAULT_PORTNUM = portnums_pb2.PortNum.PRIVATE_APP
 PAYLOAD_OVERHEAD = 1 + 1 + 8 + 12 + 16  # ver + type + msg_id + nonce + tag
 KEY_REQ_PREFIX = b"KR1|"
 KEY_RESP_PREFIX = b"KR2|"
+MSG_V2_PREFIX = b"M2"
+MSG_V2_HEADER_LEN = 16  # prefix(2) + ts(4) + group(4) + part(2) + total(2) + attempt(1) + meta(1)
+MAX_PENDING_PER_PEER = 128
+RETRY_BACKOFF_MAX_SECONDS = 300.0
+RETRY_JITTER_RATIO = 0.25
+KEY_RESPONSE_MIN_INTERVAL_SECONDS = 300.0
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_BASE_DIR = "meshTalk"
 DATA_DIR = BASE_DIR
@@ -49,7 +86,12 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 INCOMING_FILE = os.path.join(DATA_DIR, "incoming.json")
+RUNTIME_LOG_FILE = os.path.join(DATA_DIR, "runtime.log")
 keydir = os.path.join(DATA_DIR, "keyRings")
+runtime_log_lock = threading.Lock()
+RUNTIME_LOG_ENABLED = True
+COMPRESSION_MODES = tuple(int(m) for m in SUPPORTED_MODES)
+LEGACY_COMPRESSION_MODES = (int(MODE_BYTE_DICT), int(MODE_FIXED_BITS))
 
 
 def ts_local() -> str:
@@ -61,7 +103,7 @@ def ensure_data_dir() -> None:
 
 
 def set_data_dir_for_node(node_id_norm: Optional[str]) -> None:
-    global DATA_DIR, STATE_FILE, HISTORY_FILE, CONFIG_FILE, INCOMING_FILE, keydir
+    global DATA_DIR, STATE_FILE, HISTORY_FILE, CONFIG_FILE, INCOMING_FILE, RUNTIME_LOG_FILE, keydir
     if node_id_norm:
         DATA_DIR = os.path.join(BASE_DIR, node_id_norm)
     else:
@@ -70,6 +112,7 @@ def set_data_dir_for_node(node_id_norm: Optional[str]) -> None:
     HISTORY_FILE = os.path.join(DATA_DIR, "history.log")
     CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
     INCOMING_FILE = os.path.join(DATA_DIR, "incoming.json")
+    RUNTIME_LOG_FILE = os.path.join(DATA_DIR, "runtime.log")
     keydir = os.path.join(DATA_DIR, "keyRings")
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(keydir, exist_ok=True)
@@ -82,7 +125,7 @@ def migrate_data_dir(base_dir: str, node_dir: str) -> None:
         return
     try:
         os.makedirs(node_dir, exist_ok=True)
-        for name in ("config.json", "state.json", "history.log"):
+        for name in ("config.json", "state.json", "history.log", "runtime.log"):
             src = os.path.join(base_dir, name)
             dst = os.path.join(node_dir, name)
             if os.path.isfile(src) and not os.path.isfile(dst):
@@ -175,6 +218,11 @@ def load_incoming_state() -> Dict[str, Dict[str, object]]:
                 "hops_n": int(item.get("hops_n", 0)),
                 "attempts_sum": float(item.get("attempts_sum", 0.0)),
                 "attempts_n": int(item.get("attempts_n", 0)),
+                "compact": bool(item.get("compact", False)),
+                "compression": int(item.get("compression", 0) or 0),
+                "legacy_codec": (str(item.get("legacy_codec")) if item.get("legacy_codec") else None),
+                "received_at_ts": float(item.get("received_at_ts", 0.0) or 0.0),
+                "incoming_started_ts": float(item.get("incoming_started_ts", 0.0) or 0.0),
             }
         return incoming
     except Exception:
@@ -212,6 +260,11 @@ def save_incoming_state(incoming: Dict[str, Dict[str, object]]) -> None:
                 "hops_n": int(rec.get("hops_n", 0)),
                 "attempts_sum": float(rec.get("attempts_sum", 0.0)),
                 "attempts_n": int(rec.get("attempts_n", 0)),
+                "compact": bool(rec.get("compact", False)),
+                "compression": int(rec.get("compression", 0) or 0),
+                "legacy_codec": (str(rec.get("legacy_codec")) if rec.get("legacy_codec") else None),
+                "received_at_ts": float(rec.get("received_at_ts", 0.0) or 0.0),
+                "incoming_started_ts": float(rec.get("incoming_started_ts", 0.0) or 0.0),
             }
         )
     data = {"incoming": flat}
@@ -222,11 +275,26 @@ def save_incoming_state(incoming: Dict[str, Dict[str, object]]) -> None:
 
 def append_history(direction: str, peer_id: str, msg_id: str, text: str, extra: str = "") -> None:
     peer_norm = norm_id_for_filename(peer_id)
-    line = f"{ts_local()} | {direction} | {peer_norm} | {msg_id} | {text}"
+    line = f"{ts_local()} | {direction} | {peer_norm} | {msg_id} | {encode_history_text(text)}"
     if extra:
         line += f" | {extra}"
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+    append_runtime_log(line)
+
+
+def append_runtime_log(line: str) -> None:
+    if not line:
+        return
+    if not RUNTIME_LOG_ENABLED:
+        return
+    try:
+        os.makedirs(os.path.dirname(RUNTIME_LOG_FILE) or ".", exist_ok=True)
+        with runtime_log_lock:
+            with open(RUNTIME_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def load_config() -> Dict[str, object]:
@@ -277,29 +345,42 @@ def derive_key(priv: x25519.X25519PrivateKey, peer: x25519.X25519PublicKey) -> b
     return hkdf.derive(shared)
 
 
-def pack_message(msg_type: int, msg_id: bytes, aes: AESGCM, plaintext: bytes) -> bytes:
+def pack_message(
+    msg_type: int,
+    msg_id: bytes,
+    aes: AESGCM,
+    plaintext: bytes,
+    allow_payload_compress: bool = True,
+) -> Tuple[bytes, str]:
     nonce = os.urandom(12)
-    ct = aes.encrypt(nonce, plaintext, msg_id)
-    return bytes([PROTO_VERSION, msg_type]) + msg_id + nonce + ct
+    if allow_payload_compress:
+        pt_wrapped, compression_method = compress_for_encrypt_with_method(plaintext)
+    else:
+        pt_wrapped = plaintext
+        compression_method = "none"
+    ct = aes.encrypt(nonce, pt_wrapped, msg_id)
+    return bytes([PROTO_VERSION, msg_type]) + msg_id + nonce + ct, compression_method
 
 
-def try_unpack_message(payload: bytes, aes: AESGCM) -> Tuple[str, Optional[int], Optional[bytes], Optional[bytes]]:
+def try_unpack_message(payload: bytes, aes: AESGCM) -> Tuple[str, Optional[int], Optional[bytes], Optional[bytes], str]:
     if len(payload) < (1 + 1 + 8 + 12 + 16):
-        return ("nope", None, None, None)
+        return ("nope", None, None, None, "n/a")
     ver = payload[0]
     if ver != PROTO_VERSION:
-        return ("nope", None, None, None)
+        return ("nope", None, None, None, "n/a")
     msg_type = payload[1]
     if msg_type not in (TYPE_MSG, TYPE_ACK):
-        return ("nope", None, None, None)
+        return ("nope", None, None, None, "n/a")
     msg_id = payload[2:10]
     nonce = payload[10:22]
     ct = payload[22:]
     try:
         pt = aes.decrypt(nonce, ct, msg_id)
     except Exception:
-        return ("decrypt_fail", msg_type, msg_id, None)
-    return ("ok", msg_type, msg_id, pt)
+        return ("decrypt_fail", msg_type, msg_id, None, "n/a")
+    compression_method = compression_method_from_payload(pt)
+    pt = maybe_decompress_after_decrypt(pt)
+    return ("ok", msg_type, msg_id, pt, compression_method)
 
 
 def parse_payload(raw) -> Optional[bytes]:
@@ -381,6 +462,8 @@ class PeerState:
     def __init__(self, peer_id_norm: str, aes: Optional[AESGCM] = None) -> None:
         self.peer_id_norm = peer_id_norm
         self.aes = aes
+        self.compression_capable = False
+        self.compression_modes = set(LEGACY_COMPRESSION_MODES)
         self.pending: Dict[str, Dict[str, object]] = {}
         self.last_send_ts = 0.0
         self.next_key_req_ts = 0.0
@@ -415,22 +498,17 @@ def peer_request_id(args_user: Optional[str]) -> Optional[str]:
     return args_user
 
 
-def parse_key_frame(payload: bytes) -> Optional[Tuple[str, str, bytes]]:
-    if payload.startswith(KEY_REQ_PREFIX):
-        kind = "req"
-        rest = payload[len(KEY_REQ_PREFIX):]
-    elif payload.startswith(KEY_RESP_PREFIX):
-        kind = "resp"
-        rest = payload[len(KEY_RESP_PREFIX):]
-    else:
+def parse_key_frame(payload: bytes) -> Optional[Tuple[str, str, bytes, Optional[set[int]]]]:
+    parsed = parse_key_exchange_frame(
+        payload=payload,
+        key_req_prefix=KEY_REQ_PREFIX,
+        key_resp_prefix=KEY_RESP_PREFIX,
+        supported_modes=set(COMPRESSION_MODES),
+    )
+    if parsed is None:
         return None
-    try:
-        peer_id, pub_b64 = rest.split(b"|", 1)
-        peer_id_str = peer_id.decode("utf-8", errors="ignore")
-        pub_raw = b64d(pub_b64.decode("ascii"))
-        return (kind, peer_id_str, pub_raw)
-    except Exception:
-        return None
+    kind, peer_id, pub_raw, peer_modes = parsed
+    return (kind, peer_id, pub_raw, set(peer_modes) if peer_modes else None)
 
 
 def load_known_peers(keydir: str, self_id_norm: str) -> Dict[str, x25519.X25519PublicKey]:
@@ -475,9 +553,12 @@ def get_self_id(interface: SerialInterface) -> Optional[str]:
 
 def main() -> int:
     cfg_cli: Dict[str, object] = {}
-    discovery_enabled = False
+    discovery_enabled = True
     discovery_send = discovery_enabled
     discovery_reply = discovery_enabled
+    compression_enabled = True
+    compression_mode = MODE_BYTE_DICT
+    min_gain_bytes = 2
     ap = argparse.ArgumentParser(
         prog="meshTalk.py",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -494,7 +575,7 @@ def main() -> int:
     ap.add_argument("--retry-seconds", type=int, default=30, help="retry interval in seconds (default: 30). RU: интервал повторов, сек (по умолчанию: 30).")
     ap.add_argument("--max-seconds", type=int, default=3600, help="max time to wait for ACK (default: 3600). RU: максимум ожидания ACK, сек (по умолчанию: 3600).")
     ap.add_argument("--max-bytes", type=int, default=200, help="max payload bytes per packet (default: 200). RU: максимум байт полезной нагрузки (по умолчанию: 200).")
-    ap.add_argument("--rate-seconds", type=float, default=30.0, help="min seconds between sends (default: 30). RU: минимум секунд между отправками (по умолчанию: 30).")
+    ap.add_argument("--rate-seconds", type=int, default=30, help="min seconds between sends (default: 30). RU: минимум секунд между отправками (по умолчанию: 30).")
 
 
     args = ap.parse_args()
@@ -556,6 +637,7 @@ def main() -> int:
 
     def try_init_radio() -> tuple[bool, str]:
         nonlocal interface, self_id_raw, self_id, priv, pub_self, pub_self_raw, generated_now, known_peers, radio_ready, priv_path, pub_path
+        nonlocal subscriptions_registered
         # Auto-detect port
         port = args.port
         if port.lower() == "auto":
@@ -618,19 +700,23 @@ def main() -> int:
         radio_ready = True
         update_peer_names_from_nodes()
         ui_emit("log", f"{ts_local()} RADIO: self {wire_id_from_norm(self_id)}")
-        try:
-            pub.subscribe(on_receive, "meshtastic.receive.data")
-            def _on_conn_status(*_args, **_kwargs):
-                try:
-                    evt = _kwargs.get("evt")
-                    if isinstance(evt, dict) and evt.get("connected") is False:
-                        ui_emit("radio_lost", None)
-                        return
-                except Exception:
-                    pass
-            pub.subscribe(_on_conn_status, "meshtastic.connection.status")
-        except Exception:
-            pass
+        if not subscriptions_registered:
+            try:
+                pub.subscribe(on_receive, "meshtastic.receive.data")
+
+                def _on_conn_status(*_args, **_kwargs):
+                    try:
+                        evt = _kwargs.get("evt")
+                        if isinstance(evt, dict) and evt.get("connected") is False:
+                            ui_emit("radio_lost", None)
+                            return
+                    except Exception:
+                        pass
+
+                pub.subscribe(_on_conn_status, "meshtastic.connection.status")
+                subscriptions_registered = True
+            except Exception:
+                pass
         ui_emit("config_reload", load_config())
         return (True, f"Connected {port}")
 
@@ -639,7 +725,10 @@ def main() -> int:
     pending_by_peer: Dict[str, Dict[str, Dict[str, object]]] = {}
     pending_lock = threading.Lock()
     seen_msgs: Dict[str, float] = {}
+    seen_parts: Dict[str, float] = {}
+    key_response_last_ts: Dict[str, float] = {}
     seen_lock = threading.Lock()
+    subscriptions_registered = False
     peer_states: Dict[str, PeerState] = {}
     tracked_peers = set()
     ui_events: "queue.Queue[Tuple[str, object]]" = queue.Queue()
@@ -651,8 +740,38 @@ def main() -> int:
         if gui_enabled:
             ui_events.put((evt, payload))
 
-    if generated_now:
-        ui_emit("log", f"{ts_local()} KEY: auto-generated keys")
+    decode_guard_installed = False
+
+    def install_meshtastic_decode_guard() -> None:
+        nonlocal decode_guard_installed
+        if decode_guard_installed:
+            return
+        try:
+            from google.protobuf.message import DecodeError  # type: ignore
+            from meshtastic import mesh_interface as _mesh_interface
+            if getattr(_mesh_interface.MeshInterface, "_meshtalk_decode_guard", False):
+                decode_guard_installed = True
+                return
+            original_handle = _mesh_interface.MeshInterface._handleFromRadio
+
+            def _guarded_handle(self_iface, from_radio_bytes):
+                try:
+                    return original_handle(self_iface, from_radio_bytes)
+                except DecodeError as ex:
+                    try:
+                        ui_emit("log", f"{ts_local()} RADIO: protobuf decode error, reconnecting ({ex})")
+                        ui_emit("radio_lost", None)
+                    except Exception:
+                        pass
+                    return None
+
+            _mesh_interface.MeshInterface._handleFromRadio = _guarded_handle
+            _mesh_interface.MeshInterface._meshtalk_decode_guard = True
+            decode_guard_installed = True
+        except Exception:
+            pass
+
+    install_meshtastic_decode_guard()
 
     def get_peer_state(peer_norm: Optional[str]) -> Optional[PeerState]:
         if not peer_norm:
@@ -664,6 +783,8 @@ def main() -> int:
             if peer_norm == self_id:
                 aes_local = AESGCM(derive_key(priv, pub_self))
                 st = PeerState(peer_norm, aes_local)
+                st.compression_capable = True
+                st.compression_modes = set(COMPRESSION_MODES)
                 st.last_key_ok_ts = time.time()
                 peer_states[peer_norm] = st
                 return st
@@ -687,12 +808,19 @@ def main() -> int:
             st.last_key_ok_ts = time.time()
 
     def store_peer_pub(peer_id: str, pub_raw: bytes) -> str:
+        if not isinstance(pub_raw, (bytes, bytearray)):
+            raise ValueError("invalid peer public key type")
+        pub_raw_bytes = bytes(pub_raw)
+        if len(pub_raw_bytes) != 32:
+            raise ValueError("invalid peer public key length")
+        # Validate key bytes before persisting key file.
+        x25519.X25519PublicKey.from_public_bytes(pub_raw_bytes)
         peer_id_norm = norm_id_for_filename(peer_id)
         path = os.path.join(keydir, f"{peer_id_norm}.pub")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            f.write(b64e(pub_raw))
-        update_peer_pub(peer_id_norm, pub_raw)
+            f.write(b64e(pub_raw_bytes))
+        update_peer_pub(peer_id_norm, pub_raw_bytes)
         return path
 
     def on_receive(packet, interface=None):
@@ -712,39 +840,96 @@ def main() -> int:
         # Key exchange frames are plaintext
         key_frame = parse_key_frame(payload)
         if key_frame:
-            kind, peer_id, pub_raw = key_frame
-            from_id = packet.get("fromId") or peer_id
+            kind, peer_id, pub_raw, peer_modes = key_frame
+            from_id_raw = packet.get("fromId")
             to_id = packet.get("toId") or packet.get("to")
-            is_broadcast = False
-            if isinstance(to_id, int):
-                is_broadcast = to_id == int(meshtastic.BROADCAST_ADDR)
-            elif isinstance(to_id, str):
-                is_broadcast = to_id.lower() in ("^all", "all", "broadcast") or to_id == str(meshtastic.BROADCAST_ADDR)
-            if is_broadcast and not discovery_reply:
+            accepted_frame, trusted_capabilities, reject_reason, is_broadcast, from_id = key_frame_receive_policy(
+                peer_id=peer_id,
+                from_id_raw=from_id_raw,
+                to_id=to_id,
+                broadcast_addr=int(meshtastic.BROADCAST_ADDR),
+                discovery_reply=bool(discovery_reply),
+            )
+            if not accepted_frame and reject_reason == "broadcast_disabled":
                 return
             peer_norm = norm_id_for_filename(peer_id)
             update_peer_names_from_nodes(peer_norm)
-            store_peer_pub(peer_id, pub_raw)
+            if not accepted_frame and reject_reason == "missing_from_id":
+                ui_emit("log", f"{ts_local()} KEY: reject frame from {peer_id} (missing fromId).")
+                return
+            if not accepted_frame and reject_reason == "id_mismatch":
+                ui_emit(
+                    "log",
+                    f"{ts_local()} KEY: reject frame id mismatch from={from_id_raw} payload={peer_id}.",
+                )
+                return
+            if not accepted_frame:
+                ui_emit("log", f"{ts_local()} KEY: reject frame from {peer_id}.")
+                return
+            prev_pub_raw = None
+            try:
+                prev_pub = known_peers.get(peer_norm)
+                if prev_pub is not None:
+                    prev_pub_raw = prev_pub.public_bytes(
+                        encoding=serialization.Encoding.Raw,
+                        format=serialization.PublicFormat.Raw,
+                    )
+            except Exception:
+                prev_pub_raw = None
+            st_before = peer_states.get(peer_norm)
+            had_key_ready = bool(st_before and st_before.key_ready)
+            try:
+                store_peer_pub(peer_id, pub_raw)
+            except Exception:
+                ui_emit("log", f"{ts_local()} KEY: reject invalid public key from {peer_id}.")
+                return
             last_activity_ts = time.time()
             st = get_peer_state(peer_norm)
-            if st and st.key_ready:
-                print(f"KEY: exchange complete with {peer_id}. Encryption active.")
+            key_changed = (prev_pub_raw != pub_raw)
+            if st and trusted_capabilities:
+                # Capabilities from key frames are accepted only for verifiable unicast sources.
+                if peer_modes:
+                    st.compression_capable = True
+                    st.compression_modes = set(peer_modes)
+                else:
+                    # Missing modes means peer is legacy or downgraded: reset stale capabilities.
+                    st.compression_capable = False
+                    st.compression_modes = set(LEGACY_COMPRESSION_MODES)
+            if st and st.key_ready and (key_changed or not had_key_ready):
                 ui_emit("log", f"{ts_local()} KEY: exchange complete with {peer_id}. Encryption active.")
                 st.force_key_req = False
                 st.next_key_req_ts = float("inf")
                 st.last_key_ok_ts = time.time()
             if kind == "req":
                 ui_emit("log", f"{ts_local()} KEY: request from {peer_id}")
-                resp = KEY_RESP_PREFIX + self_id.encode("utf-8") + b"|" + b64e(pub_self_raw).encode("ascii")
-                if from_id:
-                    interface.sendData(
-                        resp,
-                        destinationId=from_id,
-                        wantAck=False,
-                        portNum=DEFAULT_PORTNUM,
-                        channelIndex=(args.channel if args.channel is not None else 0),
+                now = time.time()
+                last_resp = float(key_response_last_ts.get(peer_norm, 0.0) or 0.0)
+                if (now - last_resp) < KEY_RESPONSE_MIN_INTERVAL_SECONDS:
+                    left_s = int(KEY_RESPONSE_MIN_INTERVAL_SECONDS - (now - last_resp))
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} KEY: request from {peer_id} suppressed (recent response, wait {left_s}s).",
                     )
-                print(f"KEY: received request from {peer_id}, sent our public key.")
+                else:
+                    modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+                    resp = (
+                        KEY_RESP_PREFIX
+                        + self_id.encode("utf-8")
+                        + b"|"
+                        + b64e(pub_self_raw).encode("ascii")
+                        + b"|mc_modes="
+                        + modes_bytes
+                    )
+                    if from_id:
+                        interface.sendData(
+                            resp,
+                            destinationId=from_id,
+                            wantAck=False,
+                            portNum=DEFAULT_PORTNUM,
+                            channelIndex=(args.channel if args.channel is not None else 0),
+                        )
+                        key_response_last_ts[peer_norm] = now
+                    ui_emit("log", f"{ts_local()} KEY: received request from {peer_id}, sent our public key.")
             else:
                 ui_emit("log", f"{ts_local()} KEY: response from {peer_id}")
             ui_emit("peer_update", peer_norm)
@@ -766,7 +951,7 @@ def main() -> int:
                         ui_emit("log", f"{ts_local()} KEY: request (no key) -> {from_id}")
             return
 
-        status, msg_type, msg_id, pt = try_unpack_message(payload, st.aes)
+        status, msg_type, msg_id, pt, rx_compression = try_unpack_message(payload, st.aes)
         if status == "decrypt_fail":
             now = time.time()
             if (st.last_decrypt_fail_ts <= 0.0) or ((now - st.last_decrypt_fail_ts) > 30.0):
@@ -777,7 +962,6 @@ def main() -> int:
                 "log",
                 f"{ts_local()} KEY: decrypt failed for {from_id} (possible stale key).",
             )
-            print(f"KEY: decrypt failed for {from_id} (possible stale key).")
             if peer_norm:
                 st.force_key_req = True
                 if st.decrypt_fail_count >= 2:
@@ -793,6 +977,12 @@ def main() -> int:
         msg_hex = msg_id.hex()
         st.decrypt_fail_count = 0
 
+        def build_ack_text(hops: Optional[int]) -> bytes:
+            parts = ["ACK", "mc=1", f"mc_modes={','.join(str(m) for m in COMPRESSION_MODES)}"]
+            if hops is not None:
+                parts.append(f"hops={hops}")
+            return "|".join(parts).encode("utf-8")
+
         if msg_type == TYPE_ACK:
             now = time.time()
             ack_forward_hops: Optional[int] = None
@@ -801,6 +991,27 @@ def main() -> int:
                     ack_text = pt.decode("utf-8", errors="ignore")
                 except Exception:
                     ack_text = ""
+                m_mc = re.search(r"\bmc=(\d+)\b", ack_text)
+                if m_mc:
+                    try:
+                        if int(m_mc.group(1)) == 1:
+                            st.compression_capable = True
+                    except Exception:
+                        pass
+                m_modes = re.search(r"\bmc_modes=([0-9,]+)\b", ack_text)
+                if m_modes:
+                    try:
+                        parsed_modes = {
+                            int(item)
+                            for item in m_modes.group(1).split(",")
+                            if item != ""
+                        }
+                        parsed_modes = {m for m in parsed_modes if m in COMPRESSION_MODES}
+                        if parsed_modes:
+                            st.compression_modes = set(parsed_modes)
+                            st.compression_capable = True
+                    except Exception:
+                        pass
                 m = re.search(r"\bhops=(\d+)\b", ack_text)
                 if m:
                     try:
@@ -822,8 +1033,10 @@ def main() -> int:
                 delivery = max(0.0, now - float(created))
                 st.rtt_count += 1
                 st.rtt_avg = st.rtt_avg + (rtt - st.rtt_avg) / float(st.rtt_count)
-                print(f"ACK: {msg_hex} rtt={rtt:.2f}s avg={st.rtt_avg:.2f}s attempts={attempts}")
-                ui_emit("log", f"{ts_local()} ACK: {msg_hex} rtt={rtt:.2f}s attempts={attempts}")
+                ui_emit(
+                    "log",
+                    f"{ts_local()} ACK: {msg_hex} rtt={rtt:.2f}s avg={st.rtt_avg:.2f}s attempts={attempts}",
+                )
                 if peer_norm:
                     hop_start = packet.get("hopStart")
                     hop_limit = packet.get("hopLimit")
@@ -848,17 +1061,18 @@ def main() -> int:
                         hops = None
                         if isinstance(hop_start, int) and isinstance(hop_limit, int):
                             hops = max(0, hop_start - hop_limit)
-                        if hops is None:
-                            ack_payload = pack_message(TYPE_ACK, msg_id, st.aes, b"ACK")
-                        else:
-                            ack_payload = pack_message(TYPE_ACK, msg_id, st.aes, f"ACK|hops={hops}".encode("utf-8"))
-                        interface.sendData(
-                            ack_payload,
-                            destinationId=from_id,
-                            wantAck=False,
-                            portNum=DEFAULT_PORTNUM,
-                            channelIndex=(args.channel if args.channel is not None else 0),
-                        )
+                        ack_payload, _ack_cmp = pack_message(TYPE_ACK, msg_id, st.aes, build_ack_text(hops))
+                        try:
+                            interface.sendData(
+                                ack_payload,
+                                destinationId=from_id,
+                                wantAck=False,
+                                portNum=DEFAULT_PORTNUM,
+                                channelIndex=(args.channel if args.channel is not None else 0),
+                            )
+                        except Exception:
+                            ui_emit("radio_lost", None)
+                            return
                     return
                 seen_msgs[msg_key] = now
             delivery = None
@@ -866,32 +1080,102 @@ def main() -> int:
             part = 1
             total = 1
             attempt_in = None
-            try:
-                text = pt.decode("utf-8", errors="replace")
-                if text.startswith("T"):
-                    parts = text.split("|", 4)
-                    if len(parts) == 5:
-                        try:
-                            created_s = int(parts[0][1:])
-                            delivery = max(0.0, now - float(created_s))
-                        except Exception:
-                            delivery = None
-                        group_id = parts[1]
-                        try:
-                            p, t = parts[2].split("/", 1)
-                            part = int(p)
-                            total = int(t)
-                        except Exception:
-                            part = 1
-                            total = 1
-                        try:
-                            attempt_in = int(parts[3])
-                        except Exception:
-                            attempt_in = None
-                        text = parts[4]
-            except Exception:
-                text = repr(pt)
-            print(f"RECV from {from_id}: {text}")
+            chunk_b64 = None
+            payload_cmp = "none"
+            compression_flag = 0
+            legacy_codec = None
+            compact_wire = False
+            if pt.startswith(MSG_V2_PREFIX) and len(pt) >= MSG_V2_HEADER_LEN:
+                compact_wire = True
+                try:
+                    created_s = struct.unpack(">I", pt[2:6])[0]
+                    delivery = max(0.0, now - float(created_s))
+                except Exception:
+                    delivery = None
+                group_id = pt[6:10].hex()
+                try:
+                    part, total, attempt_byte, meta_byte = struct.unpack(">HHBB", pt[10:16])
+                    attempt_in = int(attempt_byte)
+                    meta_u8 = int(meta_byte)
+                    compression_flag, legacy_codec, payload_cmp = parse_compact_meta(meta_u8, pt[16:])
+                except Exception:
+                    part = 1
+                    total = 1
+                    attempt_in = None
+                    payload_cmp = "none"
+                chunk_b64 = b64e(pt[16:])
+                text = ""
+                if compression_flag == 1:
+                    st.compression_capable = True
+                    label_to_mode = {
+                        "mc_byte_dict": MODE_BYTE_DICT,
+                        "mc_fixed_bits": MODE_FIXED_BITS,
+                        "mc_deflate": MODE_DEFLATE,
+                        "mc_zlib": MODE_ZLIB,
+                        "mc_bz2": MODE_BZ2,
+                        "mc_lzma": MODE_LZMA,
+                    }
+                    if payload_cmp in label_to_mode:
+                        st.compression_modes.add(int(label_to_mode[payload_cmp]))
+            else:
+                try:
+                    text = pt.decode("utf-8", errors="replace")
+                    if text.startswith("T"):
+                        parts = text.split("|", 4)
+                        if len(parts) == 5:
+                            try:
+                                created_s = int(parts[0][1:])
+                                delivery = max(0.0, now - float(created_s))
+                            except Exception:
+                                delivery = None
+                            group_id = parts[1]
+                            try:
+                                p, t = parts[2].split("/", 1)
+                                part = int(p)
+                                total = int(t)
+                            except Exception:
+                                part = 1
+                                total = 1
+                            try:
+                                attempt_in = int(parts[3])
+                            except Exception:
+                                attempt_in = None
+                            text = parts[4]
+                except Exception:
+                    text = repr(pt)
+            if peer_norm:
+                if group_id is None:
+                    group_id = msg_hex
+                part_key = f"{peer_norm}:{group_id}:{int(part)}"
+                with seen_lock:
+                    last_part = seen_parts.get(part_key)
+                    if last_part and (now - last_part) < 3600:
+                        # Duplicate part via different path, ACK only.
+                        if from_id:
+                            hop_start = packet.get("hopStart")
+                            hop_limit = packet.get("hopLimit")
+                            hops = None
+                            if isinstance(hop_start, int) and isinstance(hop_limit, int):
+                                hops = max(0, hop_start - hop_limit)
+                            ack_payload, _ack_cmp = pack_message(TYPE_ACK, msg_id, st.aes, build_ack_text(hops))
+                            try:
+                                interface.sendData(
+                                    ack_payload,
+                                    destinationId=from_id,
+                                    wantAck=False,
+                                    portNum=DEFAULT_PORTNUM,
+                                    channelIndex=(args.channel if args.channel is not None else 0),
+                                )
+                            except Exception:
+                                ui_emit("radio_lost", None)
+                            return
+                    seen_parts[part_key] = now
+            if compact_wire:
+                print(f"RECV from {from_id}: part {part}/{total}")
+            else:
+                print(f"RECV from {from_id}: {text}")
+            log_cmp = payload_cmp if compact_wire else rx_compression
+            ui_emit("log", f"{ts_local()} RECV: {msg_hex} cmp={log_cmp}")
             if not (total and int(total) > 1):
                 # history is written on assembled message in UI layer
                 pass
@@ -904,17 +1188,31 @@ def main() -> int:
                     fwd_hops = max(0, hop_start - hop_limit)
                 if group_id is None:
                     group_id = msg_hex
-                ui_emit("recv", (peer_norm, text, fwd_hops, delivery, group_id, part, total, attempt_in))
+                ui_emit(
+                    "recv",
+                    (
+                        peer_norm,
+                        text,
+                        fwd_hops,
+                        delivery,
+                        group_id,
+                        part,
+                        total,
+                        attempt_in,
+                        chunk_b64,
+                        compression_flag,
+                        legacy_codec,
+                        payload_cmp,
+                        compact_wire,
+                    ),
+                )
             if from_id:
                 hop_start = packet.get("hopStart")
                 hop_limit = packet.get("hopLimit")
                 hops = None
                 if isinstance(hop_start, int) and isinstance(hop_limit, int):
                     hops = max(0, hop_start - hop_limit)
-                if hops is None:
-                    ack_payload = pack_message(TYPE_ACK, msg_id, st.aes, b"ACK")
-                else:
-                    ack_payload = pack_message(TYPE_ACK, msg_id, st.aes, f"ACK|hops={hops}".encode("utf-8"))
+                ack_payload, _ack_cmp = pack_message(TYPE_ACK, msg_id, st.aes, build_ack_text(hops))
                 try:
                     interface.sendData(
                         ack_payload,
@@ -977,7 +1275,6 @@ def main() -> int:
             st.rtt_avg = 0.0
             st.rtt_count = 0
             st.next_key_req_ts = 0.0
-        print("KEY: regenerated, waiting for exchange.")
         ui_emit("log", f"{ts_local()} KEY: regenerated, waiting for exchange.")
         for peer_norm in list(tracked_peers):
             send_key_request(peer_norm)
@@ -993,7 +1290,15 @@ def main() -> int:
         if st and (now - st.last_key_req_ts) < 5.0:
             return
         dest_id = wire_id_from_norm(peer_norm)
-        req = KEY_REQ_PREFIX + self_id.encode("utf-8") + b"|" + b64e(pub_self_raw).encode("ascii")
+        modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+        req = (
+            KEY_REQ_PREFIX
+            + self_id.encode("utf-8")
+            + b"|"
+            + b64e(pub_self_raw).encode("ascii")
+            + b"|mc_modes="
+            + modes_bytes
+        )
         try:
             interface.sendData(
                 req,
@@ -1005,7 +1310,6 @@ def main() -> int:
         except Exception:
             ui_emit("radio_lost", None)
             return
-        print(f"{ts_local()} KEY: request sent to {dest_id}")
         last_activity_ts = now
         last_key_sent_ts = last_activity_ts
         if st:
@@ -1016,7 +1320,15 @@ def main() -> int:
     def send_discovery_broadcast() -> None:
         if not radio_ready or interface is None:
             return
-        req = KEY_REQ_PREFIX + self_id.encode("utf-8") + b"|" + b64e(pub_self_raw).encode("ascii")
+        modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+        req = (
+            KEY_REQ_PREFIX
+            + self_id.encode("utf-8")
+            + b"|"
+            + b64e(pub_self_raw).encode("ascii")
+            + b"|mc_modes="
+            + modes_bytes
+        )
         try:
             interface.sendData(
                 req,
@@ -1030,24 +1342,23 @@ def main() -> int:
             ui_emit("radio_lost", None)
             return
 
-    def split_text_utf8(text: str, max_bytes: int) -> list[str]:
+    def split_bytes(data: bytes, max_bytes: int) -> list[bytes]:
         if max_bytes <= 0:
-            return [text]
-        parts: list[str] = []
-        buf = ""
-        buf_len = 0
-        for ch in text:
-            ch_bytes = ch.encode("utf-8")
-            if buf and (buf_len + len(ch_bytes)) > max_bytes:
-                parts.append(buf)
-                buf = ch
-                buf_len = len(ch_bytes)
-            else:
-                buf += ch
-                buf_len += len(ch_bytes)
-        if buf or not parts:
-            parts.append(buf)
+            return [data]
+        if not data:
+            return [b""]
+        parts: list[bytes] = []
+        for i in range(0, len(data), max_bytes):
+            parts.append(data[i : i + max_bytes])
         return parts
+
+    def retry_delay_seconds(base: float, attempts_next: int) -> float:
+        # Exponential backoff with jitter to reduce synchronized retries.
+        step = max(1, int(attempts_next) - 1)
+        raw = max(1.0, float(base)) * (2.0 ** step)
+        capped = min(float(RETRY_BACKOFF_MAX_SECONDS), raw)
+        jitter = capped * float(RETRY_JITTER_RATIO) * random.uniform(-1.0, 1.0)
+        return max(1.0, capped + jitter)
 
     def queue_message(peer_norm: str, text: str) -> Optional[tuple[str, int]]:
         nonlocal last_activity_ts
@@ -1057,44 +1368,125 @@ def main() -> int:
             return None
         st.force_key_req = True
         created = time.time()
-        group_id = os.urandom(4).hex()
         created_s = int(created)
+        group_id = os.urandom(4).hex()  # 4-byte id, compact on wire
         text_bytes = text.encode("utf-8")
-        # Estimate header size; iterate until total parts stabilizes
-        total = 1
-        for _ in range(3):
-            header = f"T{created_s}|{group_id}|{total}/{total}|1|"
-            max_chunk = max_plain - len(header.encode("utf-8"))
-            chunks = split_text_utf8(text, max_chunk)
-            new_total = len(chunks)
-            if new_total == total:
-                break
-            total = new_total
-        # Recompute with final total
-        header = f"T{created_s}|{group_id}|{total}/{total}|1|"
-        max_chunk = max_plain - len(header.encode("utf-8"))
-        chunks = split_text_utf8(text, max_chunk)
-        total = len(chunks)
+        payload_blob = text_bytes
+        use_compact_wire = False
+        compression_flag = 0
+        cmp_label = "none"
+        try:
+            selected_mode = int(compression_mode)
+        except Exception:
+            selected_mode = MODE_BYTE_DICT
+        if selected_mode not in COMPRESSION_MODES:
+            selected_mode = MODE_BYTE_DICT
+        peer_supports_mc = bool(st.compression_capable)
+        peer_supported_modes = sorted(
+            {int(m) for m in getattr(st, "compression_modes", set()) if int(m) in COMPRESSION_MODES}
+        )
+        if not peer_supported_modes:
+            peer_supported_modes = list(LEGACY_COMPRESSION_MODES)
+        plain_fits_one_packet = len(
+            build_legacy_wire_payload(
+                created_s=created_s,
+                group_id=group_id,
+                part=1,
+                total=1,
+                attempt=1,
+                chunk_text=text,
+            )
+        ) <= max_plain
+        chunks_bytes: list[bytes] = []
+        chunks_text: list[str] = []
+        if compression_enabled and peer_supports_mc and (not plain_fits_one_packet):
+            best_blob: Optional[bytes] = None
+            best_mode: Optional[int] = None
+            if selected_mode not in peer_supported_modes:
+                selected_mode = int(peer_supported_modes[0])
+            mode_order = [selected_mode]
+            for mode_try in peer_supported_modes:
+                if mode_try != selected_mode:
+                    mode_order.append(mode_try)
+            for mode_try in mode_order:
+                if best_mode is not None and mode_try == best_mode:
+                    continue
+                try:
+                    candidate = compress_text(text, mode=mode_try, preserve_case=True)
+                except Exception:
+                    continue
+                if (best_blob is None) or (len(candidate) < len(best_blob)):
+                    best_blob = candidate
+                    best_mode = mode_try
+            if best_blob is not None and len(best_blob) < (len(text_bytes) - int(min_gain_bytes)):
+                payload_blob = best_blob
+                use_compact_wire = True
+                compression_flag = 1
+                cmp_label = mode_name(int(best_mode))
+        if use_compact_wire:
+            max_chunk = max(1, max_plain - MSG_V2_HEADER_LEN)
+            chunks_bytes = split_bytes(payload_blob, max_chunk)
+            total = len(chunks_bytes)
+        else:
+            # Legacy text frame for backward compatibility with old clients.
+            chunks_text = build_legacy_chunks(
+                text=text,
+                max_plain=max_plain,
+                created_s=created_s,
+                group_id=group_id,
+                attempts_hint=1,
+            )
+            total = len(chunks_text)
         with pending_lock:
-            for idx, chunk in enumerate(chunks, start=1):
+            peer_pending = pending_by_peer.setdefault(peer_norm, {})
+            overflow = (len(peer_pending) + int(total)) - int(MAX_PENDING_PER_PEER)
+            if overflow > 0:
+                oldest_ids = sorted(
+                    peer_pending.keys(),
+                    key=lambda mid: float(peer_pending.get(mid, {}).get("created", 0.0)),
+                )[:overflow]
+                for mid in oldest_ids:
+                    dropped = peer_pending.pop(mid, None)
+                    if isinstance(dropped, dict):
+                        append_history("drop", peer_norm, str(dropped.get("id", mid)), str(dropped.get("text", "")), "queue_limit")
+                        ui_emit(
+                            "failed",
+                            (
+                                peer_norm,
+                                str(dropped.get("group") or dropped.get("id") or mid),
+                                "queue_limit",
+                                int(dropped.get("attempts", 0)),
+                                int(dropped.get("total", 1) or 1),
+                            ),
+                        )
+                ui_emit("log", f"{ts_local()} DROP: queue limit for {peer_norm} pruned={len(oldest_ids)}")
+            for idx in range(1, int(total) + 1):
                 mid = os.urandom(8).hex()
                 rec = {
                     "id": mid,
                     "group": group_id,
                     "part": idx,
                     "total": total,
-                    "text": chunk,
+                    "text": text,
+                    "use_compact": bool(use_compact_wire),
+                    "compression": compression_flag,
+                    "cmp": cmp_label,
                     "created": created,
                     "attempts": 0,
                     "last_send": 0.0,
+                    "next_retry_at": 0.0,
                     "peer": peer_norm,
                 }
-                pending_by_peer.setdefault(peer_norm, {})[mid] = rec
+                if use_compact_wire:
+                    rec["chunk_b64"] = b64e(chunks_bytes[idx - 1])
+                else:
+                    rec["chunk_text"] = chunks_text[idx - 1]
+                peer_pending[mid] = rec
             save_state(pending_by_peer)
-        append_history("queue", peer_norm, group_id, text, f"parts={total}")
+        append_history("queue", peer_norm, group_id, text, f"parts={total} cmp={cmp_label}")
         last_activity_ts = time.time()
         if st.key_ready:
-            print(f"QUEUE: {group_id} parts={total} bytes={len(text_bytes)}")
+            print(f"QUEUE: {group_id} parts={total} bytes={len(text_bytes)} cmp={cmp_label}")
         else:
             print(f"WAITING KEY: queued for {peer_norm} id={group_id}")
         ui_emit("queued", (peer_norm, text))
@@ -1158,10 +1550,11 @@ def main() -> int:
                     print(f"DROP: {rec['id']} timeout")
                     append_history("drop", peer_norm, rec["id"], str(rec.get("text", "")), "timeout")
                     ui_emit("log", f"{ts_local()} DROP: {rec['id']} timeout for {peer_norm}")
+                    ui_emit("failed", (peer_norm, str(rec.get("group") or rec.get("id") or rec["id"]), "timeout", int(rec.get("attempts", 0)), int(rec.get("total", 1) or 1)))
                     continue
 
-                last_send = float(rec.get("last_send", 0.0))
-                if (now - last_send) < float(args.retry_seconds):
+                next_retry_at = float(rec.get("next_retry_at", 0.0) or 0.0)
+                if now < next_retry_at:
                     continue
 
                 text = str(rec.get("text", ""))
@@ -1170,8 +1563,45 @@ def main() -> int:
                 part = int(rec.get("part", 1) or 1)
                 total = int(rec.get("total", 1) or 1)
                 attempts_next = int(rec.get("attempts", 0)) + 1
-                wire_text = f"T{created_s}|{group_id}|{part}/{total}|{attempts_next}|{text}"
-                pt = wire_text.encode("utf-8")
+                compression_flag = 1 if int(rec.get("compression", 0) or 0) else 0
+                cmp_name = str(rec.get("cmp", "none") or "none")
+                use_compact_wire = bool(rec.get("use_compact", False))
+                if (not use_compact_wire) and ("chunk_b64" in rec) and compression_flag == 1:
+                    use_compact_wire = True
+                if use_compact_wire:
+                    chunk_b64 = str(rec.get("chunk_b64", "") or "")
+                    try:
+                        chunk = b64d(chunk_b64) if chunk_b64 else b""
+                    except Exception:
+                        chunk = b""
+                    pt = build_compact_wire_payload(
+                        prefix=MSG_V2_PREFIX,
+                        created_s=int(created_s),
+                        group_id=group_id,
+                        part=int(part),
+                        total=int(total),
+                        attempt=int(attempts_next),
+                        compression_flag=int(compression_flag),
+                        chunk=chunk,
+                    )
+                else:
+                    chunk_text = rec.get("chunk_text")
+                    if not isinstance(chunk_text, str):
+                        if "chunk_b64" in rec:
+                            try:
+                                chunk_text = b64d(str(rec.get("chunk_b64", "") or "")).decode("utf-8", errors="replace")
+                            except Exception:
+                                chunk_text = None
+                    if not isinstance(chunk_text, str):
+                        chunk_text = text
+                    pt = build_legacy_wire_payload(
+                        created_s=int(created_s),
+                        group_id=group_id,
+                        part=int(part),
+                        total=int(total),
+                        attempt=int(attempts_next),
+                        chunk_text=chunk_text,
+                    )
                 if len(pt) > max_plain:
                     with pending_lock:
                         pending_by_peer.get(peer_norm, {}).pop(rec["id"], None)
@@ -1181,12 +1611,19 @@ def main() -> int:
                     print(f"DROP: {rec['id']} too long")
                     append_history("drop", peer_norm, rec["id"], text, "too_long")
                     ui_emit("log", f"{ts_local()} DROP: {rec['id']} too long for {peer_norm}")
+                    ui_emit("failed", (peer_norm, str(rec.get("group") or rec.get("id") or rec["id"]), "too_long", int(rec.get("attempts", 0)), int(rec.get("total", 1) or 1)))
                     return
 
                 if not st.aes:
                     return
 
-                payload = pack_message(TYPE_MSG, bytes.fromhex(rec["id"]), st.aes, pt)
+                payload, _wire_compression = pack_message(
+                    TYPE_MSG,
+                    bytes.fromhex(rec["id"]),
+                    st.aes,
+                    pt,
+                    allow_payload_compress=False,
+                )
                 if len(payload) > args.max_bytes:
                     with pending_lock:
                         pending_by_peer.get(peer_norm, {}).pop(rec["id"], None)
@@ -1196,6 +1633,7 @@ def main() -> int:
                     print(f"DROP: {rec['id']} payload too big")
                     append_history("drop", peer_norm, rec["id"], text, "payload_too_big")
                     ui_emit("log", f"{ts_local()} DROP: {rec['id']} payload too big for {peer_norm}")
+                    ui_emit("failed", (peer_norm, str(rec.get("group") or rec.get("id") or rec["id"]), "payload_too_big", int(rec.get("attempts", 0)), int(rec.get("total", 1) or 1)))
                     return
 
                 try:
@@ -1211,14 +1649,14 @@ def main() -> int:
                     return
                 rec["attempts"] = attempts_next
                 rec["last_send"] = now
+                rec["next_retry_at"] = now + retry_delay_seconds(float(args.retry_seconds), attempts_next)
                 with pending_lock:
                     pending_by_peer.setdefault(peer_norm, {})[rec["id"]] = rec
                     save_state(pending_by_peer)
                 global_last_send_ts = now
-                print(f"SEND: {rec['id']} attempt={rec['attempts']}")
                 if rec["attempts"] == 1:
-                    append_history("send", peer_norm, rec["id"], text, f"attempt={rec['attempts']}")
-                ui_emit("log", f"{ts_local()} SEND: {rec['id']} attempt={rec['attempts']} -> {peer_norm}")
+                    append_history("send", peer_norm, rec["id"], text, f"attempt={rec['attempts']} cmp={cmp_name}")
+                ui_emit("log", f"{ts_local()} SEND: {rec['id']} attempt={rec['attempts']} cmp={cmp_name} -> {peer_norm}")
                 return
 
     # If we just generated our keys or peer key is missing, request exchange immediately.
@@ -1239,12 +1677,13 @@ def main() -> int:
 
     def sender_loop() -> None:
         last_key_refresh_ts = 0.0
+        last_health_ts = 0.0
         while True:
             send_due()
             now = time.time()
             if (now - last_key_refresh_ts) >= 5.0:
                 last_key_refresh_ts = now
-                peers = set(peer_states.keys()) | set(known_peers.keys()) | set(tracked_peers)
+                peers, _ = snapshot_runtime_state(peer_states, known_peers, tracked_peers)
                 for peer_norm in peers:
                     if not peer_norm or peer_norm == self_id:
                         continue
@@ -1272,6 +1711,24 @@ def main() -> int:
                         elif not idle and now >= next_discovery_ts:
                             ui_emit("log", f"{ts_local()} DISCOVERY: silent (activity)")
                             discovery_state["next_ts"] = now + random.uniform(1800, 3600)
+            if radio_ready and (now - last_health_ts) >= 300.0:
+                last_health_ts = now
+                with pending_lock:
+                    pending_count = sum(len(v) for v in pending_by_peer.values())
+                peers_snapshot, avg_rtt = snapshot_runtime_state(peer_states, known_peers, tracked_peers)
+                ui_emit(
+                    "log",
+                    f"{ts_local()} HEALTH: peers={len(peers_snapshot)} tracked={len(tracked_peers)} pending={pending_count} avg_rtt={avg_rtt:.2f}s",
+                )
+            if (now % 60.0) < 0.25:
+                cutoff = now - 3600.0
+                with seen_lock:
+                    for k in list(seen_msgs.keys()):
+                        if seen_msgs.get(k, 0.0) < cutoff:
+                            seen_msgs.pop(k, None)
+                    for k in list(seen_parts.keys()):
+                        if seen_parts.get(k, 0.0) < cutoff:
+                            seen_parts.pop(k, None)
             time.sleep(0.2)
 
     threading.Thread(target=sender_loop, daemon=True).start()
@@ -1306,6 +1763,7 @@ def main() -> int:
             return 0
 
     def run_gui_qt() -> int:
+        nonlocal compression_enabled, compression_mode, min_gain_bytes
         try:
             from PySide6 import QtCore, QtGui, QtWidgets
         except Exception:
@@ -1341,9 +1799,11 @@ def main() -> int:
                 "send": "Send",
                 "select_dialog": "Select dialog or contact.",
                 "group_empty": "Group name is empty.",
+                "group_send_none": "No group members are available for sending.",
                 "select_peers": "Select peers from Contacts first.",
                 "log": "Log",
                 "verbose_events": "Verbose events",
+                "runtime_log_file": "Write runtime.log",
                 "pin": "Pin",
                 "unpin": "Unpin",
                 "group_rename": "Rename group",
@@ -1362,7 +1822,7 @@ def main() -> int:
                 "key_request": "Request key",
                 "key_reset": "Reset key",
                 "settings_runtime": "Runtime settings",
-                "settings_restart": "Applies after restart",
+                "settings_restart": "Port/retry/limits apply after reconnect or restart",
                 "port": "Port",
                 "channel": "Channel",
                 "retry": "Retry seconds",
@@ -1370,7 +1830,28 @@ def main() -> int:
                 "max_bytes": "Max bytes",
                 "rate": "Rate seconds",
                 "discovery": "Discovery",
-                "discovery_enabled": "Discovery (broadcast + reply)",
+                "discovery_send": "Send broadcast discovery",
+                "discovery_reply": "Reply to broadcast discovery",
+                "clear_pending_on_switch": "Clear pending when profile switches",
+                "compression": "Compression",
+                "compression_enabled": "Enable text compression",
+                "compression_mode": "Preferred mode",
+                "compression_mode_byte_dict": "BYTE_DICT",
+                "compression_mode_fixed_bits": "FIXED_BITS",
+                "compression_mode_deflate": "DEFLATE",
+                "compression_mode_zlib": "ZLIB",
+                "compression_mode_bz2": "BZ2",
+                "compression_mode_lzma": "LZMA",
+                "compression_min_gain": "Min gain, bytes",
+                "compression_min_gain_hint": "All modes are compared; selected mode is preferred on tie. Use compression only if payload becomes smaller by at least this many bytes",
+                "copy_log": "Copy log",
+                "clear_log": "Clear log",
+                "about_author": "Author",
+                "about_callsign": "Callsign",
+                "about_telegram": "Telegram",
+                "about_vision": "Vision: Civilian/Hobby/Research mesh messaging study only",
+                "about_author_position": "Author position: Military and any unlawful use are explicitly prohibited",
+                "about_disclaimer": "Disclaimer: provided AS IS, without warranties; author is not liable for damages",
             },
             "ru": {
                 "dialogs": "Диалоги",
@@ -1390,9 +1871,11 @@ def main() -> int:
                 "send": "Отправить",
                 "select_dialog": "Выберите диалог или контакт.",
                 "group_empty": "Имя группы пустое.",
+                "group_send_none": "Нет доступных участников группы для отправки.",
                 "select_peers": "Сначала выберите контакты.",
                 "log": "Лог",
                 "verbose_events": "Подробные события",
+                "runtime_log_file": "Писать runtime.log",
                 "pin": "Закрепить",
                 "unpin": "Открепить",
                 "group_rename": "Переименовать группу",
@@ -1411,7 +1894,7 @@ def main() -> int:
                 "key_request": "Запросить ключ",
                 "key_reset": "Сбросить ключ",
                 "settings_runtime": "Параметры запуска",
-                "settings_restart": "Применятся после перезапуска",
+                "settings_restart": "Порт/повтор/лимиты применяются после переподключения или перезапуска",
                 "port": "Порт",
                 "channel": "Канал",
                 "retry": "Повтор, сек",
@@ -1419,7 +1902,28 @@ def main() -> int:
                 "max_bytes": "Макс байт",
                 "rate": "Мин интервал, сек",
                 "discovery": "Обнаружение",
-                "discovery_enabled": "Обнаружение (broadcast + ответ)",
+                "discovery_send": "Отправлять broadcast discovery",
+                "discovery_reply": "Отвечать на broadcast discovery",
+                "clear_pending_on_switch": "Очищать очередь при смене профиля",
+                "compression": "Сжатие",
+                "compression_enabled": "Включить сжатие текста",
+                "compression_mode": "Предпочитаемый режим",
+                "compression_mode_byte_dict": "BYTE_DICT",
+                "compression_mode_fixed_bits": "FIXED_BITS",
+                "compression_mode_deflate": "DEFLATE",
+                "compression_mode_zlib": "ZLIB",
+                "compression_mode_bz2": "BZ2",
+                "compression_mode_lzma": "LZMA",
+                "compression_min_gain": "Мин выигрыш, байт",
+                "compression_min_gain_hint": "Сравниваются все режимы; выбранный режим имеет приоритет при равенстве. Сжатие применяется только если payload становится меньше минимум на это число байт",
+                "copy_log": "Копировать лог",
+                "clear_log": "Очистить лог",
+                "about_author": "Автор",
+                "about_callsign": "Позывной",
+                "about_telegram": "Telegram",
+                "about_vision": "Видение: только гражданское/любительское/исследовательское изучение mesh-месседжинга",
+                "about_author_position": "Позиция автора: военное и любое незаконное использование прямо запрещено",
+                "about_disclaimer": "Отказ от ответственности: ПО «как есть», без гарантий; автор не отвечает за ущерб",
             },
         }
         cfg: Dict[str, object] = {}
@@ -1428,9 +1932,24 @@ def main() -> int:
             log_startup.append(line)
         current_lang = str(cfg.get("lang", "ru")).lower()
         verbose_log = bool(cfg.get("log_verbose", True))
+        runtime_log_file = bool(cfg.get("runtime_log_file", True))
+        compression_enabled = bool(cfg.get("compression_enabled", True))
+        try:
+            compression_mode = int(cfg.get("compression_mode", MODE_BYTE_DICT))
+        except Exception:
+            compression_mode = MODE_BYTE_DICT
+        if compression_mode not in COMPRESSION_MODES:
+            compression_mode = MODE_BYTE_DICT
+        try:
+            min_gain_bytes = int(cfg.get("min_gain_bytes", 2))
+        except Exception:
+            min_gain_bytes = 2
         pinned_dialogs = set(cfg.get("pinned_dialogs", []))
         hidden_contacts = set(cfg.get("hidden_contacts", []))
         groups_cfg = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
+        clear_pending_on_switch = bool(cfg.get("clear_pending_on_switch", True))
+        global RUNTIME_LOG_ENABLED
+        RUNTIME_LOG_ENABLED = runtime_log_file
         if current_lang not in ("ru", "en"):
             current_lang = "ru"
 
@@ -1606,6 +2125,9 @@ def main() -> int:
             QLineEdit { background: #2b0a22; border: 1px solid #6f4a7a; padding: 6px; }
             QPushButton { background: #5c3566; border: 1px solid #6f4a7a; padding: 6px 10px; }
             QPushButton:hover { background: #6f4a7a; }
+            QMenu { background: #2b0a22; border: 1px solid #6f4a7a; padding: 2px; }
+            QMenu::item { padding: 6px 14px; color: #eeeeec; }
+            QMenu::item:selected { background: #ff9800; color: #2b0a22; }
             QLabel#muted { color: #c0b7c2; }
             QLabel#section { color: #c0b7c2; font-size: 13px; font-weight: 400; }
             QWidget#headerBar { background: #c24f00; }
@@ -1620,12 +2142,17 @@ def main() -> int:
         chat_history: Dict[str, list] = {}
         list_index: list[Optional[str]] = []
         current_dialog: Optional[str] = None
+        last_loaded_profile: Optional[str] = None
 
         def save_gui_config() -> None:
             save_config(
                 {
                     "lang": current_lang,
                     "log_verbose": verbose_log,
+                    "runtime_log_file": runtime_log_file,
+                    "compression_enabled": compression_enabled,
+                    "compression_mode": int(compression_mode),
+                    "min_gain_bytes": int(min_gain_bytes),
                     "pinned_dialogs": sorted(pinned_dialogs),
                     "hidden_contacts": sorted(hidden_contacts),
                     "groups": {k: sorted(list(v)) for k, v in groups.items()},
@@ -1635,9 +2162,10 @@ def main() -> int:
                     "max_seconds": cfg.get("max_seconds", args.max_seconds),
                     "max_bytes": cfg.get("max_bytes", args.max_bytes),
                     "rate_seconds": cfg.get("rate_seconds", args.rate_seconds),
-                    "discovery_enabled": discovery_send,
+                    "discovery_enabled": bool(discovery_send and discovery_reply),
                     "discovery_send": discovery_send,
                     "discovery_reply": discovery_reply,
+                    "clear_pending_on_switch": clear_pending_on_switch,
                 }
             )
 
@@ -1654,56 +2182,145 @@ def main() -> int:
         def open_settings() -> None:
             nonlocal current_lang
             nonlocal verbose_log
+            nonlocal runtime_log_file
             nonlocal discovery_send, discovery_reply
+            nonlocal clear_pending_on_switch
+            nonlocal compression_enabled, compression_mode, min_gain_bytes
             dlg = QtWidgets.QDialog(win)
             dlg.setWindowTitle(tr("settings_title"))
             dlg.resize(700, 560)
             layout = QtWidgets.QVBoxLayout(dlg)
+            top_row = QtWidgets.QHBoxLayout()
+            top_row.setContentsMargins(0, 0, 0, 0)
+            top_row.setSpacing(14)
+            left_panel = QtWidgets.QVBoxLayout()
+            left_panel.setContentsMargins(0, 0, 0, 0)
+            left_panel.setSpacing(6)
+            right_panel = QtWidgets.QVBoxLayout()
+            right_panel.setContentsMargins(0, 0, 0, 0)
+            right_panel.setSpacing(6)
             runtime_title = QtWidgets.QLabel(tr("settings_runtime"))
             runtime_title.setObjectName("muted")
             runtime_title.setStyleSheet("font-weight:600;")
-            layout.addWidget(runtime_title)
+            left_panel.addWidget(runtime_title)
             runtime_group = QtWidgets.QGroupBox("")
             runtime_layout = QtWidgets.QFormLayout(runtime_group)
             runtime_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
             runtime_layout.setFormAlignment(QtCore.Qt.AlignTop)
             runtime_layout.setVerticalSpacing(8)
+            runtime_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+
+            def compact_field(widget, width: int = 240):
+                widget.setMinimumWidth(150)
+                widget.setMaximumWidth(width)
+                widget.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+                return widget
+
+            def int_text(value, fallback: int) -> str:
+                try:
+                    return str(int(float(value)))
+                except Exception:
+                    return str(int(fallback))
+
             port_edit = QtWidgets.QLineEdit(str(cfg.get("port", args.port)))
-            retry_edit = QtWidgets.QLineEdit(str(cfg.get("retry_seconds", args.retry_seconds)))
-            maxsec_edit = QtWidgets.QLineEdit(str(cfg.get("max_seconds", args.max_seconds)))
-            maxbytes_edit = QtWidgets.QLineEdit(str(cfg.get("max_bytes", args.max_bytes)))
-            rate_edit = QtWidgets.QLineEdit(str(cfg.get("rate_seconds", args.rate_seconds)))
+            retry_edit = QtWidgets.QLineEdit(int_text(cfg.get("retry_seconds", args.retry_seconds), int(args.retry_seconds)))
+            maxsec_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_seconds", args.max_seconds), int(args.max_seconds)))
+            maxbytes_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_bytes", args.max_bytes), int(args.max_bytes)))
+            rate_edit = QtWidgets.QLineEdit(int_text(cfg.get("rate_seconds", args.rate_seconds), int(args.rate_seconds)))
+            compact_field(port_edit)
+            compact_field(retry_edit)
+            compact_field(maxsec_edit)
+            compact_field(maxbytes_edit)
+            compact_field(rate_edit)
+            int_validator = QtGui.QIntValidator(0, 999999, dlg)
+            retry_edit.setValidator(int_validator)
+            maxsec_edit.setValidator(int_validator)
+            maxbytes_edit.setValidator(int_validator)
+            rate_edit.setValidator(int_validator)
             runtime_layout.addRow(tr("port"), port_edit)
             runtime_layout.addRow(tr("retry"), retry_edit)
             runtime_layout.addRow(tr("max_seconds"), maxsec_edit)
             runtime_layout.addRow(tr("max_bytes"), maxbytes_edit)
             runtime_layout.addRow(tr("rate"), rate_edit)
-            layout.addWidget(runtime_group)
+            left_panel.addWidget(runtime_group)
             restart_label = QtWidgets.QLabel(tr("settings_restart"))
             restart_label.setObjectName("muted")
-            layout.addWidget(restart_label)
+            left_panel.addWidget(restart_label)
             lang_label = QtWidgets.QLabel(tr("language"))
-            layout.addWidget(lang_label)
+            right_panel.addWidget(lang_label)
             rb_ru = QtWidgets.QRadioButton(tr("lang_ru"))
             rb_en = QtWidgets.QRadioButton(tr("lang_en"))
             if current_lang == "en":
                 rb_en.setChecked(True)
             else:
                 rb_ru.setChecked(True)
-            layout.addWidget(rb_ru)
-            layout.addWidget(rb_en)
+            lang_row = QtWidgets.QHBoxLayout()
+            lang_row.setContentsMargins(0, 0, 0, 0)
+            lang_row.addWidget(rb_ru)
+            lang_row.addWidget(rb_en)
+            lang_row.addStretch(1)
+            right_panel.addLayout(lang_row)
             log_label = QtWidgets.QLabel(tr("log") + " (events)")
             log_label.setObjectName("muted")
-            layout.addWidget(log_label)
+            right_panel.addWidget(log_label)
             cb_verbose = QtWidgets.QCheckBox(tr("verbose_events"))
             cb_verbose.setChecked(verbose_log)
-            layout.addWidget(cb_verbose)
+            right_panel.addWidget(cb_verbose)
+            cb_runtime_log = QtWidgets.QCheckBox(tr("runtime_log_file"))
+            cb_runtime_log.setChecked(runtime_log_file)
+            right_panel.addWidget(cb_runtime_log)
             discovery_label = QtWidgets.QLabel(tr("discovery"))
             discovery_label.setObjectName("muted")
-            layout.addWidget(discovery_label)
-            cb_discovery_enabled = QtWidgets.QCheckBox(tr("discovery_enabled"))
-            cb_discovery_enabled.setChecked(discovery_send)
-            layout.addWidget(cb_discovery_enabled)
+            right_panel.addWidget(discovery_label)
+            cb_discovery_send = QtWidgets.QCheckBox(tr("discovery_send"))
+            cb_discovery_send.setChecked(discovery_send)
+            right_panel.addWidget(cb_discovery_send)
+            cb_discovery_reply = QtWidgets.QCheckBox(tr("discovery_reply"))
+            cb_discovery_reply.setChecked(discovery_reply)
+            right_panel.addWidget(cb_discovery_reply)
+            cb_clear_pending = QtWidgets.QCheckBox(tr("clear_pending_on_switch"))
+            cb_clear_pending.setChecked(clear_pending_on_switch)
+            right_panel.addWidget(cb_clear_pending)
+            compression_label = QtWidgets.QLabel(tr("compression"))
+            compression_label.setObjectName("muted")
+            right_panel.addWidget(compression_label)
+            cb_compression_enabled = QtWidgets.QCheckBox(tr("compression_enabled"))
+            cb_compression_enabled.setChecked(compression_enabled)
+            right_panel.addWidget(cb_compression_enabled)
+            compression_form = QtWidgets.QFormLayout()
+            compression_form.setContentsMargins(0, 0, 0, 0)
+            compression_form.setLabelAlignment(QtCore.Qt.AlignLeft)
+            compression_form.setFormAlignment(QtCore.Qt.AlignTop)
+            compression_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+            mode_combo = QtWidgets.QComboBox()
+            mode_items = [
+                ("compression_mode_byte_dict", MODE_BYTE_DICT),
+                ("compression_mode_fixed_bits", MODE_FIXED_BITS),
+                ("compression_mode_deflate", MODE_DEFLATE),
+                ("compression_mode_zlib", MODE_ZLIB),
+                ("compression_mode_bz2", MODE_BZ2),
+                ("compression_mode_lzma", MODE_LZMA),
+            ]
+            for key, mode_val in mode_items:
+                mode_combo.addItem(tr(key), int(mode_val))
+            mode_idx = mode_combo.findData(int(compression_mode))
+            if mode_idx < 0:
+                mode_idx = mode_combo.findData(int(MODE_BYTE_DICT))
+            mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+            compact_field(mode_combo)
+            gain_edit = QtWidgets.QLineEdit(str(int(min_gain_bytes)))
+            compact_field(gain_edit)
+            compression_form.addRow(tr("compression_mode"), mode_combo)
+            compression_form.addRow(tr("compression_min_gain"), gain_edit)
+            gain_edit.setToolTip(tr("compression_min_gain_hint"))
+            right_panel.addLayout(compression_form)
+            gain_hint = QtWidgets.QLabel(tr("compression_min_gain_hint"))
+            gain_hint.setObjectName("muted")
+            right_panel.addWidget(gain_hint)
+
+            top_row.addLayout(left_panel, 1)
+            top_row.addLayout(right_panel, 1)
+            layout.addLayout(top_row)
             log_view = QtWidgets.QTextEdit()
             log_view.setReadOnly(True)
             set_mono(log_view, 10)
@@ -1713,48 +2330,125 @@ def main() -> int:
             copy_row = QtWidgets.QHBoxLayout()
             copy_row.setContentsMargins(0, 0, 0, 0)
             copy_row.addStretch(1)
-            btn_copy = QtWidgets.QPushButton("Copy log")
+            btn_clear = QtWidgets.QPushButton(tr("clear_log"))
+            btn_copy = QtWidgets.QPushButton(tr("copy_log"))
+            copy_row.addWidget(btn_clear)
             copy_row.addWidget(btn_copy)
             layout.addLayout(copy_row)
-            author_label = QtWidgets.QLabel("meshTalk v0.2.2 alfa\nAuthor: Anton Vologzhanin\nCallsign: R3VAF\nTelegram: @peerat33\nLicense: MIT")
+            author_label = QtWidgets.QLabel(
+                f"meshTalk v{VERSION}\n"
+                f"{tr('about_author')}: Anton Vologzhanin\n"
+                f"{tr('about_callsign')}: R3VAF\n"
+                f"{tr('about_telegram')}: @peerat33\n"
+                f"{tr('about_vision')}\n"
+                f"{tr('about_author_position')}\n"
+                f"{tr('about_disclaimer')}"
+            )
             author_label.setObjectName("muted")
             layout.addWidget(author_label)
-            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok
+                | QtWidgets.QDialogButtonBox.Cancel
+                | QtWidgets.QDialogButtonBox.Apply
+            )
             layout.addWidget(buttons)
             for text, level in log_buffer[-500:]:
                 log_append_view(log_view, text, level)
-            def on_accept():
-                nonlocal verbose_log, discovery_send, discovery_reply
-                if not radio_ready:
-                    QtWidgets.QMessageBox.information(win, "meshTalk", "Waiting for radio...")
-                    return
+
+            def parse_int_field(edit: QtWidgets.QLineEdit, default: int) -> int:
+                try:
+                    raw = edit.text().strip()
+                    return int(raw) if raw else int(default)
+                except Exception:
+                    return int(default)
+
+            def apply_settings(close_dialog: bool) -> None:
+                nonlocal verbose_log, runtime_log_file, discovery_send, discovery_reply, clear_pending_on_switch
+                nonlocal compression_enabled, compression_mode, min_gain_bytes
                 verbose_log = cb_verbose.isChecked()
+                runtime_log_file = cb_runtime_log.isChecked()
+                global RUNTIME_LOG_ENABLED
+                RUNTIME_LOG_ENABLED = runtime_log_file
                 prev_send = discovery_send
-                discovery_send = cb_discovery_enabled.isChecked()
-                discovery_reply = discovery_send
+                discovery_send = cb_discovery_send.isChecked()
+                discovery_reply = cb_discovery_reply.isChecked()
+                clear_pending_on_switch = cb_clear_pending.isChecked()
+                compression_enabled = cb_compression_enabled.isChecked()
+                mode_data = mode_combo.currentData()
+                try:
+                    compression_mode = int(mode_data)
+                except Exception:
+                    compression_mode = MODE_BYTE_DICT
+                if compression_mode not in COMPRESSION_MODES:
+                    compression_mode = MODE_BYTE_DICT
+                try:
+                    min_gain_bytes = int(gain_edit.text().strip()) if gain_edit.text().strip() else 2
+                except Exception:
+                    min_gain_bytes = 2
+                if min_gain_bytes < 0:
+                    min_gain_bytes = 0
                 set_language("ru" if rb_ru.isChecked() else "en", persist=True)
                 cfg["port"] = port_edit.text().strip() or "auto"
-                cfg["retry_seconds"] = int(retry_edit.text().strip()) if retry_edit.text().strip() else 30
-                cfg["max_seconds"] = int(maxsec_edit.text().strip()) if maxsec_edit.text().strip() else 3600
-                cfg["max_bytes"] = int(maxbytes_edit.text().strip()) if maxbytes_edit.text().strip() else 200
-                cfg["rate_seconds"] = float(rate_edit.text().strip()) if rate_edit.text().strip() else 30.0
-                cfg["discovery_enabled"] = discovery_send
+                cfg["retry_seconds"] = parse_int_field(retry_edit, 30)
+                cfg["max_seconds"] = parse_int_field(maxsec_edit, 3600)
+                cfg["max_bytes"] = parse_int_field(maxbytes_edit, 200)
+                cfg["rate_seconds"] = parse_int_field(rate_edit, 30)
+                cfg["discovery_enabled"] = bool(discovery_send and discovery_reply)
                 cfg["discovery_send"] = discovery_send
                 cfg["discovery_reply"] = discovery_reply
+                cfg["runtime_log_file"] = runtime_log_file
+                cfg["clear_pending_on_switch"] = clear_pending_on_switch
+                cfg["compression_enabled"] = compression_enabled
+                cfg["compression_mode"] = int(compression_mode)
+                cfg["min_gain_bytes"] = int(min_gain_bytes)
                 save_gui_config()
                 if discovery_send and not prev_send:
                     reset_discovery_schedule()
                     ui_emit("log", f"{ts_local()} DISCOVERY: enabled (burst)")
-                dlg.accept()
+                if close_dialog:
+                    dlg.accept()
+
+            def on_accept():
+                apply_settings(close_dialog=True)
+
+            def on_apply():
+                apply_settings(close_dialog=False)
             def on_copy():
                 try:
-                    text = "\n".join(t for t, _lvl in log_buffer)
-                    QtWidgets.QApplication.clipboard().setText(text)
+                    text = log_view.toPlainText().strip()
+                    if not text:
+                        text = "\n".join(t for t, _lvl in log_buffer)
+                    cb = QtWidgets.QApplication.clipboard()
+                    if cb is None:
+                        return
+                    cb.setText(text)
+                    try:
+                        cb.setText(text, QtGui.QClipboard.Mode.Clipboard)
+                    except Exception:
+                        pass
+                    try:
+                        cb.setText(text, QtGui.QClipboard.Mode.Selection)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            def on_clear():
+                try:
+                    log_buffer.clear()
+                    if settings_log_view is not None:
+                        settings_log_view.clear()
+                    with runtime_log_lock:
+                        with open(RUNTIME_LOG_FILE, "w", encoding="utf-8") as f:
+                            f.write("")
                 except Exception:
                     pass
             buttons.accepted.connect(on_accept)
             buttons.rejected.connect(dlg.reject)
+            btn_apply = buttons.button(QtWidgets.QDialogButtonBox.Apply)
+            if btn_apply is not None:
+                btn_apply.clicked.connect(on_apply)
             btn_copy.clicked.connect(on_copy)
+            btn_clear.clicked.connect(on_clear)
             dlg.exec()
             settings_log_view = None
 
@@ -1825,7 +2519,13 @@ def main() -> int:
             ]
             rotate = h[7] % 4
             colors = colors[rotate:] + colors[:rotate]
-            painter.setBrush(QtGui.QBrush(colors[0]))
+            def solid_brush(c: QtGui.QColor) -> QtGui.QBrush:
+                # PySide6 compatibility: avoid QBrush(QColor) ctor path on older builds.
+                b = QtGui.QBrush()
+                b.setStyle(QtCore.Qt.SolidPattern)
+                b.setColor(c)
+                return b
+            painter.setBrush(solid_brush(colors[0]))
             painter.setPen(QtCore.Qt.NoPen)
             painter.drawEllipse(0, 0, size, size)
             cx = size / 2.0
@@ -1842,7 +2542,7 @@ def main() -> int:
                 p0 = QtCore.QPointF(cx + r * math.cos(angle0), cy + r * math.sin(angle0))
                 p1 = QtCore.QPointF(cx + r * math.cos(angle1), cy + r * math.sin(angle1))
                 poly = QtGui.QPolygonF([QtCore.QPointF(cx, cy), p0, p1])
-                painter.setBrush(QtGui.QBrush(colors[i]))
+                painter.setBrush(solid_brush(colors[i]))
                 painter.drawPolygon(poly)
                 angle += span
             ring = QtGui.QPen(QtGui.QColor(255, 255, 255, 60), 1)
@@ -1955,45 +2655,68 @@ def main() -> int:
             msg = clamp_text(msg)
             ts_html = ""
             if meta:
-                combined = f"{ts} {meta}".strip()
+                meta_l = meta.lower().strip()
+                if (
+                    meta_l.startswith("отправлена в ")
+                    or meta_l.startswith("отправлено в ")
+                    or meta_l.startswith("доставлено в ")
+                    or meta_l.startswith("получено в ")
+                    or meta_l.startswith("sent at ")
+                    or meta_l.startswith("delivered at ")
+                    or meta_l.startswith("received at ")
+                    or bool(re.match(r"^в\s+\d{2}:\d{2}\b", meta_l))
+                ):
+                    combined = meta
+                else:
+                    combined = f"{ts} {meta}".strip()
             else:
                 combined = ts
-            m = re.search(r"\bp(\d+)/(\d+)\b", combined)
-            pending = "--:--" in combined
-            if m:
-                done = int(m.group(1))
-                total = int(m.group(2))
-                token = f"p{done}/{total}"
-                if done < total:
-                    pending = True
-                start = combined.find(token)
-                if start >= 0 and done < total:
-                    ts_html = (
-                        html_escape(combined[:start])
-                        + f"<span style='color:#ff9800'>{html_escape(token)}</span>"
-                        + html_escape(combined[start + len(token):])
-                    )
-                else:
-                    ts_html = html_escape(combined)
-            else:
-                ts_html = html_escape(combined)
-            if pending:
-                ts_html = html_escape(combined)
+            combined_l = combined.lower()
+            pending = (
+                ("in progress" in combined_l)
+                or ("receiving" in combined_l)
+                or ("в процессе" in combined_l)
+                or ("получение" in combined_l)
+                or ("sent and" in combined_l)
+                or ("отправлено и" in combined_l)
+                or ("elapsed " in combined_l)
+                or ("прошло " in combined_l)
+            )
+            m_old = re.search(r"\bp(\d+)/(\d+)\b", combined_l)
+            if m_old:
+                try:
+                    if int(m_old.group(1)) < int(m_old.group(2)):
+                        pending = True
+                except Exception:
+                    pass
+            m_parts = re.search(r"(?:\bparts\b|\bчасти\b|\bчастей\b)\s+(\d+)\s*/\s*(\d+)", combined_l)
+            if m_parts:
+                try:
+                    if int(m_parts.group(1)) < int(m_parts.group(2)):
+                        pending = True
+                except Exception:
+                    pass
+            ts_html = html_escape(combined)
+            failed = (
+                ("failed (" in combined_l)
+                or ("ошибка (" in combined_l)
+            )
             text_color = tx
-            ts_color = "#ff9800" if pending else "#8a7f8b"
+            tag_color = tx
+            ts_color = "#ff5a5f" if failed else ("#ff9800" if pending else "#8a7f8b")
             tag = short_tag(peer_id)
             tag_html = html_escape(tag) if tag else "&nbsp;"
-            msg_align = "right" if outgoing else "left"
+            msg_align = "left"
             avatar_cell = (
                 f"<td width='46' align='center' valign='top' style='padding:0;' rowspan='2'>"
                 f"<div style='display:flex;flex-direction:column;align-items:center;gap:2px;'>"
                 f"<img src='{icon}' width='36' height='36'>"
-                f"<div style='color:{text_color};font-size:13px;font-weight:600;line-height:1.0;text-align:center;'>{tag_html}</div>"
+                f"<div style='color:{tag_color};font-size:13px;font-weight:600;line-height:1.0;text-align:center;'>{tag_html}</div>"
                 f"</div>"
                 f"</td>"
             )
             msg_text_cell = (
-                f"<td width='100%' align='{msg_align}' valign='top' style='padding:4px 8px 0 8px;color:{text_color};text-align:{msg_align};line-height:1.25;margin:0;height:100%;'>"
+                f"<td width='100%' align='{msg_align}' valign='top' style='padding:4px 8px 0 4px;color:{text_color};text-align:{msg_align};line-height:1.25;margin:0;height:100%;'>"
                 f"{html_escape(msg)}"
                 f"</td>"
             )
@@ -2069,12 +2792,51 @@ def main() -> int:
             chat_text.clear()
             if not dialog_id:
                 return
+
+            def as_float(val: object) -> Optional[float]:
+                if val is None:
+                    return None
+                try:
+                    return float(val)
+                except Exception:
+                    return None
+
             for idx, entry in enumerate(chat_history.get(dialog_id, [])):
                 if isinstance(entry, dict):
                     text = str(entry.get("text", ""))
                     direction = str(entry.get("dir", "in"))
                     peer_id = self_id if direction == "out" else dialog_id
                     meta = str(entry.get("meta", "") or "")
+                    meta_data = entry.get("meta_data")
+                    if isinstance(meta_data, dict):
+                        row_hhmm = text[:5] if (len(text) >= 5 and text[2] == ":" and text[5:6] == " ") else None
+                        packets = None
+                        packets_raw = meta_data.get("packets")
+                        if isinstance(packets_raw, (tuple, list)) and len(packets_raw) >= 2:
+                            try:
+                                packets = (int(packets_raw[0]), int(packets_raw[1]))
+                            except Exception:
+                                packets = None
+                        status_raw = meta_data.get("status")
+                        status = str(status_raw).strip() if status_raw is not None else ""
+                        done_raw = meta_data.get("done")
+                        done = bool(done_raw) if done_raw is not None else None
+                        meta = format_meta(
+                            as_float(meta_data.get("delivery")),
+                            as_float(meta_data.get("attempts")),
+                            as_float(meta_data.get("forward_hops")),
+                            as_float(meta_data.get("ack_hops")),
+                            packets,
+                            status=status or None,
+                            delivered_at_ts=as_float(meta_data.get("delivered_at_ts")),
+                            incoming=bool(meta_data.get("incoming", direction != "out")),
+                            done=done,
+                            row_time_hhmm=row_hhmm,
+                            received_at_ts=as_float(meta_data.get("received_at_ts")),
+                            sent_at_ts=as_float(meta_data.get("sent_at_ts")),
+                            incoming_started_ts=as_float(meta_data.get("incoming_started_ts")),
+                        )
+                        entry["meta"] = meta
                     append_chat_entry(chat_text, text, peer_id, direction == "out", idx, meta=meta)
                 else:
                     line = str(entry)
@@ -2184,6 +2946,7 @@ def main() -> int:
                 save_gui_config()
             apply_language()
             refresh_list()
+            render_chat(current_dialog)
             app.processEvents()
             for w in win.findChildren(QtWidgets.QWidget):
                 w.update()
@@ -2419,6 +3182,7 @@ def main() -> int:
             outgoing: bool = False,
             msg_id: Optional[str] = None,
             meta: str = "",
+            meta_data: Optional[Dict[str, object]] = None,
             replace_msg_id: Optional[str] = None,
         ) -> None:
             ts = time.strftime("%H:%M", time.localtime())
@@ -2431,6 +3195,8 @@ def main() -> int:
                         entry["text"] = line
                         if meta:
                             entry["meta"] = meta
+                        if meta_data is not None:
+                            entry["meta_data"] = dict(meta_data)
                         if msg_id:
                             entry["msg_id"] = msg_id
                         update_dialog(dialog_id, line, recv=not outgoing)
@@ -2443,6 +3209,8 @@ def main() -> int:
                 entry["msg_id"] = msg_id
             if meta:
                 entry["meta"] = meta
+            if meta_data is not None:
+                entry["meta_data"] = dict(meta_data)
             history.append(entry)
             update_dialog(dialog_id, line, recv=not outgoing)
             if not outgoing and current_dialog != dialog_id:
@@ -2464,39 +3232,120 @@ def main() -> int:
                     return True
             return False
 
+        def assemble_incoming_text(
+            parts: object,
+            total: int,
+            compact: bool,
+            compression: int,
+            legacy_codec: Optional[str],
+            show_partial: bool = True,
+        ) -> Tuple[str, bool]:
+            if not isinstance(parts, dict) or total <= 0:
+                return ("", True)
+            if compact:
+                return assemble_compact_parts(parts, total, compression, legacy_codec, show_partial=show_partial)
+            full = "".join(str(parts.get(str(i), parts.get(i, ""))) for i in range(1, total + 1))
+            if show_partial and len(parts) < total:
+                full = full + "..."
+            return (full, True)
+
         def restore_incoming_state() -> None:
-            for rec in incoming_state.values():
+            pruned = False
+            for key, rec in list(incoming_state.items()):
                 peer_norm = str(rec.get("peer", "")).strip()
                 group_id = str(rec.get("group_id", "")).strip()
                 if not peer_norm or not group_id:
+                    incoming_state.pop(key, None)
+                    pruned = True
                     continue
                 if history_has_msg(peer_norm, group_id):
+                    incoming_state.pop(key, None)
+                    pruned = True
                     continue
                 parts = rec.get("parts") or {}
                 total = int(rec.get("total", 0) or 0)
                 if total <= 0 or not isinstance(parts, dict):
+                    incoming_state.pop(key, None)
+                    pruned = True
                     continue
-                full = "".join(str(parts.get(i, "")) for i in range(1, total + 1))
-                if len(parts) < total:
-                    full = full + "..."
+                compact = bool(rec.get("compact", False))
+                compression = int(rec.get("compression", 0) or 0)
+                legacy_codec = rec.get("legacy_codec")
+                if legacy_codec is not None:
+                    legacy_codec = str(legacy_codec)
+                elif rec.get("codec") is not None:
+                    legacy_codec = str(rec.get("codec"))
+                full, decode_ok = assemble_incoming_text(
+                    parts,
+                    total,
+                    compact,
+                    compression,
+                    legacy_codec,
+                    show_partial=True,
+                )
                 avg_hops = None
                 if rec.get("hops_n", 0):
                     avg_hops = float(rec.get("hops_sum", 0.0)) / float(rec.get("hops_n", 1))
                 avg_attempts = None
                 if rec.get("attempts_n", 0):
                     avg_attempts = float(rec.get("attempts_sum", 0.0)) / float(rec.get("attempts_n", 1))
+                done_now = (len(parts) >= total)
+                status = "decode_error" if (done_now and not decode_ok) else None
+                received_at_ts = None
+                if done_now:
+                    raw_received = float(rec.get("received_at_ts", 0.0) or 0.0)
+                    received_at_ts = raw_received if raw_received > 0.0 else None
+                incoming_started_ts = None
+                raw_started = float(rec.get("incoming_started_ts", 0.0) or 0.0)
+                if raw_started > 0.0:
+                    incoming_started_ts = raw_started
                 meta = format_meta(
                     rec.get("delivery"),
-                    avg_attempts if avg_attempts is not None else 1,
+                    avg_attempts,
                     avg_hops,
                     None,
                     (len(parts), total),
+                    status=status,
+                    incoming=True,
+                    done=done_now,
+                    received_at_ts=received_at_ts,
+                    incoming_started_ts=incoming_started_ts,
                 )
-                chat_line(peer_norm, full, "#66d9ef", meta=meta, msg_id=group_id, replace_msg_id=group_id)
+                chat_line(
+                    peer_norm,
+                    full,
+                    "#66d9ef",
+                    meta=meta,
+                    meta_data={
+                        "delivery": rec.get("delivery"),
+                        "attempts": avg_attempts,
+                        "forward_hops": avg_hops,
+                        "ack_hops": None,
+                        "packets": (len(parts), total),
+                        "status": status,
+                        "incoming": True,
+                        "done": done_now,
+                        "received_at_ts": received_at_ts,
+                        "incoming_started_ts": incoming_started_ts,
+                    },
+                    msg_id=group_id,
+                    replace_msg_id=group_id,
+                )
+                if done_now:
+                    if decode_ok:
+                        append_history("recv", peer_norm, group_id, full)
+                    else:
+                        append_history("recv_error", peer_norm, group_id, "[decode error]", "compressed_payload_decode_failed")
+                    incoming_state.pop(key, None)
+                    pruned = True
+            if pruned:
+                save_incoming_state(incoming_state)
 
         log_buffer: list[tuple[str, str]] = []
         for line in log_startup:
-            log_buffer.append((line, "info"))
+            line_norm, _ = normalize_log_text_line(line, fallback_ts=ts_local())
+            log_buffer.append((line_norm, "info"))
+            append_runtime_log(line_norm)
 
         def log_append_view(view: QtWidgets.QTextEdit, text: str, level: str) -> None:
             if level == "error":
@@ -2508,14 +3357,22 @@ def main() -> int:
             append_html(view, text, color)
 
         def log_line(text: str, level: str = "info") -> None:
-            if not re.match(r"^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\b", text):
-                text = f"{ts_local()} {text}"
+            text, body = normalize_log_text_line(text, fallback_ts=ts_local())
+            now = time.time()
+            if not hasattr(log_line, "_last"):
+                log_line._last = {"body": "", "ts": 0.0}
+            last = log_line._last
+            # Suppress immediate duplicate lines (print + ui_emit of same event).
+            if body and body == str(last.get("body", "")) and (now - float(last.get("ts", 0.0))) < 0.6:
+                return
+            log_line._last = {"body": body, "ts": now}
             lvl = level
             if ("ERROR" in text) or ("Exception" in text) or ("Traceback" in text):
                 lvl = "error"
             elif "KEY:" in text:
                 lvl = "key"
             log_buffer.append((text, lvl))
+            append_runtime_log(text)
             if settings_log_view is not None:
                 log_append_view(settings_log_view, text, lvl)
             update_status()
@@ -2529,40 +3386,37 @@ def main() -> int:
 
         _builtins.print = _gui_print
 
-        def format_duration_mmss(seconds: float) -> str:
-            total = max(0, int(round(seconds)))
-            mm = total // 60
-            ss = total % 60
-            return f"{mm}:{ss:02d}"
-
-        def _fmt_num(val: Optional[float]) -> str:
-            if val is None:
-                return "?"
-            if abs(val - round(val)) < 0.001:
-                return str(int(round(val)))
-            return f"{val:.1f}"
-
         def format_meta(
             delivery: Optional[float],
             attempts: Optional[float],
             forward_hops: Optional[float],
             ack_hops: Optional[float],
             packets: Optional[tuple[int, int]] = None,
+            status: Optional[str] = None,
+            delivered_at_ts: Optional[float] = None,
+            incoming: bool = False,
+            done: Optional[bool] = None,
+            row_time_hhmm: Optional[str] = None,
+            received_at_ts: Optional[float] = None,
+            sent_at_ts: Optional[float] = None,
+            incoming_started_ts: Optional[float] = None,
         ) -> str:
-            dur = "--:--" if delivery is None else format_duration_mmss(delivery)
-            a = _fmt_num(attempts)
-            fwd = _fmt_num(forward_hops)
-            if ack_hops is None:
-                hops = f"h{fwd}"
-            else:
-                back = _fmt_num(ack_hops)
-                hops = f"h{fwd}:{back}"
-            p = ""
-            if packets is not None:
-                done, total = packets
-                if int(total) > 0:
-                    p = f" p{int(done)}/{int(total)}"
-            return f"({dur} a{a} {hops}{p})"
+            return format_meta_text(
+                current_lang,
+                delivery,
+                attempts,
+                forward_hops,
+                ack_hops,
+                packets,
+                status=status,
+                delivered_at_ts=delivered_at_ts,
+                incoming=incoming,
+                done=done,
+                row_time_hhmm=row_time_hhmm,
+                received_at_ts=received_at_ts,
+                sent_at_ts=sent_at_ts,
+                incoming_started_ts=incoming_started_ts,
+            )
 
         def update_sent_delivery(
             dialog_id: str,
@@ -2595,7 +3449,47 @@ def main() -> int:
                     end = msg.find(") ")
                     if end != -1:
                         msg = msg[end + 2 :]
-                entry["meta"] = format_meta(delivery, attempts, forward_hops, ack_hops, packets)
+                delivered_at_ts = None
+                if packets is not None:
+                    done_now, total_now = packets
+                    if int(done_now) >= int(total_now):
+                        delivered_at_ts = time.time()
+                sent_at_ts = None
+                old_meta_data = entry.get("meta_data")
+                if isinstance(old_meta_data, dict):
+                    try:
+                        raw_sent = float(old_meta_data.get("sent_at_ts", 0.0) or 0.0)
+                    except Exception:
+                        raw_sent = 0.0
+                    if raw_sent > 0.0:
+                        sent_at_ts = raw_sent
+                entry["meta"] = format_meta(
+                    delivery,
+                    attempts,
+                    forward_hops,
+                    ack_hops,
+                    packets,
+                    delivered_at_ts=delivered_at_ts,
+                    incoming=False,
+                    done=(delivered_at_ts is not None),
+                    row_time_hhmm=ts,
+                    sent_at_ts=sent_at_ts,
+                )
+                meta_data_out: Dict[str, object] = {
+                    "delivery": delivery,
+                    "attempts": attempts,
+                    "forward_hops": forward_hops,
+                    "ack_hops": ack_hops,
+                    "incoming": False,
+                    "done": (delivered_at_ts is not None),
+                }
+                if packets is not None:
+                    meta_data_out["packets"] = (int(packets[0]), int(packets[1]))
+                if delivered_at_ts is not None:
+                    meta_data_out["delivered_at_ts"] = delivered_at_ts
+                if sent_at_ts is not None:
+                    meta_data_out["sent_at_ts"] = sent_at_ts
+                entry["meta_data"] = meta_data_out
                 entry["text"] = f"{ts} {msg}"
                 if i == len(entries) - 1:
                     update_dialog(dialog_id, entry["text"], recv=False)
@@ -2608,6 +3502,74 @@ def main() -> int:
                     if int(done) >= int(total) and not entry.get("logged"):
                         append_history("sent", dialog_id, msg_id, msg)
                         entry["logged"] = True
+                return
+
+        def update_sent_failed(
+            dialog_id: str,
+            msg_id: str,
+            reason: str,
+            attempts: int,
+            total: int,
+        ) -> None:
+            entries = chat_history.get(dialog_id, [])
+            if not entries:
+                return
+            for i in range(len(entries) - 1, -1, -1):
+                entry = entries[i]
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("dir") != "out":
+                    continue
+                if entry.get("msg_id") != msg_id:
+                    continue
+                text = str(entry.get("text", ""))
+                if len(text) >= 6 and text[5] == " ":
+                    ts = text[:5]
+                    msg = text[6:]
+                else:
+                    ts = time.strftime("%H:%M", time.localtime())
+                    msg = text
+                if msg.startswith("("):
+                    end = msg.find(") ")
+                    if end != -1:
+                        msg = msg[end + 2 :]
+                sent_at_ts = None
+                old_meta_data = entry.get("meta_data")
+                if isinstance(old_meta_data, dict):
+                    try:
+                        raw_sent = float(old_meta_data.get("sent_at_ts", 0.0) or 0.0)
+                    except Exception:
+                        raw_sent = 0.0
+                    if raw_sent > 0.0:
+                        sent_at_ts = raw_sent
+                entry["meta"] = format_meta(
+                    None,
+                    float(attempts),
+                    None,
+                    None,
+                    (0, int(max(1, total))),
+                    status=reason,
+                    sent_at_ts=sent_at_ts,
+                )
+                entry["meta_data"] = {
+                    "delivery": None,
+                    "attempts": float(attempts),
+                    "forward_hops": None,
+                    "ack_hops": None,
+                    "packets": (0, int(max(1, total))),
+                    "status": reason,
+                    "incoming": False,
+                    "done": False,
+                }
+                if sent_at_ts is not None:
+                    entry["meta_data"]["sent_at_ts"] = sent_at_ts
+                entry["text"] = f"{ts} {msg}"
+                if i == len(entries) - 1:
+                    update_dialog(dialog_id, entry["text"], recv=False)
+                if current_dialog == dialog_id:
+                    render_chat(dialog_id)
+                else:
+                    refresh_list()
                 return
 
         def send_message() -> None:
@@ -2623,27 +3585,85 @@ def main() -> int:
                 return
             if current_dialog.startswith("group:"):
                 name = current_dialog[6:]
+                queued_ok = 0
                 for peer_norm in sorted(groups.get(name, set())):
-                    queue_message(peer_norm, text)
+                    if queue_message(peer_norm, text) is not None:
+                        queued_ok += 1
+                if queued_ok <= 0:
+                    QtWidgets.QMessageBox.information(win, "meshTalk", tr("group_send_none"))
+                    return
                 chat_line(current_dialog, text, "#fd971f", outgoing=True, meta=format_meta(None, 0, None, None, None))
-                append_history("send", current_dialog, str(int(time.time() * 1000)), text)
+                append_history("sent", current_dialog, os.urandom(8).hex(), text)
                 return
             res = queue_message(current_dialog, text)
             if res is None:
                 return
             group_id, total = res
+            sent_at_ts = time.time()
             chat_line(
                 current_dialog,
                 text,
                 "#a6e22e",
                 outgoing=True,
                 msg_id=group_id,
-                meta=format_meta(None, 0, None, None, (0, total)),
+                meta=format_meta(None, 0, None, None, (0, total), sent_at_ts=sent_at_ts),
+                meta_data={
+                    "delivery": None,
+                    "attempts": 0,
+                    "forward_hops": None,
+                    "ack_hops": None,
+                    "packets": (0, int(total)),
+                    "incoming": False,
+                    "done": False,
+                    "sent_at_ts": sent_at_ts,
+                },
             )
 
         def update_status() -> None:
             # Status is shown in Settings dialog; no-op placeholder for compatibility.
             return
+
+        def dialog_has_dynamic_pending(dialog_id: Optional[str]) -> bool:
+            if not dialog_id:
+                return False
+            for entry in chat_history.get(dialog_id, []):
+                if not isinstance(entry, dict):
+                    continue
+                meta_data = entry.get("meta_data")
+                if not isinstance(meta_data, dict):
+                    continue
+                if meta_data.get("status") is not None:
+                    continue
+                if meta_data.get("delivered_at_ts") is not None:
+                    continue
+                if entry.get("dir") == "out":
+                    try:
+                        sent_at_ts = float(meta_data.get("sent_at_ts", 0.0) or 0.0)
+                    except Exception:
+                        sent_at_ts = 0.0
+                    if sent_at_ts > 0.0:
+                        return True
+                elif bool(meta_data.get("incoming", False)) and not bool(meta_data.get("done", False)):
+                    try:
+                        incoming_started_ts = float(meta_data.get("incoming_started_ts", 0.0) or 0.0)
+                    except Exception:
+                        incoming_started_ts = 0.0
+                    if incoming_started_ts > 0.0:
+                        return True
+            return False
+
+        def refresh_dynamic_pending_meta() -> None:
+            if not current_dialog:
+                return
+            if not dialog_has_dynamic_pending(current_dialog):
+                return
+            try:
+                sb = chat_text.verticalScrollBar()
+                if sb is not None and sb.value() < max(0, sb.maximum() - 4):
+                    return
+            except Exception:
+                pass
+            render_chat(current_dialog)
 
         def update_status_labels(l1: QtWidgets.QLabel, l2: QtWidgets.QLabel, l3: QtWidgets.QLabel) -> None:
             now = time.time()
@@ -2665,26 +3685,22 @@ def main() -> int:
                     lines = f.readlines()[-2000:]
             except Exception:
                 return
-            seen_ids: set[tuple[str, str]] = set()
+            seen_ids: set[tuple[str, str, str, str]] = set()
             for line in lines:
-                parts = line.rstrip("\n").split(" | ")
-                if len(parts) < 5:
+                parsed = parse_history_line(line, strict_encoded=True)
+                if parsed is None:
                     continue
-                direction = parts[1]
+                ts_part, direction, peer_id, msg_id, text = parsed
                 if direction not in ("recv", "sent"):
                     continue
-                peer_id = parts[2]
-                msg_id = parts[3]
                 peer_norm = norm_id_for_filename(peer_id)
-                key = (peer_norm, msg_id)
+                key = (peer_norm, msg_id, direction, text)
                 if msg_id and key in seen_ids:
                     continue
                 if msg_id:
                     seen_ids.add(key)
                 if peer_id.startswith("group:") and peer_id[6:] not in groups:
                     continue
-                text = parts[4]
-                ts_part = parts[0]
                 time_only = ts_part.split(" ")[1][:5] if " " in ts_part else ts_part[:5]
                 dialog_id = peer_id if peer_id.startswith("group:") else peer_norm
                 dir_flag = "out" if direction in ("send", "sent") else "in"
@@ -2700,12 +3716,14 @@ def main() -> int:
 
         def process_ui_events() -> None:
             nonlocal init_step, last_init_label_ts, initializing
-            nonlocal current_lang, verbose_log, pinned_dialogs, hidden_contacts, groups
+            nonlocal current_lang, verbose_log, runtime_log_file, pinned_dialogs, hidden_contacts, groups
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
+            nonlocal compression_enabled, compression_mode, min_gain_bytes
             nonlocal incoming_state
             nonlocal interface, self_id, self_id_raw, radio_ready, known_peers, peer_states, peer_names
             nonlocal initial_port_arg
+            nonlocal clear_pending_on_switch, last_loaded_profile
             if initializing:
                 now = time.time()
                 if (now - last_init_label_ts) >= 0.5:
@@ -2729,12 +3747,40 @@ def main() -> int:
                     if current_lang not in ("ru", "en"):
                         current_lang = "ru"
                     verbose_log = bool(cfg.get("log_verbose", verbose_log))
-                    discovery_send = bool(cfg.get("discovery_enabled", cfg.get("discovery_send", False) or cfg.get("discovery_reply", False)))
-                    discovery_reply = discovery_send
+                    runtime_log_file = bool(cfg.get("runtime_log_file", runtime_log_file))
+                    global RUNTIME_LOG_ENABLED
+                    RUNTIME_LOG_ENABLED = runtime_log_file
+                    legacy_discovery = cfg.get("discovery_enabled", None)
+                    if "discovery_send" in cfg:
+                        discovery_send = bool(cfg.get("discovery_send"))
+                    elif legacy_discovery is not None:
+                        discovery_send = bool(legacy_discovery)
+                    else:
+                        discovery_send = True
+                    if "discovery_reply" in cfg:
+                        discovery_reply = bool(cfg.get("discovery_reply"))
+                    elif legacy_discovery is not None:
+                        discovery_reply = bool(legacy_discovery)
+                    else:
+                        discovery_reply = True
+                    compression_enabled = bool(cfg.get("compression_enabled", compression_enabled))
+                    try:
+                        compression_mode = int(cfg.get("compression_mode", compression_mode))
+                    except Exception:
+                        compression_mode = MODE_BYTE_DICT
+                    if compression_mode not in COMPRESSION_MODES:
+                        compression_mode = MODE_BYTE_DICT
+                    try:
+                        min_gain_bytes = int(cfg.get("min_gain_bytes", min_gain_bytes))
+                    except Exception:
+                        min_gain_bytes = 2
+                    if min_gain_bytes < 0:
+                        min_gain_bytes = 0
+                    clear_pending_on_switch = bool(cfg.get("clear_pending_on_switch", True))
                     args.retry_seconds = int(cfg.get("retry_seconds", args.retry_seconds))
                     args.max_seconds = int(cfg.get("max_seconds", args.max_seconds))
                     args.max_bytes = int(cfg.get("max_bytes", args.max_bytes))
-                    args.rate_seconds = float(cfg.get("rate_seconds", args.rate_seconds))
+                    args.rate_seconds = int(float(cfg.get("rate_seconds", args.rate_seconds)))
                     pinned_dialogs = set(cfg.get("pinned_dialogs", []))
                     hidden_contacts = set(cfg.get("hidden_contacts", []))
                     groups_cfg_local = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
@@ -2750,9 +3796,15 @@ def main() -> int:
                     try:
                         with pending_lock:
                             pending_by_peer.clear()
-                            save_state(pending_by_peer)
+                            profile_changed = (last_loaded_profile is not None and self_id != last_loaded_profile)
+                            if clear_pending_on_switch and profile_changed:
+                                save_state(pending_by_peer)
+                                ui_emit("log", f"{ts_local()} QUEUE: cleared on profile switch")
+                            else:
+                                pending_by_peer.update(load_state(default_peer=peer_id_norm))
                     except Exception:
                         pass
+                    last_loaded_profile = self_id or None
                     incoming_state = load_incoming_state()
                     load_history()
                     restore_incoming_state()
@@ -2760,9 +3812,66 @@ def main() -> int:
                     refresh_list()
                     render_chat(current_dialog)
                 elif evt == "recv":
-                    from_id, text, fwd_hops, delivery, group_id, part, total, attempt_in = payload
+                    from_id = ""
+                    text = ""
+                    fwd_hops = None
+                    delivery = None
+                    group_id = ""
+                    part = 1
+                    total = 1
+                    attempt_in = None
+                    chunk_b64 = None
+                    compression_flag = 0
+                    legacy_codec = None
+                    payload_cmp = "none"
+                    compact_wire = False
+                    if isinstance(payload, tuple) and len(payload) >= 8:
+                        from_id = payload[0]
+                        text = payload[1]
+                        fwd_hops = payload[2]
+                        delivery = payload[3]
+                        group_id = payload[4]
+                        part = payload[5]
+                        total = payload[6]
+                        attempt_in = payload[7]
+                        if len(payload) >= 9:
+                            chunk_b64 = payload[8]
+                        if len(payload) >= 13:
+                            compression_flag = int(payload[9] or 0)
+                            legacy_codec = payload[10]
+                            payload_cmp = str(payload[11] or "none")
+                            compact_wire = bool(payload[12])
+                        elif len(payload) == 12:
+                            compression_flag = int(payload[9] or 0)
+                            legacy_codec = payload[10]
+                            payload_cmp = str(payload[11] or "none")
+                        elif len(payload) == 11:
+                            legacy_codec = payload[9]
+                            compact_wire = bool(payload[10])
+                            payload_cmp = str(legacy_codec or "none")
+                        else:
+                            extra = list(payload[9:])
+                            if extra:
+                                for item in extra:
+                                    if isinstance(item, bool):
+                                        compact_wire = item
+                                        continue
+                                    if isinstance(item, (int, float)) and int(item) in (0, 1):
+                                        compression_flag = int(item)
+                                        continue
+                                    if isinstance(item, str):
+                                        low = item.lower().strip()
+                                        if low in ("none", "mc", "deflate", "zlib", "bz2", "lzma"):
+                                            payload_cmp = low
+                                            if low in ("deflate", "zlib", "bz2", "lzma"):
+                                                legacy_codec = low
+                                        else:
+                                            legacy_codec = item
+                    else:
+                        continue
                     peer_norm = norm_id_for_filename(from_id)
                     if peer_norm:
+                        recv_now_ts = time.time()
                         key = f"{peer_norm}:{group_id}"
                         rec = incoming_state.get(key) or {
                             "total": total,
@@ -2774,8 +3883,21 @@ def main() -> int:
                             "attempts_n": 0,
                             "peer": peer_norm,
                             "group_id": group_id,
+                            "compact": bool(compact_wire),
+                            "compression": int(compression_flag or 0),
+                            "legacy_codec": (str(legacy_codec) if legacy_codec else None),
+                            "incoming_started_ts": recv_now_ts,
                         }
+                        if not rec.get("incoming_started_ts"):
+                            rec["incoming_started_ts"] = recv_now_ts
                         rec["total"] = total
+                        if compact_wire:
+                            rec["compact"] = True
+                            rec["compression"] = merge_compact_compression(
+                                int(rec.get("compression", 0) or 0),
+                                int(compression_flag or 0),
+                            )
+                            rec["legacy_codec"] = (str(legacy_codec) if legacy_codec else None)
                         if delivery is not None:
                             rec["delivery"] = delivery
                         if fwd_hops is not None:
@@ -2784,29 +3906,80 @@ def main() -> int:
                         if attempt_in is not None:
                             rec["attempts_sum"] = float(rec.get("attempts_sum", 0.0)) + float(attempt_in)
                             rec["attempts_n"] = int(rec.get("attempts_n", 0)) + 1
-                        rec["parts"][int(part)] = text
+                        part_key = str(int(part))
+                        if rec.get("compact", False):
+                            rec["parts"][part_key] = str(chunk_b64 or "")
+                        else:
+                            rec["parts"][part_key] = str(text)
                         rec["last_part"] = int(part)
                         incoming_state[key] = rec
                         save_incoming_state(incoming_state)
-                        full = "".join(rec["parts"].get(i, "") for i in range(1, int(total) + 1))
-                        if len(rec["parts"]) < int(total):
-                            full = full + "..."
+                        full, decode_ok = assemble_incoming_text(
+                            rec.get("parts"),
+                            int(total),
+                            bool(rec.get("compact", False)),
+                            int(rec.get("compression", 0) or 0),
+                            (str(rec.get("legacy_codec")) if rec.get("legacy_codec") else None),
+                            show_partial=True,
+                        )
                         avg_hops = None
                         if rec.get("hops_n", 0):
                             avg_hops = float(rec.get("hops_sum", 0.0)) / float(rec.get("hops_n", 1))
                         avg_attempts = None
                         if rec.get("attempts_n", 0):
                             avg_attempts = float(rec.get("attempts_sum", 0.0)) / float(rec.get("attempts_n", 1))
+                        done_now = (len(rec["parts"]) >= int(total))
+                        status = "decode_error" if (done_now and not decode_ok) else None
+                        rec_received_ts = None
+                        if done_now:
+                            try:
+                                raw_received = float(rec.get("received_at_ts", 0.0) or 0.0)
+                            except Exception:
+                                raw_received = 0.0
+                            if raw_received > 0.0:
+                                rec_received_ts = raw_received
+                            else:
+                                rec_received_ts = time.time()
+                                rec["received_at_ts"] = rec_received_ts
+                                incoming_state[key] = rec
+                                save_incoming_state(incoming_state)
                         meta = format_meta(
                             rec.get("delivery"),
-                            avg_attempts if avg_attempts is not None else 1,
+                            avg_attempts,
                             avg_hops,
                             None,
                             (len(rec["parts"]), int(total)),
+                            status=status,
+                            incoming=True,
+                            done=done_now,
+                            received_at_ts=rec_received_ts,
+                            incoming_started_ts=float(rec.get("incoming_started_ts", recv_now_ts) or recv_now_ts),
                         )
-                        chat_line(peer_norm, full, "#66d9ef", meta=meta, msg_id=group_id, replace_msg_id=group_id)
-                        if len(rec["parts"]) >= int(total):
-                            append_history("recv", peer_norm, group_id, full)
+                        chat_line(
+                            peer_norm,
+                            full,
+                            "#66d9ef",
+                            meta=meta,
+                            meta_data={
+                                "delivery": rec.get("delivery"),
+                                "attempts": avg_attempts,
+                                "forward_hops": avg_hops,
+                                "ack_hops": None,
+                                "packets": (len(rec["parts"]), int(total)),
+                                "status": status,
+                                "incoming": True,
+                                "done": done_now,
+                                "received_at_ts": rec_received_ts,
+                                "incoming_started_ts": float(rec.get("incoming_started_ts", recv_now_ts) or recv_now_ts),
+                            },
+                            msg_id=group_id,
+                            replace_msg_id=group_id,
+                        )
+                        if done_now:
+                            if decode_ok:
+                                append_history("recv", peer_norm, group_id, full)
+                            else:
+                                append_history("recv_error", peer_norm, group_id, "[decode error]", "compressed_payload_decode_failed")
                             incoming_state.pop(key, None)
                             save_incoming_state(incoming_state)
                 elif evt == "queued":
@@ -2858,6 +4031,9 @@ def main() -> int:
                     )
                     if rec["acked"] >= rec["total"]:
                         outgoing.pop(group_id, None)
+                elif evt == "failed":
+                    peer_norm, group_id, reason, attempts, total = payload
+                    update_sent_failed(str(peer_norm), str(group_id), str(reason), int(attempts), int(total))
                 elif evt == "log":
                     log_line(str(payload), "info")
                 elif evt == "self_update":
@@ -2873,6 +4049,7 @@ def main() -> int:
                     known_peers.clear()
                     peer_states.clear()
                     peer_names.clear()
+                    key_response_last_ts.clear()
                     incoming_state.clear()
                     with pending_lock:
                         pending_by_peer.clear()
@@ -2966,10 +4143,12 @@ def main() -> int:
                             add_peers_to_group_by_name([current_id], str(gname))
                     add_action(tr("group_add"), add_to_group)
                 add_action(tr("key_request"), lambda: request_key(current_id))
-                add_action(tr("key_reset"), lambda: reset_peer_key(current_id))
                 add_action(tr("clear_history"), lambda: clear_history(current_id))
                 add_action(tr("peer_delete"), lambda: delete_peer(current_id))
 
+            acts = menu.actions()
+            if acts:
+                menu.setActiveAction(acts[0])
             menu.exec(global_pos)
 
         def open_context_menu(pos: QtCore.QPoint) -> None:
@@ -3023,6 +4202,10 @@ def main() -> int:
         timer = QtCore.QTimer()
         timer.timeout.connect(process_ui_events)
         timer.start(200)
+
+        pending_meta_timer = QtCore.QTimer()
+        pending_meta_timer.timeout.connect(refresh_dynamic_pending_meta)
+        pending_meta_timer.start(1000)
 
         def radio_loop() -> None:
             nonlocal initializing, radio_loop_running
@@ -3082,10 +4265,6 @@ def main() -> int:
 
         win.show()
         return app.exec()
-
-    def run_gui_tk() -> int:
-        print("ERROR: Tkinter GUI is disabled. RU: Tkinter GUI отключён.")
-        return 2
 
     rc = run_gui_qt()
     if rc >= 0:

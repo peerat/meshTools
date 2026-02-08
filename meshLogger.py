@@ -895,6 +895,101 @@ def extract_balanced_braces(text: str, start_idx: int) -> Optional[str]:
     return None
 
 
+def extract_balanced_brackets(text: str, start_idx: int) -> Optional[str]:
+    i = text.find("[", start_idx)
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(text)):
+        c = text[j]
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return None
+
+
+def _nodes_dict_to_list(nodes: Dict[str, object]) -> List[Dict[str, object]]:
+    out_list: List[Dict[str, object]] = []
+    for node_id, node_obj in nodes.items():
+        if not (isinstance(node_id, str) and node_id.startswith("!")):
+            continue
+        if isinstance(node_obj, dict):
+            normalized = dict(node_obj)
+            user = normalized.get("user") if isinstance(normalized.get("user"), dict) else {}
+            if not user.get("id"):
+                user["id"] = node_id
+            normalized["user"] = user
+            if not normalized.get("id"):
+                normalized["id"] = node_id
+            out_list.append(normalized)
+    return out_list
+
+
+def _normalize_nodes_payload(parsed: object) -> Optional[List[Dict[str, object]]]:
+    if isinstance(parsed, list):
+        out_list: List[Dict[str, object]] = []
+        for row in parsed:
+            if isinstance(row, dict):
+                out_list.append(row)
+        return out_list if out_list else None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    nodes_candidates = ("nodes", "Nodes", "nodesById")
+    for key in nodes_candidates:
+        value = parsed.get(key)
+        if isinstance(value, list):
+            out_list = [row for row in value if isinstance(row, dict)]
+            return out_list if out_list else None
+        if isinstance(value, dict):
+            out_list = _nodes_dict_to_list(value)
+            return out_list if out_list else None
+
+    for key in ("mesh", "meshInfo", "info"):
+        nested = parsed.get(key)
+        if isinstance(nested, dict):
+            out_list = _normalize_nodes_payload(nested)
+            if out_list:
+                return out_list
+
+    # Last-resort shape: mapping "!xxxxxxxx" -> node dict
+    if any(isinstance(k, str) and k.startswith("!") for k in parsed.keys()):
+        out_list = _nodes_dict_to_list(parsed)
+        return out_list if out_list else None
+
+    return None
+
+
+def _parse_nodes_json_text(out_text: str) -> Optional[List[Dict[str, object]]]:
+    cleaned = "\n".join(
+        [line for line in out_text.splitlines() if line.strip() and line.strip() != "Connected to radio"]
+    ).strip()
+    if not cleaned:
+        return None
+
+    parse_candidates: List[str] = [cleaned]
+    bracket_block = extract_balanced_brackets(cleaned, 0)
+    if bracket_block and bracket_block not in parse_candidates:
+        parse_candidates.append(bracket_block)
+    braces_block = extract_balanced_braces(cleaned, 0)
+    if braces_block and braces_block not in parse_candidates:
+        parse_candidates.append(braces_block)
+
+    for candidate in parse_candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        nodes_list = _normalize_nodes_payload(parsed)
+        if nodes_list:
+            return nodes_list
+    return None
+
+
 def parse_nodes_block(mesh_info_text: str) -> Dict[str, dict]:
     t = clean_ansi(mesh_info_text)
     t_lines = [line for line in t.splitlines() if line.strip() and line.strip() != "Connected to radio"]
@@ -963,17 +1058,9 @@ def fetch_nodes_json(port: str, timeout: int) -> Optional[List[Dict[str, object]
             )
         if rc != 0:
             continue
-        cleaned = "\n".join(
-            [line for line in out_text.splitlines() if line.strip() and line.strip() != "Connected to radio"]
-        ).strip()
-        if not cleaned:
-            continue
-        try:
-            parsed = json.loads(cleaned)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            continue
+        parsed_nodes = _parse_nodes_json_text(out_text)
+        if parsed_nodes:
+            return parsed_nodes
     return None
 
 
@@ -999,8 +1086,23 @@ def fetch_info_raw(port: str, timeout: int) -> Optional[str]:
 
 def update_db_from_nodes(port: str, timeout: int, db_path: str) -> Tuple[int, Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
     nodes_list = fetch_nodes_json(port, timeout)
+    info_raw: Optional[str] = None
     if not nodes_list:
-        return 0, {}, {}
+        info_raw = fetch_info_raw(port, timeout)
+        if info_raw:
+            try:
+                nodes_dict = parse_nodes_block(info_raw)
+                nodes_list = _nodes_dict_to_list(nodes_dict)
+            except Exception:
+                nodes_list = None
+    if not nodes_list:
+        init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            snap = _load_nodes_snapshot(conn)
+        finally:
+            conn.close()
+        return 0, snap, snap
     init_db(db_path)
     ts_utc = iso_utc_now()
     conn = sqlite3.connect(db_path)
@@ -1009,7 +1111,8 @@ def update_db_from_nodes(port: str, timeout: int, db_path: str) -> Tuple[int, Di
         for node in nodes_list:
             if isinstance(node, dict):
                 upsert_node(conn, node, ts_utc, sample_type="nodes")
-        info_raw = fetch_info_raw(port, timeout)
+        if info_raw is None:
+            info_raw = fetch_info_raw(port, timeout)
         if info_raw:
             cur = conn.cursor()
             cur.execute(

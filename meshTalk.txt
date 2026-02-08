@@ -1,102 +1,146 @@
-meshTalk v0.2.2 alfa
-License: MIT (Open Source)
+meshTalk v0.3.1
 Author: Anton Vologzhanin (R3VAF)
 
+========================
+EN
+========================
+
+Purpose
+- Encrypted P2P messenger over Meshtastic.
+- Focused on reliable delivery, delivery stats, and mesh behavior study.
+
+Project vision
+- Intended for civilian/hobby/research use.
+- Built for reliability experiments and mesh behavior study.
+- Military use is explicitly prohibited.
+- Any unlawful use (including terrorist, extremist, criminal activity) is explicitly prohibited.
+- Disclaimer: software is provided "AS IS", without warranties of any kind.
+- Disclaimer: the author is not liable for any direct or indirect damage caused by use or misuse.
+
+Main UI
+- Left: contacts/dialogs list.
+- Right: chat area.
+- Top: orange header with `Client ID`, names, and masked `pub`.
+- Bottom: input field and Send button.
+
+Initialization
+- GUI starts even if radio is not connected.
+- App waits for device, then auto-connects and loads profile data.
+- Settings/history are loaded only after node initialization.
+- Multipart receive state is resumed after restart.
+
+Top row behavior
+- `Client ID: !xxxxxxxx <longname>[<shortname>] pub: 12345****67890`
+- Left-click on top row copies Client ID.
+- Triple-click on `pub:` asks confirmation, regenerates local keys, broadcasts new key.
+
+Message status examples
+- Outgoing in progress:
+  `sent at 10:18 elapsed 00:05`
+- Outgoing multipart in progress:
+  `sent at 10:18 elapsed 00:12, parts 2/5`
+- Outgoing delivered:
+  `sent at 10:18 delivered at 10:19 in 01:18, on the 1 attempt, hops there 0 back 0`
+- Incoming multipart in progress:
+  `started receive at 10:18 elapsed 00:15 parts 2/5 attempts 1, hops 1`
+- Incoming completed:
+  `sent at 10:18 received at 10:19 in 01:18, attempts 1, hops 1, parts 5/5`
+
+Contacts context menu
+- Pin/Unpin
+- Add to group
+- Request key
+- Clear history
+- Delete contact
+
+Settings
+- Port, retry interval, max wait, max bytes, rate.
+- Discovery: two checkboxes (`Send broadcast discovery`, `Reply to broadcast discovery`).
+- Default on first start: both ON.
+- Clear pending on profile switch.
+- Language, verbose events, runtime.log toggle.
+
+Auto key refresh
+- Periodic key request roughly hourly (+ jitter).
+- Auto key request on decrypt failures.
+- Lock indicator removed if key is stale for over 24 hours.
+
+Data files (per node)
+- `<node_id>/keyRings/`
+- `<node_id>/state.json`
+- `<node_id>/history.log`
+- `<node_id>/incoming.json`
+- `<node_id>/runtime.log` (if enabled)
+- `<node_id>/config.json`
+
+========================
+RU
+========================
+
 Назначение
-meshTalk — шифрованный P2P‑мессенджер поверх протокола Meshtastic.
-Сообщения доставляются с подтверждением (ACK) и отображают статистику доставки.
+- Шифрованный P2P‑мессенджер поверх Meshtastic.
+- Фокус: надежная доставка, статистика доставки и изучение поведения mesh-сети.
 
-Основные элементы UI
+Видение проекта
+- Для гражданского/любительского/исследовательского использования.
+- Ориентировано на эксперименты по надежности и изучение поведения mesh-сети.
+- Военное применение прямо запрещено.
+- Любая незаконная деятельность (включая террористическую, экстремистскую и преступную) прямо запрещена.
+- Отказ от ответственности: ПО предоставляется «как есть», без каких-либо гарантий.
+- Отказ от ответственности: автор не несет ответственности за любой прямой или косвенный ущерб от использования или неправильного использования.
+
+Основной UI
 - Слева: список контактов/диалогов.
-- Справа: чат с выбранным контактом.
-- Вверху: оранжевая строка с Client ID, именем и маской public key.
-- Внизу: поле ввода сообщения и кнопка отправки.
-- В списке контактов: оранжевый индикатор непрочитанных (правый верхний угол).
+- Справа: окно чата.
+- Вверху: оранжевая строка `Client ID`, имена и маска `pub`.
+- Внизу: поле ввода и кнопка отправки.
 
-Механизм инициализации
-- В верхней строке показывается статус подключения (ожидание/подключено).
-- Если порт не найден, GUI всё равно запускается и ждёт устройство.
-- Как только устройство появляется, связь устанавливается автоматически.
-- После подключения подтягиваются имена и ключи.
-- Настройки и история загружаются только после инициализации ноды.
-- Непринятые части многопакетных сообщений сохраняются и продолжают собираться после перезапуска.
+Инициализация
+- GUI запускается даже без подключенного радио.
+- Приложение ждет устройство, затем подключается автоматически и грузит профиль.
+- Настройки/история загружаются только после инициализации ноды.
+- Состояние приема многопакетных сообщений восстанавливается после перезапуска.
 
-Верхняя строка
-- Текст вида: `Client ID: !xxxxxxxx <longname>[<shortname>] pub: 12345****67890`
-- Клик левой кнопкой по строке копирует Client ID в буфер обмена.
-- Тройной клик по `pub:` — запрос подтверждения и перегенерация ключей с broadcast‑рассылкой.
-- После перегенерации ключей верхняя строка обновляется автоматически.
+Поведение верхней строки
+- `Client ID: !xxxxxxxx <longname>[<shortname>] pub: 12345****67890`
+- ЛКМ по верхней строке копирует Client ID.
+- Тройной клик по `pub:` просит подтверждение, регенерирует ключи, делает broadcast нового ключа.
 
-Формат метки времени
-Внизу каждого сообщения показывается:
-  HH:MM (мм:сс a2 h3:4 p2/4)
-
-Где:
-- мм:сс — время доставки
-  - исходящие: от постановки в очередь до ACK
-  - входящие: от постановки в очередь у отправителя до получения
-- a2 — среднее число попыток доставки (может быть дробным из‑за усреднения)
-- h3:4 — хопы, 3 туда 4 обратно (обратно может отсутствовать)
-- p2/4 — прогресс по пакетам (2 из 4)
-
-Пример:
-  19:48 (0:07 a1 h0:0 p14/14)
-
-Шифрование и ключи
-- Сообщения шифруются (E2EE), метаданные Meshtastic остаются открытыми.
-- Ключи для каждого контакта хранятся в keyRings/.
+Примеры статусов сообщений
+- Исходящее в процессе:
+  `отправлено в 10:18 прошло 00:05`
+- Исходящее многопакетное в процессе:
+  `отправлено в 10:18 прошло 00:12, части 2/5`
+- Исходящее доставлено:
+  `отправлена в 10:18 доставлено в 10:19 за 01:18, с 1 попытки, хопы туда 0 обратно 0`
+- Входящее многопакетное в процессе:
+  `в 10:18 начали прием, прошло 00:15 частей 2/5 с 1 попытки, хопов 1`
+- Входящее получено полностью:
+  `отправлено в 10:18 получено в 10:19 за 01:18, попытки 1, хопов 1, части 5/5`
 
 Контекстное меню контакта
-- Pin/Unpin — закрепить диалог.
-- Add to group — добавить в группу.
-- Request key — запросить ключ у собеседника (мягко, без удаления).
-- Reset key — сбросить локальный ключ собеседника и запросить новый (жёстко).
-- Clear history — очистить историю диалога.
-- Delete contact — удалить контакт из списка.
+- Pin/Unpin
+- Add to group
+- Request key
+- Clear history
+- Delete contact
 
 Настройки
-- Порт, интервалы повторов, лимит байт, минимальный интервал отправки.
-- Discovery (обнаружение): одна галка
-  - Вкл: отправка broadcast‑запросов + ответы на чужие
-  - Выкл: авто‑обнаружение выключено (только ручной поиск по ID)
-- Язык интерфейса и подробный лог.
-  - Режимы: burst (активный старт), normal (редкий опрос), silent (выкл).
+- Порт, повтор, макс ожидание, макс байт, минимальный интервал.
+- Discovery: две галки (`Отправлять broadcast discovery`, `Отвечать на broadcast discovery`).
+- По умолчанию при первом запуске: обе ВКЛ.
+- Очистка очереди при смене профиля.
+- Язык, подробный лог, включение `runtime.log`.
 
-Автоматическое обновление ключей
-- Авто‑запрос ключей примерно раз в час с джиттером (0–10 минут).
-- При ошибках расшифровки выполняется авто‑запрос нового ключа.
- - Если ключ не обновлялся более 24 часов, индикатор замка исчезает.
+Автообновление ключей
+- Периодический запрос ключа примерно раз в час (+ джиттер).
+- Автозапрос ключа при ошибках расшифровки.
+- Замок убирается, если ключ не обновлялся более 24 часов.
 
-Индикация замка в списке контактов
-- Замок есть — ключ есть и актуален.
-- Замка нет — ключ неизвестен/давно не обновлялся.
-- Оранжевый кружок — есть непрочитанные сообщения.
-
-Discovery (обнаружение)
-- Первые 5 минут после запуска — более частые запросы.
-- Затем — раз в 30–60 минут при отсутствии активности.
-
-Группы
-- Группа — это локальный список контактов.
-- При отправке в группу сообщение уходит каждому участнику отдельно (P2P).
-
-Длинные сообщения (автонарезка)
-- Длинные сообщения режутся на пакеты и отправляются частями.
-- Получатель собирает части в одно сообщение.
-- Прогресс отображается как p2/4 (2 из 4 доставлено).
-- Частично полученные сообщения сохраняются и продолжаются после перезапуска.
-
-Горячие клавиши
-- Enter — отправить сообщение
-- Shift+Enter — новая строка в поле ввода
-
-Лог в настройках
-- Полный отладочный лог выводится в настройках (основной лог).
-- Цвета: серый — обычные события, зелёный — ключевые, красный — ошибки.
-- Кнопка Copy log копирует лог в буфер обмена.
-
-Файлы данных (в папке рядом с приложением)
-- <node_id>/keyRings/  — ключи контактов
-- <node_id>/state.json — очередь сообщений
-- <node_id>/history.log — история сообщений
-- <node_id>/config.json — настройки GUI
+Файлы данных (на каждую ноду)
+- `<node_id>/keyRings/`
+- `<node_id>/state.json`
+- `<node_id>/history.log`
+- `<node_id>/incoming.json`
+- `<node_id>/runtime.log` (если включен)
+- `<node_id>/config.json`

@@ -1,10 +1,18 @@
 # meshTools
 
-License: MIT (Open Source)
 Author: Anton Vologzhanin (R3VAF)
-Current version: 0.2.2 alfa
+Current version: 0.3.1
 
 Small utilities around Meshtastic.
+
+## Project Vision
+
+- Purpose: civilian/hobby/geek use and study of message delivery in mesh networks.
+- The project is aimed at experimentation, reliability analysis, and protocol behavior learning.
+- Military use is explicitly prohibited.
+- Any unlawful use (including terrorist, extremist, criminal activity) is explicitly prohibited.
+- Disclaimer: software is provided "AS IS", without warranties of any kind.
+- Disclaimer: the author is not liable for any direct or indirect damage caused by use or misuse.
 
 ## Contents
 
@@ -91,8 +99,49 @@ Keys are stored in `keyRings/` as `<id>.key` and `<id>.pub` (leading `!` is stri
 If `keyRings/<id>.key` / `keyRings/<id>.pub` are missing, they are generated automatically.
 The script detects your node id from the radio automatically.
 If a peer key is missing, a key exchange is requested automatically.
-Outgoing messages are queued in `meshTalk/state.json` and logged to `meshTalk/history.log`.
+Outgoing messages are stored per node profile in `<node_id>/state.json` and `<node_id>/history.log`.
 Type `/keys` to rotate your keys (they will be regenerated and exchanged again).
+
+### Text Compression (Optional)
+
+Compression is applied to message payload before encryption and only when it gives size gain.
+
+- Config keys:
+  - `compression_enabled` (default: `true`)
+  - `compression_mode` (preferred mode, default: `0`)
+    - `0` = `BYTE_DICT`
+    - `1` = `FIXED_BITS`
+    - `2` = `DEFLATE`
+    - `3` = `ZLIB`
+    - `4` = `BZ2`
+    - `5` = `LZMA`
+  - `min_gain_bytes` (default: `2`)
+- Decision rule: all supported modes are compared; compression is used only if best result is at least `min_gain_bytes` smaller than plain UTF-8.
+- External transport protocol is unchanged; compression works inside message payload bytes.
+- Peer compatibility guard: compression is enabled per peer only after capability markers are observed (`mc=1`, `mc_modes=...`) from validated peer traffic.
+- First message to an unknown peer is sent plain, then compression can activate automatically.
+
+Compressed block format (`compression=1`):
+
+`[MAGIC 2B][VER 1B][MODE 1B][DICT_ID 1B][FLAGS 1B] + DATA + [CRC8 1B]`
+
+- `MAGIC`: `0x4D 0x43` (`"MC"`)
+- `VER`: `1`
+- `MODE`: `0` (`BYTE_DICT`), `1` (`FIXED_BITS`), `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`)
+- `DICT_ID`: static dictionary id (`2`)
+- `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled
+- `CRC8`: checksum over header+data
+- Tokenization: words + punctuation tokens from `.,!?-:;()"'`.
+- Escape for unknown token:
+  - `BYTE_DICT`: `0xFF + varint(len) + raw UTF-8`
+  - `FIXED_BITS`: `ESC symbol + varint(len) + raw UTF-8`
+- Safety guard: max escaped token length is `64` bytes.
+- Text round-trip is exact (case and whitespace are preserved in compressed mode).
+
+Compatibility:
+
+- New client receives both compressed and plain payloads.
+- Plain payload path remains UTF-8 (`compression=0`).
 
 Tip: payload size depends on channel settings (e.g. LongFast). Use `--max-bytes` to tune.
 
@@ -126,7 +175,8 @@ meshTools/
   meshLogger.db # generated SQLite DB
   nodeDb.txt    # generated node DB (legacy)
   keyRings/     # key files (<id>.key, <id>.pub)
-  meshTalk/     # queue and history (state.json, history.log)
+  <node_id>/    # per-node profile data
+               # config.json, state.json, incoming.json, history.log, runtime.log, keyRings/
 ```
 
 ## Notes
@@ -153,6 +203,15 @@ meshTools/
 # meshTools (RU)
 
 Небольшие утилиты вокруг Meshtastic.
+
+## Видение проекта
+
+- Назначение: гражданское/любительское/гиковское использование и изучение прохождения сообщений в mesh-сетях.
+- Проект ориентирован на эксперименты, анализ надежности и изучение поведения протокола.
+- Военное применение прямо запрещено.
+- Любая незаконная деятельность (включая террористическую, экстремистскую и преступную) прямо запрещена.
+- Отказ от ответственности: ПО предоставляется «как есть», без каких-либо гарантий.
+- Отказ от ответственности: автор не несет ответственности за любой прямой или косвенный ущерб от использования или неправильного использования.
 
 ## Содержание
 
@@ -238,8 +297,49 @@ python meshTalk.py --user 02e591e0
 Если `keyRings/<id>.key` / `keyRings/<id>.pub` отсутствуют, они создаются автоматически.
 Скрипт автоматически определяет id узла из радио.
 Если ключ собеседника отсутствует, автоматически запрашивается обмен ключами.
-Исходящие сообщения складываются в `meshTalk/state.json` и логируются в `meshTalk/history.log`.
+Исходящие сообщения сохраняются в профиле узла: `<node_id>/state.json` и `<node_id>/history.log`.
 Команда `/keys` пересоздаёт ваши ключи и запускает новый обмен.
+
+### Сжатие текста (опционально)
+
+Сжатие применяется к payload сообщения до шифрования и только если есть выигрыш по размеру.
+
+- Ключи конфигурации:
+  - `compression_enabled` (по умолчанию: `true`)
+  - `compression_mode` (предпочитаемый режим, по умолчанию: `0`)
+    - `0` = `BYTE_DICT`
+    - `1` = `FIXED_BITS`
+    - `2` = `DEFLATE`
+    - `3` = `ZLIB`
+    - `4` = `BZ2`
+    - `5` = `LZMA`
+  - `min_gain_bytes` (по умолчанию: `2`)
+- Правило выбора: сравниваются все поддерживаемые режимы; сжатие включается только если лучший результат минимум на `min_gain_bytes` меньше обычного UTF-8.
+- Внешний транспортный протокол не меняется; сжатие работает внутри байтов payload.
+- Защита совместимости: сжатие включается для peer только после маркеров возможностей (`mc=1`, `mc_modes=...`) из валидированного трафика этого peer.
+- Первое сообщение неизвестному peer уходит как обычный текст; далее сжатие может включиться автоматически.
+
+Формат сжатого блока (`compression=1`):
+
+`[MAGIC 2B][VER 1B][MODE 1B][DICT_ID 1B][FLAGS 1B] + DATA + [CRC8 1B]`
+
+- `MAGIC`: `0x4D 0x43` (`"MC"`)
+- `VER`: `1`
+- `MODE`: `0` (`BYTE_DICT`), `1` (`FIXED_BITS`), `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`)
+- `DICT_ID`: id статического словаря (`2`)
+- `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled
+- `CRC8`: контрольная сумма по header+data
+- Токенизация: слова + отдельные токены пунктуации `.,!?-:;()"'`.
+- Escape для неизвестного токена:
+  - `BYTE_DICT`: `0xFF + varint(len) + raw UTF-8`
+  - `FIXED_BITS`: `ESC symbol + varint(len) + raw UTF-8`
+- Защита: максимальная длина escape-токена `64` байта.
+- Текст восстанавливается без потерь (сохраняются регистр и пробелы).
+
+Совместимость:
+
+- Новый клиент принимает и сжатый, и обычный payload.
+- Обычный путь (`compression=0`) остается UTF-8 как раньше.
 
 Совет: размер пакета зависит от настроек канала (например LongFast). Подбирайте `--max-bytes`.
 
@@ -273,7 +373,8 @@ meshTools/
   meshLogger.db # сгенерированная SQLite-база
   nodeDb.txt    # сгенерированная база узлов (legacy)
   keyRings/     # ключи (<id>.key, <id>.pub)
-  meshTalk/     # очередь и история (state.json, history.log)
+  <node_id>/    # профиль конкретной ноды
+               # config.json, state.json, incoming.json, history.log, runtime.log, keyRings/
 ```
 
 ## Заметки

@@ -9,6 +9,8 @@ meshLogger.db
 *.db
 *.dot
 *.svg
+runtime.log
+[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/
 
 # Python artifacts
 __pycache__/
