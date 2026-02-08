@@ -606,6 +606,8 @@ def format_meta_text(
     sent_at_ts: Optional[float] = None,
     incoming_started_ts: Optional[float] = None,
     now_ts: Optional[float] = None,
+    compression_name: Optional[str] = None,
+    compression_eff_pct: Optional[float] = None,
 ) -> str:
     is_ru = (lang == "ru")
     dur = format_duration_mmss(delivery) if delivery is not None else None
@@ -647,6 +649,20 @@ def format_meta_text(
             details.append(f"части {done_count}/{total_count}")
         else:
             details.append(f"parts {done_count}/{total_count}")
+    cmp_name = str(compression_name or "").strip()
+    cmp_name_l = cmp_name.lower()
+    if cmp_name and cmp_name_l not in ("none", "n/a", "-", "null"):
+        if compression_eff_pct is not None:
+            eff = _fmt_num(float(compression_eff_pct))
+            if is_ru:
+                details.append(f"сжатие {cmp_name} {eff}%")
+            else:
+                details.append(f"compression {cmp_name} {eff}%")
+        else:
+            if is_ru:
+                details.append(f"сжатие {cmp_name}")
+            else:
+                details.append(f"compression {cmp_name}")
     status_map_ru = {
         "timeout": "таймаут",
         "queue_limit": "лимит очереди",

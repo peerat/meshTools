@@ -254,6 +254,34 @@ class MeshTalkUtilsTests(unittest.TestCase):
         )
         self.assertIn("failed (decode error)", en)
 
+    def test_format_meta_appends_compression_details_en(self) -> None:
+        en = format_meta_text(
+            "en",
+            delivery=6.0,
+            attempts=1.0,
+            forward_hops=0.0,
+            ack_hops=0.0,
+            packets=(1, 1),
+            delivered_at_ts=1700000000.0,
+            compression_name="ZLIB",
+            compression_eff_pct=37.4,
+        )
+        self.assertIn("compression ZLIB 37.4%", en)
+
+    def test_format_meta_appends_compression_details_ru(self) -> None:
+        ru = format_meta_text(
+            "ru",
+            delivery=6.0,
+            attempts=1.0,
+            forward_hops=0.0,
+            ack_hops=0.0,
+            packets=(1, 1),
+            delivered_at_ts=1700000000.0,
+            compression_name="BYTE_DICT",
+            compression_eff_pct=42.0,
+        )
+        self.assertIn("сжатие BYTE_DICT 42%", ru)
+
     def test_format_meta_pending_single_packet_with_sent_timer(self) -> None:
         sent_at_ts = 1700000000.0
         sent_hhmm = time.strftime("%H:%M", time.localtime(sent_at_ts))

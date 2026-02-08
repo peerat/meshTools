@@ -41,6 +41,8 @@ Message status examples
   `sent at 10:18 elapsed 00:12, parts 2/5`
 - Outgoing delivered:
   `sent at 10:18 delivered at 10:19 in 01:18, on the 1 attempt, hops there 0 back 0`
+- Outgoing delivered with compression:
+  `sent at 10:18 delivered at 10:19 in 01:18, on the 1 attempt, hops there 0 back 0, compression BYTE_DICT 42%`
 - Incoming multipart in progress:
   `started receive at 10:18 elapsed 00:15 parts 2/5 attempts 1, hops 1`
 - Incoming completed:
@@ -59,6 +61,8 @@ Settings
 - Default on first start: both ON.
 - Clear pending on profile switch.
 - Language, verbose events, runtime.log toggle.
+- Hint labels in settings use a smaller font (`QLabel#hint`, 10px) to avoid looking like regular options.
+- `Full reset` button (red, with confirmation) removes profile config/state/history/incoming/runtime logs and key files, then regenerates local keys.
 
 Auto key refresh
 - Periodic key request roughly hourly (+ jitter).
@@ -72,6 +76,43 @@ Data files (per node)
 - `<node_id>/incoming.json`
 - `<node_id>/runtime.log` (if enabled)
 - `<node_id>/config.json`
+
+meshTalk related files map (keep updated)
+- This section is operationally important and must be updated periodically when behavior or file roles change.
+
+Project files (repository / source-controlled)
+- `meshTalk.py`:
+  - Main app: radio lifecycle, E2EE, queue/retry/ACK, GUI, save/load state/history.
+- `meshtalk_utils.py`:
+  - Shared helpers: history encode/decode, parsers, metadata formatting, wire payload assembly.
+- `message_text_compression.py`:
+  - Compression codecs/modes used by message payload processing.
+- `run_meshTalk.bat`: Windows launcher.
+- `build_meshTalk.bat`: Windows single-file build helper.
+- `requirements.txt`: Python dependencies.
+- `README.md`: project-level usage and options.
+- `meshTalk.txt`: focused meshTalk behavior reference.
+- `CHANGELOG.md`: changes between versions.
+- `tests/test_meshtalk_utils.py`: history/parsing/metadata behavior.
+- `tests/test_message_text_compression.py`: compression behavior.
+
+Generated during runtime (per profile/node, not source code)
+- `config.json`: GUI/runtime options.
+- `state.json`: outgoing pending queue records (used to restore unsent outgoing messages).
+- `incoming.json`: incoming multipart assembly state.
+- `history.log`: message history and transport events.
+  - Text is stored as `b64:...`.
+  - Optional per-message metadata is stored as `meta64:...` (base64 JSON) for status restoration.
+- `runtime.log`: technical runtime events.
+- `keyRings/`: local private/public keys and peer public keys.
+
+History/recovery behavior
+- On startup, app restores in this logical order:
+  1) `history.log` (`recv/sent`) with metadata.
+  2) outgoing pending state from `state.json`.
+  3) incoming multipart state from `incoming.json`.
+- Group rename moves history entries from old `group:<name>` id to new id.
+- Group delete/clear removes corresponding entries from `history.log`.
 
 ========================
 RU
@@ -113,6 +154,8 @@ RU
   `отправлено в 10:18 прошло 00:12, части 2/5`
 - Исходящее доставлено:
   `отправлена в 10:18 доставлено в 10:19 за 01:18, с 1 попытки, хопы туда 0 обратно 0`
+- Исходящее доставлено со сжатием:
+  `отправлена в 10:18 доставлено в 10:19 за 01:18, с 1 попытки, хопы туда 0 обратно 0, сжатие BYTE_DICT 42%`
 - Входящее многопакетное в процессе:
   `в 10:18 начали прием, прошло 00:15 частей 2/5 с 1 попытки, хопов 1`
 - Входящее получено полностью:
@@ -131,6 +174,8 @@ RU
 - По умолчанию при первом запуске: обе ВКЛ.
 - Очистка очереди при смене профиля.
 - Язык, подробный лог, включение `runtime.log`.
+- Подсказки в настройках показываются меньшим шрифтом (`QLabel#hint`, 10px), чтобы не выглядеть как обычные опции.
+- Кнопка `Полный сброс` (красная, с подтверждением) удаляет конфиг/очереди/историю/incoming/runtime.log и ключи профиля, затем создает новую пару локальных ключей.
 
 Автообновление ключей
 - Периодический запрос ключа примерно раз в час (+ джиттер).
@@ -144,3 +189,40 @@ RU
 - `<node_id>/incoming.json`
 - `<node_id>/runtime.log` (если включен)
 - `<node_id>/config.json`
+
+Карта связанных файлов meshTalk (поддерживать актуальной)
+- Этот раздел операционно важен и должен периодически обновляться при изменении поведения или ролей файлов.
+
+Файлы проекта (в репозитории / исходники)
+- `meshTalk.py`:
+  - Основное приложение: жизненный цикл радио, E2EE, очередь/повторы/ACK, GUI, сохранение/загрузка состояния и истории.
+- `meshtalk_utils.py`:
+  - Общие утилиты: кодирование/декодирование истории, парсеры, форматирование метаданных, сборка wire-пакетов.
+- `message_text_compression.py`:
+  - Алгоритмы/режимы сжатия для полезной нагрузки сообщений.
+- `run_meshTalk.bat`: запуск на Windows.
+- `build_meshTalk.bat`: сборка single-file для Windows.
+- `requirements.txt`: Python-зависимости.
+- `README.md`: общее использование проекта и параметры.
+- `meshTalk.txt`: целевая справка по поведению meshTalk.
+- `CHANGELOG.md`: изменения между версиями.
+- `tests/test_meshtalk_utils.py`: история/парсинг/метаданные.
+- `tests/test_message_text_compression.py`: поведение сжатия.
+
+Генерируется во время работы (на профиль/ноду, не исходники)
+- `config.json`: настройки GUI/runtime.
+- `state.json`: очередь исходящих pending-записей (для восстановления недоотправленных исходящих).
+- `incoming.json`: состояние сборки входящих многопакетных сообщений.
+- `history.log`: история сообщений и транспортные события.
+  - Текст хранится как `b64:...`.
+  - Опциональные метаданные сообщения хранятся как `meta64:...` (base64 JSON) для восстановления статусов.
+- `runtime.log`: технические runtime-события.
+- `keyRings/`: локальные приватный/публичный ключи и публичные ключи пиров.
+
+Поведение восстановления
+- При старте приложение восстанавливает данные логически в таком порядке:
+  1) `history.log` (`recv/sent`) вместе с метаданными.
+  2) pending-исходящие из `state.json`.
+  3) входящие multipart из `incoming.json`.
+- При переименовании группы записи истории переносятся со старого `group:<name>` на новый id.
+- При удалении/очистке группы соответствующие строки удаляются из `history.log`.

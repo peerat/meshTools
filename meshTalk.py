@@ -51,6 +51,7 @@ from meshtalk_utils import (
     encode_history_text,
     parse_history_line,
     assemble_compact_parts,
+    HISTORY_TEXT_PREFIX,
 )
 from message_text_compression import (
     MODE_BZ2,
@@ -92,6 +93,8 @@ runtime_log_lock = threading.Lock()
 RUNTIME_LOG_ENABLED = True
 COMPRESSION_MODES = tuple(int(m) for m in SUPPORTED_MODES)
 LEGACY_COMPRESSION_MODES = (int(MODE_BYTE_DICT), int(MODE_FIXED_BITS))
+HISTORY_META_PREFIX = "meta64:"
+HISTORY_META_MAX_BYTES = 8192
 
 
 def ts_local() -> str:
@@ -221,6 +224,7 @@ def load_incoming_state() -> Dict[str, Dict[str, object]]:
                 "compact": bool(item.get("compact", False)),
                 "compression": int(item.get("compression", 0) or 0),
                 "legacy_codec": (str(item.get("legacy_codec")) if item.get("legacy_codec") else None),
+                "payload_cmp": (str(item.get("payload_cmp")) if item.get("payload_cmp") else "none"),
                 "received_at_ts": float(item.get("received_at_ts", 0.0) or 0.0),
                 "incoming_started_ts": float(item.get("incoming_started_ts", 0.0) or 0.0),
             }
@@ -263,6 +267,7 @@ def save_incoming_state(incoming: Dict[str, Dict[str, object]]) -> None:
                 "compact": bool(rec.get("compact", False)),
                 "compression": int(rec.get("compression", 0) or 0),
                 "legacy_codec": (str(rec.get("legacy_codec")) if rec.get("legacy_codec") else None),
+                "payload_cmp": (str(rec.get("payload_cmp")) if rec.get("payload_cmp") else "none"),
                 "received_at_ts": float(rec.get("received_at_ts", 0.0) or 0.0),
                 "incoming_started_ts": float(rec.get("incoming_started_ts", 0.0) or 0.0),
             }
@@ -273,11 +278,95 @@ def save_incoming_state(incoming: Dict[str, Dict[str, object]]) -> None:
     os.replace(tmp, INCOMING_FILE)
 
 
-def append_history(direction: str, peer_id: str, msg_id: str, text: str, extra: str = "") -> None:
+def encode_history_meta_token(meta_data: Optional[Dict[str, object]]) -> str:
+    if not isinstance(meta_data, dict) or not meta_data:
+        return ""
+    try:
+        import json
+
+        raw = json.dumps(meta_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        if len(raw) > int(HISTORY_META_MAX_BYTES):
+            return ""
+        return HISTORY_META_PREFIX + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return ""
+
+
+def decode_history_meta_token(token: str) -> Optional[Dict[str, object]]:
+    if not isinstance(token, str):
+        return None
+    payload = token.strip()
+    if not payload.startswith(HISTORY_META_PREFIX):
+        return None
+    payload = payload[len(HISTORY_META_PREFIX) :].strip()
+    if not payload:
+        return None
+    try:
+        raw = base64.b64decode(payload.encode("ascii"), validate=True)
+        if len(raw) > int(HISTORY_META_MAX_BYTES):
+            return None
+        import json
+
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return None
+    return None
+
+
+def parse_history_record_line(
+    line: str,
+) -> Optional[Tuple[str, str, str, str, str, Optional[Dict[str, object]]]]:
+    if not isinstance(line, str):
+        return None
+    parts = line.rstrip("\n").split(" | ")
+    if len(parts) < 5:
+        return None
+    base_line = " | ".join(parts[:5])
+    parsed = parse_history_line(base_line, strict_encoded=True)
+    if parsed is None:
+        # Backward compatibility: legacy history rows could store plain text
+        # without b64 prefix. Keep strict behavior for malformed b64 payloads.
+        text_wire = str(parts[4] or "")
+        if text_wire.startswith(HISTORY_TEXT_PREFIX):
+            return None
+        # Parse full legacy line first to preserve plain text that may contain
+        # " | " separators.
+        parsed = parse_history_line(line.rstrip("\n"), strict_encoded=False)
+        if parsed is None:
+            parsed = parse_history_line(base_line, strict_encoded=False)
+    if parsed is None:
+        return None
+    meta_data: Optional[Dict[str, object]] = None
+    for token in parts[5:]:
+        decoded = decode_history_meta_token(token)
+        if isinstance(decoded, dict):
+            meta_data = decoded
+            break
+    ts_part, direction, peer_id, msg_id, text = parsed
+    return (ts_part, direction, peer_id, msg_id, text, meta_data)
+
+
+def append_history(
+    direction: str,
+    peer_id: str,
+    msg_id: str,
+    text: str,
+    extra: str = "",
+    meta_data: Optional[Dict[str, object]] = None,
+) -> None:
     peer_norm = norm_id_for_filename(peer_id)
     line = f"{ts_local()} | {direction} | {peer_norm} | {msg_id} | {encode_history_text(text)}"
-    if extra:
-        line += f" | {extra}"
+    extras: list[str] = []
+    extra_text = str(extra).strip()
+    if extra_text:
+        extras.append(extra_text)
+    meta_token = encode_history_meta_token(meta_data)
+    if meta_token:
+        extras.append(meta_token)
+    if extras:
+        line += " | " + " | ".join(extras)
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
     append_runtime_log(line)
@@ -322,6 +411,69 @@ def b64e(b: bytes) -> str:
 
 def b64d(s: str) -> bytes:
     return base64.b64decode(s.encode("ascii"))
+
+
+def infer_compact_cmp_label_from_chunk(chunk: bytes) -> Optional[str]:
+    raw = bytes(chunk or b"")
+    if len(raw) >= 4 and raw[:2] == b"MC":
+        try:
+            return str(mode_name(int(raw[3])))
+        except Exception:
+            return "mc"
+    try:
+        _compression, _legacy_codec, label = parse_compact_meta(1, raw)
+    except Exception:
+        return None
+    low = str(label or "").strip().lower()
+    if low.startswith("mc_") or low == "mc":
+        return low
+    return None
+
+
+def infer_compact_cmp_label_from_parts(parts: object) -> Optional[str]:
+    if not isinstance(parts, dict):
+        return None
+    raw_part = parts.get("1")
+    if raw_part is None:
+        raw_part = parts.get(1)
+    if raw_part in (None, ""):
+        return None
+    try:
+        chunk = b64d(str(raw_part))
+    except Exception:
+        return None
+    return infer_compact_cmp_label_from_chunk(chunk)
+
+
+def effective_payload_cmp_label(
+    payload_cmp: object,
+    compact_wire: bool,
+    compression_flag: int,
+    legacy_codec: object = None,
+    parts: object = None,
+    chunk_b64: Optional[str] = None,
+) -> str:
+    cmp_low = str(payload_cmp or "").strip().lower()
+    if compact_wire and int(compression_flag or 0) == 1:
+        if cmp_low.startswith("mc_") or cmp_low == "mc":
+            return cmp_low
+        if chunk_b64:
+            try:
+                inferred = infer_compact_cmp_label_from_chunk(b64d(str(chunk_b64)))
+            except Exception:
+                inferred = None
+            if inferred:
+                return inferred
+        inferred = infer_compact_cmp_label_from_parts(parts)
+        if inferred:
+            return inferred
+        return "mc"
+    if cmp_low and cmp_low not in ("none", "n/a", "-", "null"):
+        return cmp_low
+    legacy_low = str(legacy_codec or "").strip().lower()
+    if legacy_low and legacy_low not in ("none", "n/a", "-", "null"):
+        return legacy_low
+    return "none"
 
 
 def load_priv(path: str) -> x25519.X25519PrivateKey:
@@ -1174,7 +1326,17 @@ def main() -> int:
                 print(f"RECV from {from_id}: part {part}/{total}")
             else:
                 print(f"RECV from {from_id}: {text}")
-            log_cmp = payload_cmp if compact_wire else rx_compression
+            log_cmp = (
+                effective_payload_cmp_label(
+                    payload_cmp,
+                    compact_wire=True,
+                    compression_flag=int(compression_flag or 0),
+                    legacy_codec=legacy_codec,
+                    chunk_b64=(str(chunk_b64) if chunk_b64 is not None else None),
+                )
+                if compact_wire
+                else rx_compression
+            )
             ui_emit("log", f"{ts_local()} RECV: {msg_hex} cmp={log_cmp}")
             if not (total and int(total) > 1):
                 # history is written on assembled message in UI layer
@@ -1360,7 +1522,38 @@ def main() -> int:
         jitter = capped * float(RETRY_JITTER_RATIO) * random.uniform(-1.0, 1.0)
         return max(1.0, capped + jitter)
 
-    def queue_message(peer_norm: str, text: str) -> Optional[tuple[str, int]]:
+    def compression_efficiency_pct(plain_size: int, packed_size: int) -> Optional[float]:
+        try:
+            plain = int(plain_size)
+            packed = int(packed_size)
+        except Exception:
+            return None
+        if plain <= 0 or packed < 0:
+            return None
+        return ((float(plain) - float(packed)) / float(plain)) * 100.0
+
+    def normalize_compression_name(raw_name: Optional[str]) -> Optional[str]:
+        name = str(raw_name or "").strip()
+        low = name.lower()
+        if not name or low in ("none", "n/a", "-", "null"):
+            return None
+        aliases = {
+            "mc": "MC",
+            "mc_byte_dict": "BYTE_DICT",
+            "mc_fixed_bits": "FIXED_BITS",
+            "mc_deflate": "DEFLATE",
+            "mc_zlib": "ZLIB",
+            "mc_bz2": "BZ2",
+            "mc_lzma": "LZMA",
+            "mc_unknown": "MC",
+            "deflate": "DEFLATE",
+            "zlib": "ZLIB",
+            "bz2": "BZ2",
+            "lzma": "LZMA",
+        }
+        return aliases.get(low, name)
+
+    def queue_message(peer_norm: str, text: str) -> Optional[tuple[str, int, Optional[str], Optional[float]]]:
         nonlocal last_activity_ts
         peer_norm = norm_id_for_filename(peer_norm)
         st = get_peer_state(peer_norm)
@@ -1375,6 +1568,7 @@ def main() -> int:
         use_compact_wire = False
         compression_flag = 0
         cmp_label = "none"
+        cmp_eff_pct: Optional[float] = None
         try:
             selected_mode = int(compression_mode)
         except Exception:
@@ -1423,6 +1617,7 @@ def main() -> int:
                 use_compact_wire = True
                 compression_flag = 1
                 cmp_label = mode_name(int(best_mode))
+                cmp_eff_pct = compression_efficiency_pct(len(text_bytes), len(best_blob))
         if use_compact_wire:
             max_chunk = max(1, max_plain - MSG_V2_HEADER_LEN)
             chunks_bytes = split_bytes(payload_blob, max_chunk)
@@ -1471,6 +1666,7 @@ def main() -> int:
                     "use_compact": bool(use_compact_wire),
                     "compression": compression_flag,
                     "cmp": cmp_label,
+                    "cmp_eff_pct": cmp_eff_pct,
                     "created": created,
                     "attempts": 0,
                     "last_send": 0.0,
@@ -1491,7 +1687,7 @@ def main() -> int:
             print(f"WAITING KEY: queued for {peer_norm} id={group_id}")
         ui_emit("queued", (peer_norm, text))
         tracked_peers.add(peer_norm)
-        return (group_id, total)
+        return (group_id, total, normalize_compression_name(cmp_label), cmp_eff_pct)
 
     global_last_send_ts = 0.0
 
@@ -1612,7 +1808,7 @@ def main() -> int:
                     append_history("drop", peer_norm, rec["id"], text, "too_long")
                     ui_emit("log", f"{ts_local()} DROP: {rec['id']} too long for {peer_norm}")
                     ui_emit("failed", (peer_norm, str(rec.get("group") or rec.get("id") or rec["id"]), "too_long", int(rec.get("attempts", 0)), int(rec.get("total", 1) or 1)))
-                    return
+                    continue
 
                 if not st.aes:
                     return
@@ -1634,7 +1830,7 @@ def main() -> int:
                     append_history("drop", peer_norm, rec["id"], text, "payload_too_big")
                     ui_emit("log", f"{ts_local()} DROP: {rec['id']} payload too big for {peer_norm}")
                     ui_emit("failed", (peer_norm, str(rec.get("group") or rec.get("id") or rec["id"]), "payload_too_big", int(rec.get("attempts", 0)), int(rec.get("total", 1) or 1)))
-                    return
+                    continue
 
                 try:
                     interface.sendData(
@@ -1844,6 +2040,10 @@ def main() -> int:
                 "compression_mode_lzma": "LZMA",
                 "compression_min_gain": "Min gain, bytes",
                 "compression_min_gain_hint": "All modes are compared; selected mode is preferred on tie. Use compression only if payload becomes smaller by at least this many bytes",
+                "full_reset": "Full reset",
+                "full_reset_confirm": "Delete all profile settings, history, pending state and keys for '{name}'?\n\nThis action cannot be undone.",
+                "full_reset_done": "Profile data and keys were reset.",
+                "full_reset_unavailable": "Full reset is available after node/profile initialization.",
                 "copy_log": "Copy log",
                 "clear_log": "Clear log",
                 "about_author": "Author",
@@ -1916,6 +2116,10 @@ def main() -> int:
                 "compression_mode_lzma": "LZMA",
                 "compression_min_gain": "Мин выигрыш, байт",
                 "compression_min_gain_hint": "Сравниваются все режимы; выбранный режим имеет приоритет при равенстве. Сжатие применяется только если payload становится меньше минимум на это число байт",
+                "full_reset": "Полный сброс",
+                "full_reset_confirm": "Удалить все настройки профиля, историю, очередь и ключи для '{name}'?\n\nДействие необратимо.",
+                "full_reset_done": "Данные профиля и ключи сброшены.",
+                "full_reset_unavailable": "Полный сброс доступен после инициализации ноды/профиля.",
                 "copy_log": "Копировать лог",
                 "clear_log": "Очистить лог",
                 "about_author": "Автор",
@@ -2129,6 +2333,7 @@ def main() -> int:
             QMenu::item { padding: 6px 14px; color: #eeeeec; }
             QMenu::item:selected { background: #ff9800; color: #2b0a22; }
             QLabel#muted { color: #c0b7c2; }
+            QLabel#hint { color: #bcaec0; font-size: 10px; }
             QLabel#section { color: #c0b7c2; font-size: 13px; font-weight: 400; }
             QWidget#headerBar { background: #c24f00; }
             QWidget#headerBar QLabel { background: #c24f00; font-weight: 600; color: #2b0a22; }
@@ -2244,7 +2449,8 @@ def main() -> int:
             runtime_layout.addRow(tr("rate"), rate_edit)
             left_panel.addWidget(runtime_group)
             restart_label = QtWidgets.QLabel(tr("settings_restart"))
-            restart_label.setObjectName("muted")
+            restart_label.setObjectName("hint")
+            restart_label.setWordWrap(True)
             left_panel.addWidget(restart_label)
             lang_label = QtWidgets.QLabel(tr("language"))
             right_panel.addWidget(lang_label)
@@ -2315,7 +2521,8 @@ def main() -> int:
             gain_edit.setToolTip(tr("compression_min_gain_hint"))
             right_panel.addLayout(compression_form)
             gain_hint = QtWidgets.QLabel(tr("compression_min_gain_hint"))
-            gain_hint.setObjectName("muted")
+            gain_hint.setObjectName("hint")
+            gain_hint.setWordWrap(True)
             right_panel.addWidget(gain_hint)
 
             top_row.addLayout(left_panel, 1)
@@ -2346,6 +2553,16 @@ def main() -> int:
             )
             author_label.setObjectName("muted")
             layout.addWidget(author_label)
+            danger_row = QtWidgets.QHBoxLayout()
+            danger_row.setContentsMargins(0, 0, 0, 0)
+            danger_row.addStretch(1)
+            btn_full_reset = QtWidgets.QPushButton(tr("full_reset"))
+            btn_full_reset.setStyleSheet(
+                "QPushButton { background:#8f1d1d; border:1px solid #c85a5a; color:#ffecec; font-weight:600; }"
+                "QPushButton:hover { background:#a82424; }"
+            )
+            danger_row.addWidget(btn_full_reset)
+            layout.addLayout(danger_row)
             buttons = QtWidgets.QDialogButtonBox(
                 QtWidgets.QDialogButtonBox.Ok
                 | QtWidgets.QDialogButtonBox.Cancel
@@ -2442,6 +2659,96 @@ def main() -> int:
                             f.write("")
                 except Exception:
                     pass
+            def on_full_reset():
+                nonlocal current_lang, verbose_log, runtime_log_file
+                nonlocal discovery_send, discovery_reply, clear_pending_on_switch
+                nonlocal compression_enabled, compression_mode, min_gain_bytes
+                if not self_id or not priv_path or not pub_path:
+                    QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_unavailable"))
+                    return
+                name = norm_id_for_wire(self_id)
+                reply = QtWidgets.QMessageBox.warning(
+                    win,
+                    "meshTalk",
+                    tr("full_reset_confirm").format(name=name),
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
+                import shutil
+                # Clear in-memory profile state first so UI immediately reflects reset.
+                with pending_lock:
+                    pending_by_peer.clear()
+                incoming_state.clear()
+                with seen_lock:
+                    seen_msgs.clear()
+                    seen_parts.clear()
+                key_response_last_ts.clear()
+                tracked_peers.clear()
+                known_peers.clear()
+                peer_states.clear()
+                peer_names.clear()
+                dialogs.clear()
+                chat_history.clear()
+                list_index.clear()
+                groups.clear()
+                pinned_dialogs.clear()
+                hidden_contacts.clear()
+                cfg.clear()
+                log_buffer.clear()
+                if settings_log_view is not None:
+                    settings_log_view.clear()
+                # Delete persisted profile files.
+                for path in (CONFIG_FILE, STATE_FILE, HISTORY_FILE, INCOMING_FILE, RUNTIME_LOG_FILE):
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                    except Exception:
+                        pass
+                try:
+                    if os.path.isdir(keydir):
+                        shutil.rmtree(keydir, ignore_errors=True)
+                except Exception:
+                    pass
+                try:
+                    os.makedirs(keydir, exist_ok=True)
+                except Exception:
+                    pass
+                # Reset runtime options to defaults.
+                current_lang = "ru"
+                verbose_log = True
+                runtime_log_file = True
+                discovery_send = True
+                discovery_reply = True
+                clear_pending_on_switch = True
+                compression_enabled = True
+                compression_mode = MODE_BYTE_DICT
+                min_gain_bytes = 2
+                global RUNTIME_LOG_ENABLED
+                RUNTIME_LOG_ENABLED = True
+                try:
+                    args.retry_seconds = 30
+                    args.max_seconds = 3600
+                    args.max_bytes = 200
+                    args.rate_seconds = 30
+                except Exception:
+                    pass
+                # Recreate local keypair for current profile.
+                regenerate_keys()
+                try:
+                    search_field.clear()
+                    msg_entry.clear()
+                    chat_text.clear()
+                    items_list.clear()
+                except Exception:
+                    pass
+                apply_language()
+                select_dialog(None)
+                refresh_list()
+                log_line(f"{ts_local()} RESET: full profile reset completed", "warn")
+                QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_done"))
+                dlg.accept()
             buttons.accepted.connect(on_accept)
             buttons.rejected.connect(dlg.reject)
             btn_apply = buttons.button(QtWidgets.QDialogButtonBox.Apply)
@@ -2449,6 +2756,7 @@ def main() -> int:
                 btn_apply.clicked.connect(on_apply)
             btn_copy.clicked.connect(on_copy)
             btn_clear.clicked.connect(on_clear)
+            btn_full_reset.clicked.connect(on_full_reset)
             dlg.exec()
             settings_log_view = None
 
@@ -2615,35 +2923,6 @@ def main() -> int:
             row_index: int,
             meta: str = "",
         ) -> None:
-            def clamp_text(text_in: str) -> str:
-                vp = view.viewport()
-                width = max(1, vp.width() - 60)
-                height = max(1, vp.height())
-                fm = QtGui.QFontMetrics(view.font())
-                char_w = max(1, fm.averageCharWidth())
-                max_cols = max(10, int(width // char_w))
-                line_h = max(1, fm.lineSpacing())
-                max_lines = max(1, int((height * 0.33) // line_h))
-                lines: list[str] = []
-                for para in text_in.splitlines():
-                    if para == "":
-                        lines.append("")
-                        continue
-                    while len(para) > max_cols:
-                        lines.append(para[:max_cols])
-                        para = para[max_cols:]
-                    lines.append(para)
-                if len(lines) <= max_lines:
-                    return text_in
-                lines = lines[:max_lines]
-                last = lines[-1]
-                if last:
-                    last = (last[:-1] + "…") if len(last) > 1 else "…"
-                else:
-                    last = "…"
-                lines[-1] = last
-                return "\n".join(lines)
-
             icon = avatar_data_uri(peer_id, 36)
             bg, tx = color_pair_for_message(peer_id)
             if " " in text and len(text) >= 6:
@@ -2652,7 +2931,6 @@ def main() -> int:
             else:
                 ts = ""
                 msg = text
-            msg = clamp_text(msg)
             ts_html = ""
             if meta:
                 meta_l = meta.lower().strip()
@@ -2835,6 +3113,8 @@ def main() -> int:
                             received_at_ts=as_float(meta_data.get("received_at_ts")),
                             sent_at_ts=as_float(meta_data.get("sent_at_ts")),
                             incoming_started_ts=as_float(meta_data.get("incoming_started_ts")),
+                            compression_name=(str(meta_data.get("compression_name", "") or "") or None),
+                            compression_eff_pct=as_float(meta_data.get("compression_eff_pct")),
                         )
                         entry["meta"] = meta
                     append_chat_entry(chat_text, text, peer_id, direction == "out", idx, meta=meta)
@@ -3047,6 +3327,36 @@ def main() -> int:
             update_dialog(f"group:{group_name}", "group updated")
             refresh_list()
 
+        def rewrite_history_dialog_entries(old_dialog_id: str, new_dialog_id: Optional[str] = None) -> None:
+            if not old_dialog_id:
+                return
+            if not os.path.isfile(HISTORY_FILE):
+                return
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except Exception:
+                return
+            out: list[str] = []
+            for line in lines:
+                raw = line.rstrip("\n")
+                parts = raw.split(" | ", 3)
+                if len(parts) < 4:
+                    out.append(line)
+                    continue
+                ts_part, direction, peer_raw, rest = parts
+                if peer_raw != old_dialog_id:
+                    out.append(line)
+                    continue
+                if new_dialog_id is None:
+                    continue
+                out.append(f"{ts_part} | {direction} | {new_dialog_id} | {rest}\n")
+            try:
+                with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(out)
+            except Exception:
+                return
+
         def rename_group(group_id: str) -> None:
             old_name = group_id[6:]
             if old_name not in groups:
@@ -3070,6 +3380,7 @@ def main() -> int:
             if old_id in pinned_dialogs:
                 pinned_dialogs.discard(old_id)
                 pinned_dialogs.add(new_id)
+            rewrite_history_dialog_entries(old_id, new_id)
             if current_dialog == old_id:
                 select_dialog(new_id)
             save_gui_config()
@@ -3082,6 +3393,7 @@ def main() -> int:
             dialogs.pop(group_id, None)
             chat_history.pop(group_id, None)
             pinned_dialogs.discard(group_id)
+            rewrite_history_dialog_entries(group_id, None)
             if current_dialog == group_id:
                 select_dialog(None)
             save_gui_config()
@@ -3232,6 +3544,144 @@ def main() -> int:
                     return True
             return False
 
+        def restore_outgoing_state() -> None:
+            for peer_norm, peer_pending in list(pending_by_peer.items()):
+                if not peer_norm or not isinstance(peer_pending, dict):
+                    continue
+                grouped: Dict[str, Dict[str, object]] = {}
+                for rec in peer_pending.values():
+                    if not isinstance(rec, dict):
+                        continue
+                    group_id = str(rec.get("group") or rec.get("id") or "").strip()
+                    if not group_id:
+                        continue
+                    grouped_rec = grouped.setdefault(
+                        group_id,
+                        {
+                            "text": "",
+                            "total": 1,
+                            "parts": set(),
+                            "attempts": 0,
+                            "created": 0.0,
+                            "compression_name": None,
+                            "compression_eff_pct": None,
+                            "compressed_size": 0,
+                        },
+                    )
+                    text = str(rec.get("text", ""))
+                    if text and not grouped_rec.get("text"):
+                        grouped_rec["text"] = text
+                    try:
+                        total_now = int(rec.get("total", 1) or 1)
+                    except Exception:
+                        total_now = 1
+                    grouped_rec["total"] = max(int(grouped_rec.get("total", 1) or 1), max(1, total_now))
+                    try:
+                        part_now = int(rec.get("part", 0) or 0)
+                    except Exception:
+                        part_now = 0
+                    if part_now > 0:
+                        try:
+                            grouped_rec["parts"].add(part_now)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    try:
+                        attempts_now = int(rec.get("attempts", 0) or 0)
+                    except Exception:
+                        attempts_now = 0
+                    grouped_rec["attempts"] = max(int(grouped_rec.get("attempts", 0) or 0), max(0, attempts_now))
+                    try:
+                        created_now = float(rec.get("created", 0.0) or 0.0)
+                    except Exception:
+                        created_now = 0.0
+                    if created_now > 0.0:
+                        created_prev = float(grouped_rec.get("created", 0.0) or 0.0)
+                        if (created_prev <= 0.0) or (created_now < created_prev):
+                            grouped_rec["created"] = created_now
+                    if int(rec.get("compression", 0) or 0) == 1:
+                        cmp_name_now = normalize_compression_name(str(rec.get("cmp", "") or ""))
+                        if cmp_name_now and not grouped_rec.get("compression_name"):
+                            grouped_rec["compression_name"] = cmp_name_now
+                        try:
+                            eff_now = float(rec.get("cmp_eff_pct"))
+                        except Exception:
+                            eff_now = None
+                        if eff_now is not None and grouped_rec.get("compression_eff_pct") is None:
+                            grouped_rec["compression_eff_pct"] = eff_now
+                        chunk_b64 = str(rec.get("chunk_b64", "") or "")
+                        if chunk_b64:
+                            try:
+                                grouped_rec["compressed_size"] = int(grouped_rec.get("compressed_size", 0) or 0) + len(
+                                    b64d(chunk_b64)
+                                )
+                            except Exception:
+                                pass
+
+                for group_id, grouped_rec in grouped.items():
+                    if history_has_msg(peer_norm, group_id):
+                        continue
+                    text = str(grouped_rec.get("text", ""))
+                    if not text:
+                        continue
+                    total = max(1, int(grouped_rec.get("total", 1) or 1))
+                    try:
+                        pending_parts = len(grouped_rec.get("parts") or set())
+                    except Exception:
+                        pending_parts = total
+                    pending_parts = max(1, pending_parts)
+                    done_parts = max(0, min(total, total - pending_parts))
+                    attempts_raw = int(grouped_rec.get("attempts", 0) or 0)
+                    attempts_val = float(attempts_raw) if attempts_raw > 0 else 0.0
+                    sent_at_raw = float(grouped_rec.get("created", 0.0) or 0.0)
+                    sent_at_ts = sent_at_raw if sent_at_raw > 0.0 else None
+                    packets = (done_parts, total)
+                    compression_name = normalize_compression_name(
+                        str(grouped_rec.get("compression_name", "") or "")
+                    )
+                    compression_eff_pct = None
+                    try:
+                        raw_eff = grouped_rec.get("compression_eff_pct")
+                        if raw_eff is not None:
+                            compression_eff_pct = float(raw_eff)
+                    except Exception:
+                        compression_eff_pct = None
+                    if compression_name and compression_eff_pct is None and pending_parts >= total:
+                        compressed_size = int(grouped_rec.get("compressed_size", 0) or 0)
+                        if compressed_size > 0:
+                            compression_eff_pct = compression_efficiency_pct(len(text.encode("utf-8")), compressed_size)
+                    meta_data_out: Dict[str, object] = {
+                        "delivery": None,
+                        "attempts": attempts_val,
+                        "forward_hops": None,
+                        "ack_hops": None,
+                        "packets": packets,
+                        "incoming": False,
+                        "done": False,
+                        "compression_name": compression_name,
+                        "compression_eff_pct": compression_eff_pct,
+                    }
+                    if sent_at_ts is not None:
+                        meta_data_out["sent_at_ts"] = sent_at_ts
+                    meta = format_meta(
+                        None,
+                        attempts_val,
+                        None,
+                        None,
+                        packets,
+                        sent_at_ts=sent_at_ts,
+                        compression_name=compression_name,
+                        compression_eff_pct=compression_eff_pct,
+                    )
+                    chat_line(
+                        peer_norm,
+                        text,
+                        "#a6e22e",
+                        outgoing=True,
+                        msg_id=group_id,
+                        meta=meta,
+                        meta_data=meta_data_out,
+                    )
+
         def assemble_incoming_text(
             parts: object,
             total: int,
@@ -3291,6 +3741,25 @@ def main() -> int:
                     avg_attempts = float(rec.get("attempts_sum", 0.0)) / float(rec.get("attempts_n", 1))
                 done_now = (len(parts) >= total)
                 status = "decode_error" if (done_now and not decode_ok) else None
+                cmp_raw = effective_payload_cmp_label(
+                    rec.get("payload_cmp"),
+                    compact_wire=compact,
+                    compression_flag=int(compression or 0),
+                    legacy_codec=legacy_codec,
+                    parts=parts,
+                )
+                compression_name = normalize_compression_name(cmp_raw)
+                compression_eff_pct = None
+                if compression_name and compact and done_now and decode_ok:
+                    compressed_size = 0
+                    for part_payload in parts.values():
+                        try:
+                            compressed_size += len(b64d(str(part_payload)))
+                        except Exception:
+                            compressed_size = 0
+                            break
+                    if compressed_size > 0:
+                        compression_eff_pct = compression_efficiency_pct(len(full.encode("utf-8")), compressed_size)
                 received_at_ts = None
                 if done_now:
                     raw_received = float(rec.get("received_at_ts", 0.0) or 0.0)
@@ -3310,30 +3779,35 @@ def main() -> int:
                     done=done_now,
                     received_at_ts=received_at_ts,
                     incoming_started_ts=incoming_started_ts,
+                    compression_name=compression_name,
+                    compression_eff_pct=compression_eff_pct,
                 )
+                meta_data_in: Dict[str, object] = {
+                    "delivery": rec.get("delivery"),
+                    "attempts": avg_attempts,
+                    "forward_hops": avg_hops,
+                    "ack_hops": None,
+                    "packets": (len(parts), total),
+                    "status": status,
+                    "incoming": True,
+                    "done": done_now,
+                    "received_at_ts": received_at_ts,
+                    "incoming_started_ts": incoming_started_ts,
+                    "compression_name": compression_name,
+                    "compression_eff_pct": compression_eff_pct,
+                }
                 chat_line(
                     peer_norm,
                     full,
                     "#66d9ef",
                     meta=meta,
-                    meta_data={
-                        "delivery": rec.get("delivery"),
-                        "attempts": avg_attempts,
-                        "forward_hops": avg_hops,
-                        "ack_hops": None,
-                        "packets": (len(parts), total),
-                        "status": status,
-                        "incoming": True,
-                        "done": done_now,
-                        "received_at_ts": received_at_ts,
-                        "incoming_started_ts": incoming_started_ts,
-                    },
+                    meta_data=meta_data_in,
                     msg_id=group_id,
                     replace_msg_id=group_id,
                 )
                 if done_now:
                     if decode_ok:
-                        append_history("recv", peer_norm, group_id, full)
+                        append_history("recv", peer_norm, group_id, full, meta_data=meta_data_in)
                     else:
                         append_history("recv_error", peer_norm, group_id, "[decode error]", "compressed_payload_decode_failed")
                     incoming_state.pop(key, None)
@@ -3400,6 +3874,8 @@ def main() -> int:
             received_at_ts: Optional[float] = None,
             sent_at_ts: Optional[float] = None,
             incoming_started_ts: Optional[float] = None,
+            compression_name: Optional[str] = None,
+            compression_eff_pct: Optional[float] = None,
         ) -> str:
             return format_meta_text(
                 current_lang,
@@ -3416,6 +3892,8 @@ def main() -> int:
                 received_at_ts=received_at_ts,
                 sent_at_ts=sent_at_ts,
                 incoming_started_ts=incoming_started_ts,
+                compression_name=compression_name,
+                compression_eff_pct=compression_eff_pct,
             )
 
         def update_sent_delivery(
@@ -3455,6 +3933,8 @@ def main() -> int:
                     if int(done_now) >= int(total_now):
                         delivered_at_ts = time.time()
                 sent_at_ts = None
+                compression_name = None
+                compression_eff_pct = None
                 old_meta_data = entry.get("meta_data")
                 if isinstance(old_meta_data, dict):
                     try:
@@ -3463,6 +3943,13 @@ def main() -> int:
                         raw_sent = 0.0
                     if raw_sent > 0.0:
                         sent_at_ts = raw_sent
+                    compression_name = normalize_compression_name(str(old_meta_data.get("compression_name", "") or ""))
+                    try:
+                        raw_eff = old_meta_data.get("compression_eff_pct")
+                        if raw_eff is not None:
+                            compression_eff_pct = float(raw_eff)
+                    except Exception:
+                        compression_eff_pct = None
                 entry["meta"] = format_meta(
                     delivery,
                     attempts,
@@ -3474,6 +3961,8 @@ def main() -> int:
                     done=(delivered_at_ts is not None),
                     row_time_hhmm=ts,
                     sent_at_ts=sent_at_ts,
+                    compression_name=compression_name,
+                    compression_eff_pct=compression_eff_pct,
                 )
                 meta_data_out: Dict[str, object] = {
                     "delivery": delivery,
@@ -3482,6 +3971,8 @@ def main() -> int:
                     "ack_hops": ack_hops,
                     "incoming": False,
                     "done": (delivered_at_ts is not None),
+                    "compression_name": compression_name,
+                    "compression_eff_pct": compression_eff_pct,
                 }
                 if packets is not None:
                     meta_data_out["packets"] = (int(packets[0]), int(packets[1]))
@@ -3500,7 +3991,7 @@ def main() -> int:
                 if packets is not None:
                     done, total = packets
                     if int(done) >= int(total) and not entry.get("logged"):
-                        append_history("sent", dialog_id, msg_id, msg)
+                        append_history("sent", dialog_id, msg_id, msg, meta_data=meta_data_out)
                         entry["logged"] = True
                 return
 
@@ -3534,6 +4025,8 @@ def main() -> int:
                     if end != -1:
                         msg = msg[end + 2 :]
                 sent_at_ts = None
+                compression_name = None
+                compression_eff_pct = None
                 old_meta_data = entry.get("meta_data")
                 if isinstance(old_meta_data, dict):
                     try:
@@ -3542,6 +4035,13 @@ def main() -> int:
                         raw_sent = 0.0
                     if raw_sent > 0.0:
                         sent_at_ts = raw_sent
+                    compression_name = normalize_compression_name(str(old_meta_data.get("compression_name", "") or ""))
+                    try:
+                        raw_eff = old_meta_data.get("compression_eff_pct")
+                        if raw_eff is not None:
+                            compression_eff_pct = float(raw_eff)
+                    except Exception:
+                        compression_eff_pct = None
                 entry["meta"] = format_meta(
                     None,
                     float(attempts),
@@ -3550,6 +4050,8 @@ def main() -> int:
                     (0, int(max(1, total))),
                     status=reason,
                     sent_at_ts=sent_at_ts,
+                    compression_name=compression_name,
+                    compression_eff_pct=compression_eff_pct,
                 )
                 entry["meta_data"] = {
                     "delivery": None,
@@ -3560,6 +4062,8 @@ def main() -> int:
                     "status": reason,
                     "incoming": False,
                     "done": False,
+                    "compression_name": compression_name,
+                    "compression_eff_pct": compression_eff_pct,
                 }
                 if sent_at_ts is not None:
                     entry["meta_data"]["sent_at_ts"] = sent_at_ts
@@ -3598,7 +4102,7 @@ def main() -> int:
             res = queue_message(current_dialog, text)
             if res is None:
                 return
-            group_id, total = res
+            group_id, total, cmp_name, cmp_eff_pct = res
             sent_at_ts = time.time()
             chat_line(
                 current_dialog,
@@ -3606,7 +4110,16 @@ def main() -> int:
                 "#a6e22e",
                 outgoing=True,
                 msg_id=group_id,
-                meta=format_meta(None, 0, None, None, (0, total), sent_at_ts=sent_at_ts),
+                meta=format_meta(
+                    None,
+                    0,
+                    None,
+                    None,
+                    (0, total),
+                    sent_at_ts=sent_at_ts,
+                    compression_name=cmp_name,
+                    compression_eff_pct=cmp_eff_pct,
+                ),
                 meta_data={
                     "delivery": None,
                     "attempts": 0,
@@ -3616,6 +4129,8 @@ def main() -> int:
                     "incoming": False,
                     "done": False,
                     "sent_at_ts": sent_at_ts,
+                    "compression_name": cmp_name,
+                    "compression_eff_pct": cmp_eff_pct,
                 },
             )
 
@@ -3687,10 +4202,10 @@ def main() -> int:
                 return
             seen_ids: set[tuple[str, str, str, str]] = set()
             for line in lines:
-                parsed = parse_history_line(line, strict_encoded=True)
+                parsed = parse_history_record_line(line)
                 if parsed is None:
                     continue
-                ts_part, direction, peer_id, msg_id, text = parsed
+                ts_part, direction, peer_id, msg_id, text, meta_data = parsed
                 if direction not in ("recv", "sent"):
                     continue
                 peer_norm = norm_id_for_filename(peer_id)
@@ -3707,6 +4222,8 @@ def main() -> int:
                 entry = {"text": f"{time_only} {text}", "dir": dir_flag}
                 if msg_id:
                     entry["msg_id"] = msg_id
+                if isinstance(meta_data, dict):
+                    entry["meta_data"] = dict(meta_data)
                 chat_history.setdefault(dialog_id, []).append(entry)
                 update_dialog(dialog_id, text, recv=(dir_flag == "in"))
 
@@ -3807,6 +4324,7 @@ def main() -> int:
                     last_loaded_profile = self_id or None
                     incoming_state = load_incoming_state()
                     load_history()
+                    restore_outgoing_state()
                     restore_incoming_state()
                     apply_language()
                     refresh_list()
@@ -3886,6 +4404,13 @@ def main() -> int:
                             "compact": bool(compact_wire),
                             "compression": int(compression_flag or 0),
                             "legacy_codec": (str(legacy_codec) if legacy_codec else None),
+                            "payload_cmp": effective_payload_cmp_label(
+                                payload_cmp,
+                                compact_wire=bool(compact_wire),
+                                compression_flag=int(compression_flag or 0),
+                                legacy_codec=legacy_codec,
+                                chunk_b64=(str(chunk_b64) if chunk_b64 is not None else None),
+                            ),
                             "incoming_started_ts": recv_now_ts,
                         }
                         if not rec.get("incoming_started_ts"):
@@ -3911,6 +4436,14 @@ def main() -> int:
                             rec["parts"][part_key] = str(chunk_b64 or "")
                         else:
                             rec["parts"][part_key] = str(text)
+                        rec["payload_cmp"] = effective_payload_cmp_label(
+                            payload_cmp,
+                            compact_wire=bool(rec.get("compact", False)),
+                            compression_flag=int(rec.get("compression", 0) or 0),
+                            legacy_codec=rec.get("legacy_codec"),
+                            parts=rec.get("parts"),
+                            chunk_b64=(str(chunk_b64) if chunk_b64 is not None else None),
+                        )
                         rec["last_part"] = int(part)
                         incoming_state[key] = rec
                         save_incoming_state(incoming_state)
@@ -3930,6 +4463,28 @@ def main() -> int:
                             avg_attempts = float(rec.get("attempts_sum", 0.0)) / float(rec.get("attempts_n", 1))
                         done_now = (len(rec["parts"]) >= int(total))
                         status = "decode_error" if (done_now and not decode_ok) else None
+                        cmp_raw = effective_payload_cmp_label(
+                            rec.get("payload_cmp"),
+                            compact_wire=bool(rec.get("compact", False)),
+                            compression_flag=int(rec.get("compression", 0) or 0),
+                            legacy_codec=rec.get("legacy_codec"),
+                            parts=rec.get("parts"),
+                        )
+                        compression_name = normalize_compression_name(cmp_raw)
+                        compression_eff_pct = None
+                        if compression_name and bool(rec.get("compact", False)) and done_now and decode_ok:
+                            compressed_size = 0
+                            for part_payload in rec.get("parts", {}).values():
+                                try:
+                                    compressed_size += len(b64d(str(part_payload)))
+                                except Exception:
+                                    compressed_size = 0
+                                    break
+                            if compressed_size > 0:
+                                compression_eff_pct = compression_efficiency_pct(
+                                    len(full.encode("utf-8")),
+                                    compressed_size,
+                                )
                         rec_received_ts = None
                         if done_now:
                             try:
@@ -3954,30 +4509,35 @@ def main() -> int:
                             done=done_now,
                             received_at_ts=rec_received_ts,
                             incoming_started_ts=float(rec.get("incoming_started_ts", recv_now_ts) or recv_now_ts),
+                            compression_name=compression_name,
+                            compression_eff_pct=compression_eff_pct,
                         )
+                        meta_data_in: Dict[str, object] = {
+                            "delivery": rec.get("delivery"),
+                            "attempts": avg_attempts,
+                            "forward_hops": avg_hops,
+                            "ack_hops": None,
+                            "packets": (len(rec["parts"]), int(total)),
+                            "status": status,
+                            "incoming": True,
+                            "done": done_now,
+                            "received_at_ts": rec_received_ts,
+                            "incoming_started_ts": float(rec.get("incoming_started_ts", recv_now_ts) or recv_now_ts),
+                            "compression_name": compression_name,
+                            "compression_eff_pct": compression_eff_pct,
+                        }
                         chat_line(
                             peer_norm,
                             full,
                             "#66d9ef",
                             meta=meta,
-                            meta_data={
-                                "delivery": rec.get("delivery"),
-                                "attempts": avg_attempts,
-                                "forward_hops": avg_hops,
-                                "ack_hops": None,
-                                "packets": (len(rec["parts"]), int(total)),
-                                "status": status,
-                                "incoming": True,
-                                "done": done_now,
-                                "received_at_ts": rec_received_ts,
-                                "incoming_started_ts": float(rec.get("incoming_started_ts", recv_now_ts) or recv_now_ts),
-                            },
+                            meta_data=meta_data_in,
                             msg_id=group_id,
                             replace_msg_id=group_id,
                         )
                         if done_now:
                             if decode_ok:
-                                append_history("recv", peer_norm, group_id, full)
+                                append_history("recv", peer_norm, group_id, full, meta_data=meta_data_in)
                             else:
                                 append_history("recv_error", peer_norm, group_id, "[decode error]", "compressed_payload_decode_failed")
                             incoming_state.pop(key, None)
@@ -4107,21 +4667,7 @@ def main() -> int:
                 if dialog_id in dialogs:
                     dialogs[dialog_id]["last_text"] = ""
                     dialogs[dialog_id]["unread"] = 0
-                # Rewrite history log without this dialog
-                try:
-                    if os.path.isfile(HISTORY_FILE):
-                        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                            lines = f.readlines()
-                        keep: list[str] = []
-                        for line in lines:
-                            parts = line.rstrip("\n").split(" | ")
-                            if len(parts) >= 3 and parts[2] == dialog_id:
-                                continue
-                            keep.append(line)
-                        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                            f.writelines(keep)
-                except Exception:
-                    pass
+                rewrite_history_dialog_entries(dialog_id, None)
                 if current_dialog == dialog_id:
                     render_chat(dialog_id)
                 refresh_list()

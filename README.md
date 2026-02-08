@@ -164,20 +164,28 @@ Output: `dist\meshTalk.exe`
 
 ## File layout
 
-```
-meshTools/
-  meshLogger.py
-  nodeDbUpdater.py
-  graphGen.py
-  meshTalk.py
-  meshLogger/   # generated daily traceroute logs
-  graphGen/     # generated graphs (dot/svg/html/json)
-  meshLogger.db # generated SQLite DB
-  nodeDb.txt    # generated node DB (legacy)
-  keyRings/     # key files (<id>.key, <id>.pub)
-  <node_id>/    # per-node profile data
-               # config.json, state.json, incoming.json, history.log, runtime.log, keyRings/
-```
+### Project files (repository / source-controlled)
+
+- `meshLogger.py` — traceroute/logger utility.
+- `nodeDbUpdater.py` — legacy text DB updater.
+- `graphGen.py` — Graphviz + D3 generator.
+- `meshTalk.py` — encrypted messenger.
+- `meshtalk_utils.py` — shared helpers/parsers/formatters.
+- `message_text_compression.py` — text compression modes/codecs.
+- `requirements.txt` — Python dependencies.
+- `run_meshTalk.bat` / `build_meshTalk.bat` — Windows run/build scripts.
+- `README.md` / `CHANGELOG.md` / `meshTalk.txt` — docs.
+- `tests/` — unit tests.
+
+### Generated during runtime (not source code)
+
+- `meshLogger/` — generated daily traceroute logs.
+- `graphGen/` — generated graph output (`dot/svg/html/json`).
+- `meshLogger.db` — generated SQLite DB.
+- `nodeDb.txt` — generated node DB (legacy mode).
+- `keyRings/` — generated key files (`<id>.key`, `<id>.pub`).
+- `<node_id>/` — per-node runtime profile directory:
+  - `config.json`, `state.json`, `incoming.json`, `history.log`, `runtime.log`, `keyRings/`.
 
 ## Notes
 
@@ -362,20 +370,28 @@ build_meshTalk.bat
 
 ## Структура файлов
 
-```
-meshTools/
-  meshLogger.py
-  nodeDbUpdater.py
-  graphGen.py
-  meshTalk.py
-  meshLogger/   # сгенерированные ежедневные логи traceroute
-  graphGen/     # сгенерированные графы (dot/svg/html/json)
-  meshLogger.db # сгенерированная SQLite-база
-  nodeDb.txt    # сгенерированная база узлов (legacy)
-  keyRings/     # ключи (<id>.key, <id>.pub)
-  <node_id>/    # профиль конкретной ноды
-               # config.json, state.json, incoming.json, history.log, runtime.log, keyRings/
-```
+### Файлы проекта (в репозитории / исходники)
+
+- `meshLogger.py` — утилита traceroute/logger.
+- `nodeDbUpdater.py` — legacy-обновление текстовой БД.
+- `graphGen.py` — генерация Graphviz + D3.
+- `meshTalk.py` — шифрованный мессенджер.
+- `meshtalk_utils.py` — общие утилиты/парсеры/форматтеры.
+- `message_text_compression.py` — режимы/кодеки сжатия текста.
+- `requirements.txt` — Python-зависимости.
+- `run_meshTalk.bat` / `build_meshTalk.bat` — скрипты запуска/сборки для Windows.
+- `README.md` / `CHANGELOG.md` / `meshTalk.txt` — документация.
+- `tests/` — unit-тесты.
+
+### Генерируется во время работы (не исходники)
+
+- `meshLogger/` — сгенерированные ежедневные логи traceroute.
+- `graphGen/` — сгенерированные файлы графов (`dot/svg/html/json`).
+- `meshLogger.db` — сгенерированная SQLite-база.
+- `nodeDb.txt` — сгенерированная база узлов (legacy-режим).
+- `keyRings/` — сгенерированные ключи (`<id>.key`, `<id>.pub`).
+- `<node_id>/` — runtime-профиль конкретной ноды:
+  - `config.json`, `state.json`, `incoming.json`, `history.log`, `runtime.log`, `keyRings/`.
 
 ## Заметки
 
