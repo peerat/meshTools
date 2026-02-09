@@ -14,6 +14,12 @@ Small utilities around Meshtastic.
 - Disclaimer: software is provided "AS IS", without warranties of any kind.
 - Disclaimer: the author is not liable for any direct or indirect damage caused by use or misuse.
 
+## License
+
+- This project is licensed under Apache License 2.0 (`LICENSE`).
+- Attribution requirement: if you redistribute this project or derivative works, keep the `NOTICE` file and preserve attribution to Anton Vologzhanin (R3VAF).
+- If you do not want to comply with these terms, do not use or redistribute the code.
+
 ## Contents
 
 - `meshLogger.py` polls traceroute and writes daily logs to `meshLogger/`.
@@ -224,6 +230,12 @@ Output: `dist\meshTalk.exe`
 - Любая незаконная деятельность (включая террористическую, экстремистскую и преступную) прямо запрещена.
 - Отказ от ответственности: ПО предоставляется «как есть», без каких-либо гарантий.
 - Отказ от ответственности: автор не несет ответственности за любой прямой или косвенный ущерб от использования или неправильного использования.
+
+## Лицензия
+
+- Проект распространяется под Apache License 2.0 (`LICENSE`).
+- Требование атрибуции: при распространении проекта или производных работ сохраняйте файл `NOTICE` и упоминание автора Anton Vologzhanin (R3VAF).
+- Если вы не готовы выполнять эти условия, не используйте и не распространяйте код.
 
 ## Содержание
 

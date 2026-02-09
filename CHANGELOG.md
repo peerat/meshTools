@@ -8,6 +8,7 @@ Added
 - Key exchange confirmation retries until peer confirmation (`KR2`) or encrypted traffic is observed.
 - Optional compression profile IDs `NLTK`, `SPACY`, `TENSORFLOW` as wire-level mode aliases over built-in codecs.
 - `requirements-ml.txt` for optional NLP stack experiments.
+- Added Apache-2.0 licensing files: `LICENSE` and `NOTICE` with attribution guidance.
 
 Changed
 - Outgoing text-compression settings were removed from UI; mode selection is now fully automatic.
@@ -98,6 +99,7 @@ Removed
 - Повторы подтверждения обмена ключами до подтверждения от peer (`KR2`) или получения зашифрованного трафика.
 - Опциональные ID профилей сжатия `NLTK`, `SPACY`, `TENSORFLOW` как wire-level алиасы поверх встроенных кодеков.
 - `requirements-ml.txt` для опциональных NLP-экспериментов.
+- Добавлены файлы лицензирования Apache-2.0: `LICENSE` и `NOTICE` с указанием атрибуции.
 
 Изменено
 - Настройки сжатия исходящего текста убраны из UI; выбор режима теперь полностью автоматический.
