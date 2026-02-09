@@ -2,6 +2,24 @@
 
 ## EN
 
+### Unreleased
+
+Added
+- Key exchange confirmation retries until peer confirmation (`KR2`) or encrypted traffic is observed.
+- Optional compression profile IDs `NLTK`, `SPACY`, `TENSORFLOW` as wire-level mode aliases over built-in codecs.
+- `requirements-ml.txt` for optional NLP stack experiments.
+
+Changed
+- Outgoing text-compression settings were removed from UI; mode selection is now fully automatic.
+- Compression capability negotiation now advertises and accepts extended mode IDs.
+- Header click-to-copy logic for `Client ID` was fixed for centered/right-aligned text.
+- Documentation synchronized with implementation (USB/COM auto-detect, automatic compression, source-vs-generated file map).
+- `.gitignore` expanded for local runtime/test/archive artifacts.
+
+Removed
+- Compression preference controls from Settings.
+- Test utilities and local ZIP archives from tracked repository files (kept local via ignore rules).
+
 ### 0.3.1
 
 Added
@@ -73,6 +91,24 @@ Removed
 - Duplicate "attempt" lines from chat history view after restart.
 
 ## RU
+
+### Unreleased
+
+Добавлено
+- Повторы подтверждения обмена ключами до подтверждения от peer (`KR2`) или получения зашифрованного трафика.
+- Опциональные ID профилей сжатия `NLTK`, `SPACY`, `TENSORFLOW` как wire-level алиасы поверх встроенных кодеков.
+- `requirements-ml.txt` для опциональных NLP-экспериментов.
+
+Изменено
+- Настройки сжатия исходящего текста убраны из UI; выбор режима теперь полностью автоматический.
+- Обмен возможностями сжатия теперь объявляет и принимает расширенные ID режимов.
+- Исправлена логика клика для копирования `Client ID` в заголовке при центрированном/правом выравнивании.
+- Документация синхронизирована с реализацией (USB/COM auto-detect, автосжатие, карта исходников и генерируемых файлов).
+- Расширен `.gitignore` для локальных runtime/test/archive артефактов.
+
+Удалено
+- Элементы настроек приоритета сжатия из окна Settings.
+- Тестовые утилиты и локальные ZIP-архивы из отслеживаемых файлов репозитория (сохраняются локально по ignore-правилам).
 
 ### 0.3.1
 
