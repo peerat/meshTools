@@ -25,6 +25,8 @@ Main UI
 
 Initialization
 - GUI starts even if radio is not connected.
+- Radio connection is serial-over-USB (COM on Windows, `/dev/ttyUSB*`/`/dev/ttyACM*` on Linux).
+- Default port mode is `--port auto`: on startup the app scans serial ports and picks the best candidate automatically.
 - App waits for device, then auto-connects and loads profile data.
 - Settings/history are loaded only after node initialization.
 - Multipart receive state is resumed after restart.
@@ -42,7 +44,7 @@ Message status examples
 - Outgoing delivered:
   `sent at 10:18 delivered at 10:19 in 01:18, on the 1 attempt, hops there 0 back 0`
 - Outgoing delivered with compression:
-  `sent at 10:18 delivered at 10:19 in 01:18, on the 1 attempt, hops there 0 back 0, compression BYTE_DICT 42%`
+  `sent at 10:18 delivered at 10:19 in 01:18, on the 1 attempt, hops there 0 back 0, compression DEFLATE 42%`
 - Incoming multipart in progress:
   `started receive at 10:18 elapsed 00:15 parts 2/5 attempts 1, hops 1`
 - Incoming completed:
@@ -61,6 +63,9 @@ Settings
 - Default on first start: both ON.
 - Clear pending on profile switch.
 - Language, verbose events, runtime.log toggle.
+- Compression settings are hidden from UI and work automatically.
+- For outgoing messages the app compares `DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `NLTK`, `SPACY`, `TENSORFLOW` and applies compression only if payload becomes smaller.
+- `NLTK`/`SPACY`/`TENSORFLOW` are wire-level compression profile aliases; decode path stays dependency-free.
 - Hint labels in settings use a smaller font (`QLabel#hint`, 10px) to avoid looking like regular options.
 - `Full reset` button (red, with confirmation) removes profile config/state/history/incoming/runtime logs and key files, then regenerates local keys.
 
@@ -90,6 +95,7 @@ Project files (repository / source-controlled)
 - `run_meshTalk.bat`: Windows launcher.
 - `build_meshTalk.bat`: Windows single-file build helper.
 - `requirements.txt`: Python dependencies.
+- `requirements-ml.txt`: optional NLP-related dependencies for additional compression profiles.
 - `README.md`: project-level usage and options.
 - `meshTalk.txt`: focused meshTalk behavior reference.
 - `CHANGELOG.md`: changes between versions.
@@ -138,6 +144,8 @@ RU
 
 Инициализация
 - GUI запускается даже без подключенного радио.
+- Подключение к радио — через serial-over-USB (COM на Windows, `/dev/ttyUSB*`/`/dev/ttyACM*` на Linux).
+- Режим порта по умолчанию — `--port auto`: при старте приложение сканирует serial-порты и автоматически выбирает наиболее подходящий.
 - Приложение ждет устройство, затем подключается автоматически и грузит профиль.
 - Настройки/история загружаются только после инициализации ноды.
 - Состояние приема многопакетных сообщений восстанавливается после перезапуска.
@@ -155,7 +163,7 @@ RU
 - Исходящее доставлено:
   `отправлена в 10:18 доставлено в 10:19 за 01:18, с 1 попытки, хопы туда 0 обратно 0`
 - Исходящее доставлено со сжатием:
-  `отправлена в 10:18 доставлено в 10:19 за 01:18, с 1 попытки, хопы туда 0 обратно 0, сжатие BYTE_DICT 42%`
+  `отправлена в 10:18 доставлено в 10:19 за 01:18, с 1 попытки, хопы туда 0 обратно 0, сжатие DEFLATE 42%`
 - Входящее многопакетное в процессе:
   `в 10:18 начали прием, прошло 00:15 частей 2/5 с 1 попытки, хопов 1`
 - Входящее получено полностью:
@@ -174,6 +182,9 @@ RU
 - По умолчанию при первом запуске: обе ВКЛ.
 - Очистка очереди при смене профиля.
 - Язык, подробный лог, включение `runtime.log`.
+- Настройки сжатия скрыты из UI и работают автоматически.
+- Для исходящих сообщений приложение сравнивает `DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `NLTK`, `SPACY`, `TENSORFLOW` и применяет сжатие только если payload становится меньше.
+- `NLTK`/`SPACY`/`TENSORFLOW` это wire-level алиасы профилей сжатия; путь декодирования остается без обязательных внешних зависимостей.
 - Подсказки в настройках показываются меньшим шрифтом (`QLabel#hint`, 10px), чтобы не выглядеть как обычные опции.
 - Кнопка `Полный сброс` (красная, с подтверждением) удаляет конфиг/очереди/историю/incoming/runtime.log и ключи профиля, затем создает новую пару локальных ключей.
 
@@ -203,6 +214,7 @@ RU
 - `run_meshTalk.bat`: запуск на Windows.
 - `build_meshTalk.bat`: сборка single-file для Windows.
 - `requirements.txt`: Python-зависимости.
+- `requirements-ml.txt`: опциональные NLP-зависимости для дополнительных профилей сжатия.
 - `README.md`: общее использование проекта и параметры.
 - `meshTalk.txt`: целевая справка по поведению meshTalk.
 - `CHANGELOG.md`: изменения между версиями.

@@ -7,10 +7,26 @@ nodeDb*.txt
 nodes.txt
 meshLogger.db
 *.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 *.dot
 *.svg
 runtime.log
+config.json
+state.json
+history.log
+incoming.json
 [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/
+
+# Local archives and temp
+*.zip
+*.[Zz][Ii][Pp]
+tmp_review_meta/
+
+# Local test utilities
+tests/
 
 # Python artifacts
 __pycache__/

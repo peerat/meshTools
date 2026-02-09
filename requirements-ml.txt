@@ -1,0 +1,4 @@
+# Optional NLP stack for extended experiments/profiling.
+nltk
+spacy
+tensorflow

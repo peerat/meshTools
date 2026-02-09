@@ -21,6 +21,10 @@ MODE_DEFLATE = 2
 MODE_ZLIB = 3
 MODE_BZ2 = 4
 MODE_LZMA = 5
+# NLP profile mode ids are wire-level aliases; encode/decode stays dependency-free.
+MODE_NLTK = 6
+MODE_SPACY = 7
+MODE_TENSORFLOW = 8
 SUPPORTED_MODES = (
     MODE_BYTE_DICT,
     MODE_FIXED_BITS,
@@ -28,6 +32,9 @@ SUPPORTED_MODES = (
     MODE_ZLIB,
     MODE_BZ2,
     MODE_LZMA,
+    MODE_NLTK,
+    MODE_SPACY,
+    MODE_TENSORFLOW,
 )
 MODE_TO_NAME: Dict[int, str] = {
     MODE_BYTE_DICT: "mc_byte_dict",
@@ -36,6 +43,9 @@ MODE_TO_NAME: Dict[int, str] = {
     MODE_ZLIB: "mc_zlib",
     MODE_BZ2: "mc_bz2",
     MODE_LZMA: "mc_lzma",
+    MODE_NLTK: "mc_nltk",
+    MODE_SPACY: "mc_spacy",
+    MODE_TENSORFLOW: "mc_tensorflow",
 }
 
 FLAG_LOWERCASE_USED = 1 << 0
@@ -503,26 +513,26 @@ def _encode_fixed(tokens: Sequence[str]) -> bytes:
 def _encode_binary(text: str, mode: int, preserve_case: bool) -> bytes:
     source = text if preserve_case else text.lower()
     raw = source.encode("utf-8")
-    if mode == MODE_DEFLATE:
+    if mode in (MODE_DEFLATE, MODE_NLTK):
         cobj = zlib.compressobj(level=9, wbits=-15)
         return cobj.compress(raw) + cobj.flush()
-    if mode == MODE_ZLIB:
+    if mode in (MODE_ZLIB, MODE_SPACY):
         return zlib.compress(raw, level=9)
     if mode == MODE_BZ2:
         return bz2.compress(raw, compresslevel=9)
-    if mode == MODE_LZMA:
+    if mode in (MODE_LZMA, MODE_TENSORFLOW):
         return lzma.compress(raw, preset=9)
     raise CompressionError(f"unsupported binary compression mode: {mode}")
 
 
 def _decode_binary(data: bytes, mode: int) -> str:
-    if mode == MODE_DEFLATE:
+    if mode in (MODE_DEFLATE, MODE_NLTK):
         raw = zlib.decompress(data, wbits=-15)
-    elif mode == MODE_ZLIB:
+    elif mode in (MODE_ZLIB, MODE_SPACY):
         raw = zlib.decompress(data)
     elif mode == MODE_BZ2:
         raw = bz2.decompress(data)
-    elif mode == MODE_LZMA:
+    elif mode in (MODE_LZMA, MODE_TENSORFLOW):
         raw = lzma.decompress(data)
     else:
         raise CompressionFormatError(f"unsupported binary compression mode: {mode}")
@@ -595,7 +605,15 @@ def compress_text(text: str, mode: int = MODE_BYTE_DICT, preserve_case: bool = F
         data = _encode_byte_dict(tokens)
     elif mode == MODE_FIXED_BITS:
         data = _encode_fixed(tokens)
-    elif mode in (MODE_DEFLATE, MODE_ZLIB, MODE_BZ2, MODE_LZMA):
+    elif mode in (
+        MODE_DEFLATE,
+        MODE_ZLIB,
+        MODE_BZ2,
+        MODE_LZMA,
+        MODE_NLTK,
+        MODE_SPACY,
+        MODE_TENSORFLOW,
+    ):
         data = _encode_binary(text, mode, preserve_case=preserve_case)
     else:
         raise CompressionError(f"unsupported compression mode: {mode}")
@@ -637,7 +655,15 @@ def decompress_text(blob: bytes) -> str:
         tokens = _decode_byte_dict(data)
     elif mode == MODE_FIXED_BITS:
         tokens = _decode_fixed(data)
-    elif mode in (MODE_DEFLATE, MODE_ZLIB, MODE_BZ2, MODE_LZMA):
+    elif mode in (
+        MODE_DEFLATE,
+        MODE_ZLIB,
+        MODE_BZ2,
+        MODE_LZMA,
+        MODE_NLTK,
+        MODE_SPACY,
+        MODE_TENSORFLOW,
+    ):
         return _decode_binary(data, mode)
     else:
         raise CompressionFormatError(f"unsupported mode: {mode}")

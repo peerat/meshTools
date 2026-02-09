@@ -59,8 +59,10 @@ from message_text_compression import (
     MODE_BYTE_DICT,
     MODE_FIXED_BITS,
     MODE_LZMA,
+    MODE_NLTK,
+    MODE_SPACY,
+    MODE_TENSORFLOW,
     MODE_ZLIB,
-    SUPPORTED_MODES,
     compress_text,
     mode_name,
 )
@@ -80,6 +82,7 @@ MAX_PENDING_PER_PEER = 128
 RETRY_BACKOFF_MAX_SECONDS = 300.0
 RETRY_JITTER_RATIO = 0.25
 KEY_RESPONSE_MIN_INTERVAL_SECONDS = 300.0
+KEY_RESPONSE_RETRY_INTERVAL_SECONDS = 5.0
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_BASE_DIR = "meshTalk"
 DATA_DIR = BASE_DIR
@@ -91,8 +94,17 @@ RUNTIME_LOG_FILE = os.path.join(DATA_DIR, "runtime.log")
 keydir = os.path.join(DATA_DIR, "keyRings")
 runtime_log_lock = threading.Lock()
 RUNTIME_LOG_ENABLED = True
-COMPRESSION_MODES = tuple(int(m) for m in SUPPORTED_MODES)
-LEGACY_COMPRESSION_MODES = (int(MODE_BYTE_DICT), int(MODE_FIXED_BITS))
+COMPRESSION_MODES = (
+    int(MODE_DEFLATE),
+    int(MODE_ZLIB),
+    int(MODE_BZ2),
+    int(MODE_LZMA),
+    int(MODE_NLTK),
+    int(MODE_SPACY),
+    int(MODE_TENSORFLOW),
+)
+LEGACY_COMPRESSION_MODES = tuple(COMPRESSION_MODES)
+AUTO_MIN_GAIN_BYTES = 2
 HISTORY_META_PREFIX = "meta64:"
 HISTORY_META_MAX_BYTES = 8192
 
@@ -627,6 +639,7 @@ class PeerState:
         self.last_key_ok_ts = 0.0
         self.last_key_req_ts = 0.0
         self.next_key_refresh_ts = 0.0
+        self.await_key_confirm = False
 
     @property
     def key_ready(self) -> bool:
@@ -708,9 +721,6 @@ def main() -> int:
     discovery_enabled = True
     discovery_send = discovery_enabled
     discovery_reply = discovery_enabled
-    compression_enabled = True
-    compression_mode = MODE_BYTE_DICT
-    min_gain_bytes = 2
     ap = argparse.ArgumentParser(
         prog="meshTalk.py",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1048,16 +1058,29 @@ def main() -> int:
                     st.compression_capable = False
                     st.compression_modes = set(LEGACY_COMPRESSION_MODES)
             if st and st.key_ready and (key_changed or not had_key_ready):
-                ui_emit("log", f"{ts_local()} KEY: exchange complete with {peer_id}. Encryption active.")
-                st.force_key_req = False
-                st.next_key_req_ts = float("inf")
                 st.last_key_ok_ts = time.time()
+                if kind == "resp":
+                    ui_emit("log", f"{ts_local()} KEY: exchange complete with {peer_id}. Encryption active.")
+                    st.force_key_req = False
+                    st.await_key_confirm = False
+                    st.next_key_req_ts = float("inf")
+                else:
+                    # For unicast request, keep retrying until peer confirms receipt.
+                    if not is_broadcast:
+                        st.await_key_confirm = True
+                        st.next_key_req_ts = time.time() + max(1.0, float(args.retry_seconds))
             if kind == "req":
                 ui_emit("log", f"{ts_local()} KEY: request from {peer_id}")
                 now = time.time()
                 last_resp = float(key_response_last_ts.get(peer_norm, 0.0) or 0.0)
-                if (now - last_resp) < KEY_RESPONSE_MIN_INTERVAL_SECONDS:
-                    left_s = int(KEY_RESPONSE_MIN_INTERVAL_SECONDS - (now - last_resp))
+                retrying_confirm = bool(st and st.await_key_confirm and not is_broadcast)
+                min_reply_interval = (
+                    float(KEY_RESPONSE_RETRY_INTERVAL_SECONDS)
+                    if retrying_confirm
+                    else float(KEY_RESPONSE_MIN_INTERVAL_SECONDS)
+                )
+                if (now - last_resp) < min_reply_interval:
+                    left_s = int(max(0.0, min_reply_interval - (now - last_resp)))
                     ui_emit(
                         "log",
                         f"{ts_local()} KEY: request from {peer_id} suppressed (recent response, wait {left_s}s).",
@@ -1082,8 +1105,16 @@ def main() -> int:
                         )
                         key_response_last_ts[peer_norm] = now
                     ui_emit("log", f"{ts_local()} KEY: received request from {peer_id}, sent our public key.")
+                if st and not is_broadcast:
+                    st.await_key_confirm = True
+                    st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
             else:
                 ui_emit("log", f"{ts_local()} KEY: response from {peer_id}")
+                if st:
+                    st.force_key_req = False
+                    st.await_key_confirm = False
+                    st.next_key_req_ts = float("inf")
+                    st.last_key_ok_ts = time.time()
             ui_emit("peer_update", peer_norm)
             return
 
@@ -1128,6 +1159,13 @@ def main() -> int:
             return
         msg_hex = msg_id.hex()
         st.decrypt_fail_count = 0
+        if st.await_key_confirm:
+            st.await_key_confirm = False
+            st.force_key_req = False
+            st.next_key_req_ts = float("inf")
+            st.last_key_ok_ts = time.time()
+            if from_id:
+                ui_emit("log", f"{ts_local()} KEY: confirmed by encrypted traffic from {from_id}.")
 
         def build_ack_text(hops: Optional[int]) -> bytes:
             parts = ["ACK", "mc=1", f"mc_modes={','.join(str(m) for m in COMPRESSION_MODES)}"]
@@ -1266,6 +1304,9 @@ def main() -> int:
                         "mc_zlib": MODE_ZLIB,
                         "mc_bz2": MODE_BZ2,
                         "mc_lzma": MODE_LZMA,
+                        "mc_nltk": MODE_NLTK,
+                        "mc_spacy": MODE_SPACY,
+                        "mc_tensorflow": MODE_TENSORFLOW,
                     }
                     if payload_cmp in label_to_mode:
                         st.compression_modes.add(int(label_to_mode[payload_cmp]))
@@ -1441,7 +1482,7 @@ def main() -> int:
         for peer_norm in list(tracked_peers):
             send_key_request(peer_norm)
 
-    def send_key_request(peer_norm: str) -> None:
+    def send_key_request(peer_norm: str, require_confirm: bool = True) -> None:
         nonlocal last_activity_ts, last_key_sent_ts
         if not radio_ready or interface is None:
             return
@@ -1477,6 +1518,9 @@ def main() -> int:
         if st:
             st.last_key_req_ts = last_activity_ts
             st.next_key_refresh_ts = last_activity_ts + 3600.0 + random.uniform(0, 600)
+            if require_confirm:
+                st.await_key_confirm = True
+                st.next_key_req_ts = last_activity_ts + max(1.0, float(args.retry_seconds))
         ui_emit("log", f"{ts_local()} KEY: request sent to {dest_id}")
 
     def send_discovery_broadcast() -> None:
@@ -1545,11 +1589,17 @@ def main() -> int:
             "mc_zlib": "ZLIB",
             "mc_bz2": "BZ2",
             "mc_lzma": "LZMA",
+            "mc_nltk": "NLTK",
+            "mc_spacy": "SPACY",
+            "mc_tensorflow": "TENSORFLOW",
             "mc_unknown": "MC",
             "deflate": "DEFLATE",
             "zlib": "ZLIB",
             "bz2": "BZ2",
             "lzma": "LZMA",
+            "nltk": "NLTK",
+            "spacy": "SPACY",
+            "tensorflow": "TENSORFLOW",
         }
         return aliases.get(low, name)
 
@@ -1569,12 +1619,6 @@ def main() -> int:
         compression_flag = 0
         cmp_label = "none"
         cmp_eff_pct: Optional[float] = None
-        try:
-            selected_mode = int(compression_mode)
-        except Exception:
-            selected_mode = MODE_BYTE_DICT
-        if selected_mode not in COMPRESSION_MODES:
-            selected_mode = MODE_BYTE_DICT
         peer_supports_mc = bool(st.compression_capable)
         peer_supported_modes = sorted(
             {int(m) for m in getattr(st, "compression_modes", set()) if int(m) in COMPRESSION_MODES}
@@ -1593,15 +1637,10 @@ def main() -> int:
         ) <= max_plain
         chunks_bytes: list[bytes] = []
         chunks_text: list[str] = []
-        if compression_enabled and peer_supports_mc and (not plain_fits_one_packet):
+        if peer_supports_mc and (not plain_fits_one_packet):
             best_blob: Optional[bytes] = None
             best_mode: Optional[int] = None
-            if selected_mode not in peer_supported_modes:
-                selected_mode = int(peer_supported_modes[0])
-            mode_order = [selected_mode]
-            for mode_try in peer_supported_modes:
-                if mode_try != selected_mode:
-                    mode_order.append(mode_try)
+            mode_order = list(peer_supported_modes)
             for mode_try in mode_order:
                 if best_mode is not None and mode_try == best_mode:
                     continue
@@ -1612,7 +1651,7 @@ def main() -> int:
                 if (best_blob is None) or (len(candidate) < len(best_blob)):
                     best_blob = candidate
                     best_mode = mode_try
-            if best_blob is not None and len(best_blob) < (len(text_bytes) - int(min_gain_bytes)):
+            if best_blob is not None and len(best_blob) < (len(text_bytes) - int(AUTO_MIN_GAIN_BYTES)):
                 payload_blob = best_blob
                 use_compact_wire = True
                 compression_flag = 1
@@ -1886,10 +1925,13 @@ def main() -> int:
                     st = get_peer_state(peer_norm)
                     if not st:
                         continue
+                    if st.key_ready and st.await_key_confirm and now >= st.next_key_req_ts:
+                        send_key_request(peer_norm, require_confirm=True)
+                        continue
                     if st.next_key_refresh_ts <= 0.0:
                         st.next_key_refresh_ts = now + 3600.0 + random.uniform(0, 600)
                     if now >= st.next_key_refresh_ts:
-                        send_key_request(peer_norm)
+                        send_key_request(peer_norm, require_confirm=False)
                 if discovery_send and radio_ready:
                     start_ts = discovery_state["start_ts"]
                     next_discovery_ts = discovery_state["next_ts"]
@@ -1959,7 +2001,6 @@ def main() -> int:
             return 0
 
     def run_gui_qt() -> int:
-        nonlocal compression_enabled, compression_mode, min_gain_bytes
         try:
             from PySide6 import QtCore, QtGui, QtWidgets
         except Exception:
@@ -2029,17 +2070,6 @@ def main() -> int:
                 "discovery_send": "Send broadcast discovery",
                 "discovery_reply": "Reply to broadcast discovery",
                 "clear_pending_on_switch": "Clear pending when profile switches",
-                "compression": "Compression",
-                "compression_enabled": "Enable text compression",
-                "compression_mode": "Preferred mode",
-                "compression_mode_byte_dict": "BYTE_DICT",
-                "compression_mode_fixed_bits": "FIXED_BITS",
-                "compression_mode_deflate": "DEFLATE",
-                "compression_mode_zlib": "ZLIB",
-                "compression_mode_bz2": "BZ2",
-                "compression_mode_lzma": "LZMA",
-                "compression_min_gain": "Min gain, bytes",
-                "compression_min_gain_hint": "All modes are compared; selected mode is preferred on tie. Use compression only if payload becomes smaller by at least this many bytes",
                 "full_reset": "Full reset",
                 "full_reset_confirm": "Delete all profile settings, history, pending state and keys for '{name}'?\n\nThis action cannot be undone.",
                 "full_reset_done": "Profile data and keys were reset.",
@@ -2105,17 +2135,6 @@ def main() -> int:
                 "discovery_send": "Отправлять broadcast discovery",
                 "discovery_reply": "Отвечать на broadcast discovery",
                 "clear_pending_on_switch": "Очищать очередь при смене профиля",
-                "compression": "Сжатие",
-                "compression_enabled": "Включить сжатие текста",
-                "compression_mode": "Предпочитаемый режим",
-                "compression_mode_byte_dict": "BYTE_DICT",
-                "compression_mode_fixed_bits": "FIXED_BITS",
-                "compression_mode_deflate": "DEFLATE",
-                "compression_mode_zlib": "ZLIB",
-                "compression_mode_bz2": "BZ2",
-                "compression_mode_lzma": "LZMA",
-                "compression_min_gain": "Мин выигрыш, байт",
-                "compression_min_gain_hint": "Сравниваются все режимы; выбранный режим имеет приоритет при равенстве. Сжатие применяется только если payload становится меньше минимум на это число байт",
                 "full_reset": "Полный сброс",
                 "full_reset_confirm": "Удалить все настройки профиля, историю, очередь и ключи для '{name}'?\n\nДействие необратимо.",
                 "full_reset_done": "Данные профиля и ключи сброшены.",
@@ -2137,17 +2156,6 @@ def main() -> int:
         current_lang = str(cfg.get("lang", "ru")).lower()
         verbose_log = bool(cfg.get("log_verbose", True))
         runtime_log_file = bool(cfg.get("runtime_log_file", True))
-        compression_enabled = bool(cfg.get("compression_enabled", True))
-        try:
-            compression_mode = int(cfg.get("compression_mode", MODE_BYTE_DICT))
-        except Exception:
-            compression_mode = MODE_BYTE_DICT
-        if compression_mode not in COMPRESSION_MODES:
-            compression_mode = MODE_BYTE_DICT
-        try:
-            min_gain_bytes = int(cfg.get("min_gain_bytes", 2))
-        except Exception:
-            min_gain_bytes = 2
         pinned_dialogs = set(cfg.get("pinned_dialogs", []))
         hidden_contacts = set(cfg.get("hidden_contacts", []))
         groups_cfg = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
@@ -2355,9 +2363,6 @@ def main() -> int:
                     "lang": current_lang,
                     "log_verbose": verbose_log,
                     "runtime_log_file": runtime_log_file,
-                    "compression_enabled": compression_enabled,
-                    "compression_mode": int(compression_mode),
-                    "min_gain_bytes": int(min_gain_bytes),
                     "pinned_dialogs": sorted(pinned_dialogs),
                     "hidden_contacts": sorted(hidden_contacts),
                     "groups": {k: sorted(list(v)) for k, v in groups.items()},
@@ -2390,7 +2395,6 @@ def main() -> int:
             nonlocal runtime_log_file
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
-            nonlocal compression_enabled, compression_mode, min_gain_bytes
             dlg = QtWidgets.QDialog(win)
             dlg.setWindowTitle(tr("settings_title"))
             dlg.resize(700, 560)
@@ -2487,43 +2491,6 @@ def main() -> int:
             cb_clear_pending = QtWidgets.QCheckBox(tr("clear_pending_on_switch"))
             cb_clear_pending.setChecked(clear_pending_on_switch)
             right_panel.addWidget(cb_clear_pending)
-            compression_label = QtWidgets.QLabel(tr("compression"))
-            compression_label.setObjectName("muted")
-            right_panel.addWidget(compression_label)
-            cb_compression_enabled = QtWidgets.QCheckBox(tr("compression_enabled"))
-            cb_compression_enabled.setChecked(compression_enabled)
-            right_panel.addWidget(cb_compression_enabled)
-            compression_form = QtWidgets.QFormLayout()
-            compression_form.setContentsMargins(0, 0, 0, 0)
-            compression_form.setLabelAlignment(QtCore.Qt.AlignLeft)
-            compression_form.setFormAlignment(QtCore.Qt.AlignTop)
-            compression_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
-            mode_combo = QtWidgets.QComboBox()
-            mode_items = [
-                ("compression_mode_byte_dict", MODE_BYTE_DICT),
-                ("compression_mode_fixed_bits", MODE_FIXED_BITS),
-                ("compression_mode_deflate", MODE_DEFLATE),
-                ("compression_mode_zlib", MODE_ZLIB),
-                ("compression_mode_bz2", MODE_BZ2),
-                ("compression_mode_lzma", MODE_LZMA),
-            ]
-            for key, mode_val in mode_items:
-                mode_combo.addItem(tr(key), int(mode_val))
-            mode_idx = mode_combo.findData(int(compression_mode))
-            if mode_idx < 0:
-                mode_idx = mode_combo.findData(int(MODE_BYTE_DICT))
-            mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
-            compact_field(mode_combo)
-            gain_edit = QtWidgets.QLineEdit(str(int(min_gain_bytes)))
-            compact_field(gain_edit)
-            compression_form.addRow(tr("compression_mode"), mode_combo)
-            compression_form.addRow(tr("compression_min_gain"), gain_edit)
-            gain_edit.setToolTip(tr("compression_min_gain_hint"))
-            right_panel.addLayout(compression_form)
-            gain_hint = QtWidgets.QLabel(tr("compression_min_gain_hint"))
-            gain_hint.setObjectName("hint")
-            gain_hint.setWordWrap(True)
-            right_panel.addWidget(gain_hint)
 
             top_row.addLayout(left_panel, 1)
             top_row.addLayout(right_panel, 1)
@@ -2581,7 +2548,6 @@ def main() -> int:
 
             def apply_settings(close_dialog: bool) -> None:
                 nonlocal verbose_log, runtime_log_file, discovery_send, discovery_reply, clear_pending_on_switch
-                nonlocal compression_enabled, compression_mode, min_gain_bytes
                 verbose_log = cb_verbose.isChecked()
                 runtime_log_file = cb_runtime_log.isChecked()
                 global RUNTIME_LOG_ENABLED
@@ -2590,20 +2556,6 @@ def main() -> int:
                 discovery_send = cb_discovery_send.isChecked()
                 discovery_reply = cb_discovery_reply.isChecked()
                 clear_pending_on_switch = cb_clear_pending.isChecked()
-                compression_enabled = cb_compression_enabled.isChecked()
-                mode_data = mode_combo.currentData()
-                try:
-                    compression_mode = int(mode_data)
-                except Exception:
-                    compression_mode = MODE_BYTE_DICT
-                if compression_mode not in COMPRESSION_MODES:
-                    compression_mode = MODE_BYTE_DICT
-                try:
-                    min_gain_bytes = int(gain_edit.text().strip()) if gain_edit.text().strip() else 2
-                except Exception:
-                    min_gain_bytes = 2
-                if min_gain_bytes < 0:
-                    min_gain_bytes = 0
                 set_language("ru" if rb_ru.isChecked() else "en", persist=True)
                 cfg["port"] = port_edit.text().strip() or "auto"
                 cfg["retry_seconds"] = parse_int_field(retry_edit, 30)
@@ -2615,9 +2567,6 @@ def main() -> int:
                 cfg["discovery_reply"] = discovery_reply
                 cfg["runtime_log_file"] = runtime_log_file
                 cfg["clear_pending_on_switch"] = clear_pending_on_switch
-                cfg["compression_enabled"] = compression_enabled
-                cfg["compression_mode"] = int(compression_mode)
-                cfg["min_gain_bytes"] = int(min_gain_bytes)
                 save_gui_config()
                 if discovery_send and not prev_send:
                     reset_discovery_schedule()
@@ -2662,7 +2611,6 @@ def main() -> int:
             def on_full_reset():
                 nonlocal current_lang, verbose_log, runtime_log_file
                 nonlocal discovery_send, discovery_reply, clear_pending_on_switch
-                nonlocal compression_enabled, compression_mode, min_gain_bytes
                 if not self_id or not priv_path or not pub_path:
                     QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_unavailable"))
                     return
@@ -2722,9 +2670,6 @@ def main() -> int:
                 discovery_send = True
                 discovery_reply = True
                 clear_pending_on_switch = True
-                compression_enabled = True
-                compression_mode = MODE_BYTE_DICT
-                min_gain_bytes = 2
                 global RUNTIME_LOG_ENABLED
                 RUNTIME_LOG_ENABLED = True
                 try:
@@ -2763,6 +2708,17 @@ def main() -> int:
         settings_btn.clicked.connect(open_settings)
         click_state = {"last_ts": 0.0, "count": 0}
 
+        def _header_text_left_x(text: str) -> float:
+            rect = chat_label.contentsRect()
+            fm = QtGui.QFontMetrics(chat_label.font())
+            text_w = float(fm.horizontalAdvance(text))
+            align = int(chat_label.alignment())
+            if align & int(QtCore.Qt.AlignRight):
+                return float(rect.right()) - text_w + 1.0
+            if align & int(QtCore.Qt.AlignHCenter):
+                return float(rect.left()) + max(0.0, (float(rect.width()) - text_w) * 0.5)
+            return float(rect.left())
+
         def _chat_label_click(e):
             if e.button() != QtCore.Qt.LeftButton:
                 return
@@ -2771,8 +2727,8 @@ def main() -> int:
             if pub_idx >= 0:
                 fm = QtGui.QFontMetrics(chat_label.font())
                 left_text = text[:pub_idx]
-                start_x = fm.horizontalAdvance(left_text)
-                if e.position().x() < start_x:
+                left_boundary_x = _header_text_left_x(text) + float(fm.horizontalAdvance(left_text))
+                if float(e.position().x()) < left_boundary_x:
                     copy_client_id()
                     return
                 now = time.time()
@@ -4236,7 +4192,6 @@ def main() -> int:
             nonlocal current_lang, verbose_log, runtime_log_file, pinned_dialogs, hidden_contacts, groups
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
-            nonlocal compression_enabled, compression_mode, min_gain_bytes
             nonlocal incoming_state
             nonlocal interface, self_id, self_id_raw, radio_ready, known_peers, peer_states, peer_names
             nonlocal initial_port_arg
@@ -4280,19 +4235,6 @@ def main() -> int:
                         discovery_reply = bool(legacy_discovery)
                     else:
                         discovery_reply = True
-                    compression_enabled = bool(cfg.get("compression_enabled", compression_enabled))
-                    try:
-                        compression_mode = int(cfg.get("compression_mode", compression_mode))
-                    except Exception:
-                        compression_mode = MODE_BYTE_DICT
-                    if compression_mode not in COMPRESSION_MODES:
-                        compression_mode = MODE_BYTE_DICT
-                    try:
-                        min_gain_bytes = int(cfg.get("min_gain_bytes", min_gain_bytes))
-                    except Exception:
-                        min_gain_bytes = 2
-                    if min_gain_bytes < 0:
-                        min_gain_bytes = 0
                     clear_pending_on_switch = bool(cfg.get("clear_pending_on_switch", True))
                     args.retry_seconds = int(cfg.get("retry_seconds", args.retry_seconds))
                     args.max_seconds = int(cfg.get("max_seconds", args.max_seconds))
@@ -4632,7 +4574,15 @@ def main() -> int:
 
         def copy_client_id() -> None:
             try:
-                QtWidgets.QApplication.clipboard().setText(wire_id_from_norm(self_id))
+                text = str(wire_id_from_norm(self_id) or "").strip()
+                if not text:
+                    return
+                cb = QtWidgets.QApplication.clipboard()
+                cb.setText(text, QtGui.QClipboard.Clipboard)
+                try:
+                    cb.setText(text, QtGui.QClipboard.Selection)
+                except Exception:
+                    pass
             except Exception:
                 pass
 

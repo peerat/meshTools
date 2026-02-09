@@ -30,6 +30,9 @@ MC_MODE_DEFLATE = 2
 MC_MODE_ZLIB = 3
 MC_MODE_BZ2 = 4
 MC_MODE_LZMA = 5
+MC_MODE_NLTK = 6
+MC_MODE_SPACY = 7
+MC_MODE_TENSORFLOW = 8
 HISTORY_TEXT_PREFIX = "b64:"
 
 MESSAGE_CODEC_NONE = "none"
@@ -110,6 +113,9 @@ def looks_like_mc_block(data: bytes) -> bool:
         MC_MODE_ZLIB,
         MC_MODE_BZ2,
         MC_MODE_LZMA,
+        MC_MODE_NLTK,
+        MC_MODE_SPACY,
+        MC_MODE_TENSORFLOW,
     ):
         return False
     if dict_id != MC_DICT_ID:
@@ -336,6 +342,9 @@ def parse_compact_meta(meta_u8: int, body: bytes = b"") -> Tuple[int, Optional[s
                 MC_MODE_ZLIB: "mc_zlib",
                 MC_MODE_BZ2: "mc_bz2",
                 MC_MODE_LZMA: "mc_lzma",
+                MC_MODE_NLTK: "mc_nltk",
+                MC_MODE_SPACY: "mc_spacy",
+                MC_MODE_TENSORFLOW: "mc_tensorflow",
             }.get(mc_mode, "mc")
             return (1, legacy, mode_label)
         return (0, legacy, str(legacy or "none"))

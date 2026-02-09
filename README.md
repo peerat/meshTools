@@ -51,6 +51,12 @@ Small utilities around Meshtastic.
 pip install -r requirements.txt
 ```
 
+Optional NLP-related compression profiles:
+
+```bash
+pip install -r requirements-ml.txt
+```
+
 Check that tools are in PATH:
 
 ```bash
@@ -95,6 +101,9 @@ Interactive chat (stdin -> ACK on each line):
 python meshTalk.py --user 02e591e0
 ```
 
+`meshTalk.py` uses a direct serial connection to the radio (USB/COM).
+Default `--port` is `auto`: on startup the app scans serial ports and picks the best candidate automatically.
+
 Keys are stored in `keyRings/` as `<id>.key` and `<id>.pub` (leading `!` is stripped).
 If `keyRings/<id>.key` / `keyRings/<id>.pub` are missing, they are generated automatically.
 The script detects your node id from the radio automatically.
@@ -106,20 +115,14 @@ Type `/keys` to rotate your keys (they will be regenerated and exchanged again).
 
 Compression is applied to message payload before encryption and only when it gives size gain.
 
-- Config keys:
-  - `compression_enabled` (default: `true`)
-  - `compression_mode` (preferred mode, default: `0`)
-    - `0` = `BYTE_DICT`
-    - `1` = `FIXED_BITS`
-    - `2` = `DEFLATE`
-    - `3` = `ZLIB`
-    - `4` = `BZ2`
-    - `5` = `LZMA`
-  - `min_gain_bytes` (default: `2`)
-- Decision rule: all supported modes are compared; compression is used only if best result is at least `min_gain_bytes` smaller than plain UTF-8.
+- Compression settings are hidden from UI and work automatically.
+- Decision rule: all supported modes are compared; compression is used only when the best mode is smaller than plain UTF-8.
 - External transport protocol is unchanged; compression works inside message payload bytes.
 - Peer compatibility guard: compression is enabled per peer only after capability markers are observed (`mc=1`, `mc_modes=...`) from validated peer traffic.
 - First message to an unknown peer is sent plain, then compression can activate automatically.
+- Table modes `BYTE_DICT`/`FIXED_BITS` are disabled for new outgoing messages.
+- Additional automatic modes are enabled: `NLTK`, `SPACY`, `TENSORFLOW`.
+- These NLP profiles are wire-level mode aliases over built-in codecs to keep decode path dependency-free.
 
 Compressed block format (`compression=1`):
 
@@ -127,7 +130,8 @@ Compressed block format (`compression=1`):
 
 - `MAGIC`: `0x4D 0x43` (`"MC"`)
 - `VER`: `1`
-- `MODE`: `0` (`BYTE_DICT`), `1` (`FIXED_BITS`), `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`)
+- `MODE`: `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`), `6` (`NLTK`), `7` (`SPACY`), `8` (`TENSORFLOW`) for new outgoing messages.
+- Legacy values `0` (`BYTE_DICT`) and `1` (`FIXED_BITS`) are kept only for backward decode compatibility.
 - `DICT_ID`: static dictionary id (`2`)
 - `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled
 - `CRC8`: checksum over header+data
@@ -257,6 +261,12 @@ Output: `dist\meshTalk.exe`
 pip install -r requirements.txt
 ```
 
+Опционально для NLP-профилей сжатия:
+
+```bash
+pip install -r requirements-ml.txt
+```
+
 Проверка, что утилиты доступны в PATH:
 
 ```bash
@@ -301,6 +311,9 @@ python graphGen.py --root .
 python meshTalk.py --user 02e591e0
 ```
 
+`meshTalk.py` работает через прямое serial-подключение к радио (USB/COM).
+Параметр `--port` по умолчанию равен `auto`: при старте приложение сканирует serial-порты и автоматически выбирает наиболее подходящий.
+
 Ключи хранятся в `keyRings/` как `<id>.key` и `<id>.pub` (ведущий `!` убирается).
 Если `keyRings/<id>.key` / `keyRings/<id>.pub` отсутствуют, они создаются автоматически.
 Скрипт автоматически определяет id узла из радио.
@@ -312,20 +325,14 @@ python meshTalk.py --user 02e591e0
 
 Сжатие применяется к payload сообщения до шифрования и только если есть выигрыш по размеру.
 
-- Ключи конфигурации:
-  - `compression_enabled` (по умолчанию: `true`)
-  - `compression_mode` (предпочитаемый режим, по умолчанию: `0`)
-    - `0` = `BYTE_DICT`
-    - `1` = `FIXED_BITS`
-    - `2` = `DEFLATE`
-    - `3` = `ZLIB`
-    - `4` = `BZ2`
-    - `5` = `LZMA`
-  - `min_gain_bytes` (по умолчанию: `2`)
-- Правило выбора: сравниваются все поддерживаемые режимы; сжатие включается только если лучший результат минимум на `min_gain_bytes` меньше обычного UTF-8.
+- Настройки сжатия скрыты из UI и работают автоматически.
+- Правило выбора: сравниваются все поддерживаемые режимы; сжатие включается только если лучший режим меньше обычного UTF-8.
 - Внешний транспортный протокол не меняется; сжатие работает внутри байтов payload.
 - Защита совместимости: сжатие включается для peer только после маркеров возможностей (`mc=1`, `mc_modes=...`) из валидированного трафика этого peer.
 - Первое сообщение неизвестному peer уходит как обычный текст; далее сжатие может включиться автоматически.
+- Табличные режимы `BYTE_DICT`/`FIXED_BITS` отключены для новых исходящих сообщений.
+- Дополнительно включены автоматические режимы: `NLTK`, `SPACY`, `TENSORFLOW`.
+- Эти NLP-профили реализованы как wire-level алиасы поверх встроенных кодеков, чтобы декодирование оставалось без обязательных внешних зависимостей.
 
 Формат сжатого блока (`compression=1`):
 
@@ -333,7 +340,8 @@ python meshTalk.py --user 02e591e0
 
 - `MAGIC`: `0x4D 0x43` (`"MC"`)
 - `VER`: `1`
-- `MODE`: `0` (`BYTE_DICT`), `1` (`FIXED_BITS`), `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`)
+- `MODE`: для новых исходящих используются `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`), `6` (`NLTK`), `7` (`SPACY`), `8` (`TENSORFLOW`).
+- Значения `0` (`BYTE_DICT`) и `1` (`FIXED_BITS`) оставлены только для декодирования legacy-сообщений.
 - `DICT_ID`: id статического словаря (`2`)
 - `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled
 - `CRC8`: контрольная сумма по header+data
