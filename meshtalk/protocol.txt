@@ -1,0 +1,57 @@
+meshtalk/protocol.py reference
+Author: Anton Vologzhanin (R3VAF)
+
+========================
+EN
+========================
+
+Purpose
+- Internal wire-protocol helpers extracted from `meshTalk.py`.
+- Keeps crypto primitives and framing logic in a focused, testable module.
+
+License
+- Apache License 2.0 (`LICENSE`).
+- Keep attribution notices from `NOTICE` when redistributing.
+
+Scope
+- Protocol constants: `PROTO_VERSION`, `TYPE_MSG`, `TYPE_ACK`.
+- Key derivation: X25519 (ECDH) + HKDF-SHA256.
+- Payload framing: `pack_message()` / `try_unpack_message()` using AES-256-GCM.
+- Best-effort payload compression before encryption (labels: `none|zlib|bz2|lzma`).
+- Public key fingerprint helper for UI/logs.
+- `PeerKeyPinnedError` for TOFU key pinning mismatches.
+
+Used by
+- Imported by `meshTalk.py`.
+
+Security notes
+- AES-GCM uses random 12-byte nonces per message.
+- AAD can optionally include message type (`bind_aad_type`) to reduce malleability across types.
+
+========================
+RU
+========================
+
+Назначение
+- Внутренний модуль helpers wire-протокола, вынесенный из `meshTalk.py`.
+- Держит криптопримитивы и сборку/разбор фреймов в отдельном, тестируемом файле.
+
+Лицензия
+- Apache License 2.0 (`LICENSE`).
+- При распространении сохраняйте атрибуцию из `NOTICE`.
+
+Область ответственности
+- Константы протокола: `PROTO_VERSION`, `TYPE_MSG`, `TYPE_ACK`.
+- Вычисление ключа: X25519 (ECDH) + HKDF-SHA256.
+- Фрейминг payload: `pack_message()` / `try_unpack_message()` на AES-256-GCM.
+- Best-effort сжатие перед шифрованием (labels: `none|zlib|bz2|lzma`).
+- Хелпер fingerprint публичного ключа для UI/логов.
+- `PeerKeyPinnedError` для несоответствия закрепленного (pinned) ключа (TOFU).
+
+Используется
+- Импортируется из `meshTalk.py`.
+
+Заметки по безопасности
+- AES-GCM использует случайные nonce 12 байт на каждое сообщение.
+- AAD опционально включает тип сообщения (`bind_aad_type`) для усиления связывания контекста.
+

@@ -1,4 +1,4 @@
-meshTalk v0.3.1
+meshTalk v0.3.2
 Author: Anton Vologzhanin (R3VAF)
 
 ========================
@@ -24,7 +24,10 @@ Project vision
 Main UI
 - Left: contacts/dialogs list.
 - Right: chat area.
-- Top: orange header with `Client ID`, names, and masked `pub`.
+- Top: header status bar with `Client ID`, names, and masked `pub`.
+  - Orange: initialization / transitional states (waiting for radio).
+  - Dark green: connected, no unacknowledged errors.
+  - Red: errors happened in log and require user attention (until Settings is opened).
 - Bottom: input field and Send button.
 
 Initialization
@@ -50,7 +53,7 @@ Message status examples
 - Outgoing delivered with compression:
   `sent at 10:18 delivered at 10:19 in 01:18, on the 1 attempt, hops there 0 back 0, compression DEFLATE 42%`
 - Incoming multipart in progress:
-  `started receive at 10:18 elapsed 00:15 parts 2/5 attempts 1, hops 1`
+  `at 10:18 started receiving, elapsed 00:15 parts 2/5 attempts 1, hops 1`
 - Incoming completed:
   `sent at 10:18 received at 10:19 in 01:18, attempts 1, hops 1, parts 5/5`
 
@@ -61,12 +64,18 @@ Contacts context menu
 - Clear history
 - Delete contact
 
+Contact list indicators
+- Lock (`🔒`) is shown only after confirmed two-way key exchange.
+- Next to lock: hours since key exchange confirmation.
+- Above lock: `Last seen: N h` (peer last seen time in hours).
+
 Settings
 - Port, retry interval, max wait, max bytes, rate.
 - Discovery: two checkboxes (`Send broadcast discovery`, `Reply to broadcast discovery`).
 - Default on first start: both ON.
 - Clear pending on profile switch.
 - Language, verbose events, runtime.log toggle.
+- Default on first start: `runtime.log` ON.
 - Compression settings are hidden from UI and work automatically.
 - For outgoing messages the app compares `DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `NLTK`, `SPACY`, `TENSORFLOW` and applies compression only if payload becomes smaller.
 - `NLTK`/`SPACY`/`TENSORFLOW` are wire-level compression profile aliases; decode path stays dependency-free.
@@ -80,6 +89,7 @@ Auto key refresh
 
 Data files (per node)
 - `<node_id>/keyRings/`
+- `<node_id>/keyRings/storage.key` (local at-rest encryption key)
 - `<node_id>/state.json`
 - `<node_id>/history.log`
 - `<node_id>/incoming.json`
@@ -92,6 +102,10 @@ meshTalk related files map (keep updated)
 Project files (repository / source-controlled)
 - `meshTalk.py`:
   - Main app: radio lifecycle, E2EE, queue/retry/ACK, GUI, save/load state/history.
+- `meshtalk/protocol.py`:
+  - Wire protocol primitives: pack/unpack, X25519+HKDF key derivation, base64 helpers.
+- `meshtalk/storage.py`:
+  - Storage layer: config/state/history/incoming I/O, at-rest encryption key, file hardening.
 - `meshtalk_utils.py`:
   - Shared helpers: history encode/decode, parsers, metadata formatting, wire payload assembly.
 - `message_text_compression.py`:
@@ -107,19 +121,21 @@ Project files (repository / source-controlled)
 - `nodeDbUpdater.txt`: focused nodeDbUpdater behavior reference.
 - `meshtalk_utils.txt`: focused meshtalk_utils module reference.
 - `message_text_compression.txt`: focused text-compression module reference.
+- `meshtalk/protocol.txt`: focused protocol module reference.
+- `meshtalk/storage.txt`: focused storage module reference.
 - `CHANGELOG.md`: changes between versions.
-- `tests/test_meshtalk_utils.py`: history/parsing/metadata behavior.
-- `tests/test_message_text_compression.py`: compression behavior.
 
 Generated during runtime (per profile/node, not source code)
 - `config.json`: GUI/runtime options.
 - `state.json`: outgoing pending queue records (used to restore unsent outgoing messages).
 - `incoming.json`: incoming multipart assembly state.
 - `history.log`: message history and transport events.
-  - Text is stored as `b64:...`.
+  - Text is stored as `enc1:...` (AES-256-GCM; key in `keyRings/storage.key`).
+  - Legacy rows may contain `b64:...` (older versions).
   - Optional per-message metadata is stored as `meta64:...` (base64 JSON) for status restoration.
 - `runtime.log`: technical runtime events.
 - `keyRings/`: local private/public keys and peer public keys.
+  - `storage.key`: 32-byte key used to encrypt message text persisted at rest (`history.log`, sensitive fields in `state.json`/`incoming.json`).
 
 History/recovery behavior
 - On startup, app restores in this logical order:
@@ -152,7 +168,10 @@ RU
 Основной UI
 - Слева: список контактов/диалогов.
 - Справа: окно чата.
-- Вверху: оранжевая строка `Client ID`, имена и маска `pub`.
+- Вверху: статусная строка `Client ID`, имена и маска `pub`.
+  - Оранжевая: инициализация/переходные состояния (ожидание радио).
+  - Темно‑зеленая: подключено, нет непросмотренных ошибок.
+  - Красная: в логе были ошибки, требуется внимание (до открытия Настроек).
 - Внизу: поле ввода и кнопка отправки.
 
 Инициализация
@@ -189,12 +208,18 @@ RU
 - Clear history
 - Delete contact
 
+Индикаторы в списке контактов
+- Замок (`🔒`) показывается только после подтвержденного двухстороннего обмена ключами.
+- Рядом с замком: сколько часов прошло с подтверждения обмена ключами.
+- Над замком: `Last seen: N h` (сколько часов назад пир был замечен в сети).
+
 Настройки
 - Порт, повтор, макс ожидание, макс байт, минимальный интервал.
 - Discovery: две галки (`Отправлять broadcast discovery`, `Отвечать на broadcast discovery`).
 - По умолчанию при первом запуске: обе ВКЛ.
 - Очистка очереди при смене профиля.
 - Язык, подробный лог, включение `runtime.log`.
+- По умолчанию при первом запуске: `runtime.log` ВКЛ.
 - Настройки сжатия скрыты из UI и работают автоматически.
 - Для исходящих сообщений приложение сравнивает `DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `NLTK`, `SPACY`, `TENSORFLOW` и применяет сжатие только если payload становится меньше.
 - `NLTK`/`SPACY`/`TENSORFLOW` это wire-level алиасы профилей сжатия; путь декодирования остается без обязательных внешних зависимостей.
@@ -208,6 +233,7 @@ RU
 
 Файлы данных (на каждую ноду)
 - `<node_id>/keyRings/`
+- `<node_id>/keyRings/storage.key` (локальный ключ шифрования на диске)
 - `<node_id>/state.json`
 - `<node_id>/history.log`
 - `<node_id>/incoming.json`
@@ -220,6 +246,10 @@ RU
 Файлы проекта (в репозитории / исходники)
 - `meshTalk.py`:
   - Основное приложение: жизненный цикл радио, E2EE, очередь/повторы/ACK, GUI, сохранение/загрузка состояния и истории.
+- `meshtalk/protocol.py`:
+  - Примитивы wire-протокола: pack/unpack, вычисление ключа X25519+HKDF, base64‑помощники.
+- `meshtalk/storage.py`:
+  - Слой хранения: I/O config/state/history/incoming, ключ шифрования на диске, hardening прав файлов.
 - `meshtalk_utils.py`:
   - Общие утилиты: кодирование/декодирование истории, парсеры, форматирование метаданных, сборка wire-пакетов.
 - `message_text_compression.py`:
@@ -235,19 +265,21 @@ RU
 - `nodeDbUpdater.txt`: целевая справка по поведению nodeDbUpdater.
 - `meshtalk_utils.txt`: целевая справка по модулю meshtalk_utils.
 - `message_text_compression.txt`: целевая справка по модулю сжатия текста.
+- `meshtalk/protocol.txt`: целевая справка по модулю протокола.
+- `meshtalk/storage.txt`: целевая справка по модулю хранения.
 - `CHANGELOG.md`: изменения между версиями.
-- `tests/test_meshtalk_utils.py`: история/парсинг/метаданные.
-- `tests/test_message_text_compression.py`: поведение сжатия.
 
 Генерируется во время работы (на профиль/ноду, не исходники)
 - `config.json`: настройки GUI/runtime.
 - `state.json`: очередь исходящих pending-записей (для восстановления недоотправленных исходящих).
 - `incoming.json`: состояние сборки входящих многопакетных сообщений.
 - `history.log`: история сообщений и транспортные события.
-  - Текст хранится как `b64:...`.
+  - Текст хранится как `enc1:...` (AES-256-GCM; ключ в `keyRings/storage.key`).
+  - В старых строках может встречаться `b64:...` (старые версии).
   - Опциональные метаданные сообщения хранятся как `meta64:...` (base64 JSON) для восстановления статусов.
 - `runtime.log`: технические runtime-события.
 - `keyRings/`: локальные приватный/публичный ключи и публичные ключи пиров.
+  - `storage.key`: 32-байтный ключ, которым шифруется текст сообщений при сохранении на диск (`history.log` и чувствительные поля `state.json`/`incoming.json`).
 
 Поведение восстановления
 - При старте приложение восстанавливает данные логически в таком порядке:

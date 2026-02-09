@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import time
 import bz2
 import hashlib
@@ -35,6 +36,24 @@ MC_MODE_NLTK = 6
 MC_MODE_SPACY = 7
 MC_MODE_TENSORFLOW = 8
 HISTORY_TEXT_PREFIX = "b64:"
+HISTORY_TEXT_ENC_PREFIX = "enc1:"
+
+_HISTORY_ENC_KEY: Optional[bytes] = None
+
+
+def set_history_encryption_key(key: Optional[bytes]) -> None:
+    """Set AES-256-GCM key for encrypting message text stored in history/state logs.
+
+    When unset (default), history uses legacy b64: encoding for backwards compatibility.
+    """
+    global _HISTORY_ENC_KEY
+    if key is None:
+        _HISTORY_ENC_KEY = None
+        return
+    if isinstance(key, (bytes, bytearray)) and len(key) == 32:
+        _HISTORY_ENC_KEY = bytes(key)
+        return
+    _HISTORY_ENC_KEY = None
 
 MESSAGE_CODEC_NONE = "none"
 MESSAGE_CODEC_DEFLATE = "deflate"
@@ -358,7 +377,7 @@ def parse_key_exchange_frame(
     key_req_prefix: bytes,
     key_resp_prefix: bytes,
     supported_modes: Set[int],
-) -> Optional[Tuple[str, str, bytes, Optional[Set[int]]]]:
+) -> Optional[Tuple[str, str, bytes, Optional[Set[int]], Optional[Set[str]]]]:
     if not isinstance(payload, (bytes, bytearray)):
         return None
     raw = bytes(payload)
@@ -381,12 +400,18 @@ def parse_key_exchange_frame(
         if len(pub_raw) != 32:
             return None
         peer_modes: Optional[Set[int]] = None
+        peer_caps: Optional[Set[str]] = None
         for extra_raw in parts[2:]:
             try:
                 extra = extra_raw.decode("utf-8", errors="ignore").strip()
             except Exception:
                 continue
             if not extra.startswith("mc_modes="):
+                if extra.startswith("mt_caps="):
+                    caps_raw = extra[len("mt_caps="):]
+                    parsed_caps = {c.strip() for c in caps_raw.split(",") if c.strip()}
+                    if parsed_caps:
+                        peer_caps = set(parsed_caps)
                 continue
             try:
                 parsed = {
@@ -399,7 +424,7 @@ def parse_key_exchange_frame(
             parsed = {m for m in parsed if m in supported_modes}
             if parsed:
                 peer_modes = set(parsed)
-        return (kind, peer_id, pub_raw, peer_modes)
+        return (kind, peer_id, pub_raw, peer_modes, peer_caps)
     except Exception:
         return None
 
@@ -480,14 +505,51 @@ def merge_compact_compression(prev_flag: int, incoming_flag: int) -> int:
     return 1 if int(prev_flag) == 1 or int(incoming_flag) == 1 else 0
 
 
-def encode_history_text(text: str) -> str:
+def _encrypt_history_token(plaintext: bytes, aad: bytes) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    key = _HISTORY_ENC_KEY
+    if not key:
+        raise ValueError("history encryption key not configured")
+    nonce = os.urandom(12)
+    ct = AESGCM(key).encrypt(nonce, plaintext, aad)
+    return HISTORY_TEXT_ENC_PREFIX + base64.b64encode(nonce + ct).decode("ascii")
+
+
+def _decrypt_history_token(token: str, aad: bytes, strict: bool) -> Optional[str]:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    key = _HISTORY_ENC_KEY
+    if not key:
+        return None if strict else "[locked]"
+    payload = token[len(HISTORY_TEXT_ENC_PREFIX):]
+    try:
+        raw = base64.b64decode(payload.encode("ascii"), validate=True)
+        if len(raw) < (12 + 16):
+            raise ValueError("ciphertext too short")
+        nonce = raw[:12]
+        ct = raw[12:]
+        pt = AESGCM(key).decrypt(nonce, ct, aad)
+        return pt.decode("utf-8", errors="replace")
+    except Exception:
+        return None if strict else "[decode error]"
+
+
+def encode_history_text(text: str, aad: Optional[bytes] = None) -> str:
     raw = str(text).encode("utf-8")
+    if _HISTORY_ENC_KEY:
+        try:
+            return _encrypt_history_token(raw, aad or b"")
+        except Exception:
+            pass
     return HISTORY_TEXT_PREFIX + base64.b64encode(raw).decode("ascii")
 
 
-def decode_history_text(value: str, strict: bool = False) -> Optional[str]:
+def decode_history_text(value: str, strict: bool = False, aad: Optional[bytes] = None) -> Optional[str]:
     if not isinstance(value, str):
         return str(value)
+    if value.startswith(HISTORY_TEXT_ENC_PREFIX):
+        return _decrypt_history_token(value, aad or b"", strict=strict)
     if not value.startswith(HISTORY_TEXT_PREFIX):
         return value
     payload = value[len(HISTORY_TEXT_PREFIX):]
@@ -511,9 +573,12 @@ def parse_history_line(line: str, strict_encoded: bool = True) -> Optional[Tuple
     peer_id = parts[2]
     msg_id = parts[3]
     text_wire = " | ".join(parts[4:])
-    if strict_encoded and not text_wire.startswith(HISTORY_TEXT_PREFIX):
+    if strict_encoded and not (
+        text_wire.startswith(HISTORY_TEXT_PREFIX) or text_wire.startswith(HISTORY_TEXT_ENC_PREFIX)
+    ):
         return None
-    text = decode_history_text(text_wire, strict=strict_encoded)
+    aad = f"{direction}|{peer_id}|{msg_id}".encode("utf-8", errors="replace")
+    text = decode_history_text(text_wire, strict=strict_encoded, aad=aad)
     if text is None:
         return None
     return (ts_part, direction, peer_id, msg_id, text)
@@ -661,18 +726,23 @@ def format_meta_text(
             details.append(f"parts {done_count}/{total_count}")
     cmp_name = str(compression_name or "").strip()
     cmp_name_l = cmp_name.lower()
+    cmp_tail = ""
     if cmp_name and cmp_name_l not in ("none", "n/a", "-", "null"):
         if compression_eff_pct is not None:
             eff = _fmt_num(float(compression_eff_pct))
             if is_ru:
                 details.append(f"сжатие {cmp_name} {eff}%")
+                cmp_tail = f", сжатие {cmp_name} {eff}%"
             else:
                 details.append(f"compression {cmp_name} {eff}%")
+                cmp_tail = f", compression {cmp_name} {eff}%"
         else:
             if is_ru:
                 details.append(f"сжатие {cmp_name}")
+                cmp_tail = f", сжатие {cmp_name}"
             else:
                 details.append(f"compression {cmp_name}")
+                cmp_tail = f", compression {cmp_name}"
     status_map_ru = {
         "timeout": "таймаут",
         "queue_limit": "лимит очереди",
@@ -722,12 +792,12 @@ def format_meta_text(
                 else:
                     prefix = f"received at {recv_at}" + (f" in {dur}" if dur else "")
             return f"{prefix}, {', '.join(details)}" if details else prefix
+        now_ref = time.time() if now_ts is None else now_ts
+        start_ts = incoming_started_ts if incoming_started_ts is not None else now_ref
+        start_hhmm = time.strftime("%H:%M", time.localtime(start_ts))
+        elapsed = max(0.0, float(now_ref) - float(start_ts))
+        timer = format_duration_mmss(elapsed)
         if is_ru:
-            now_ref = time.time() if now_ts is None else now_ts
-            start_ts = incoming_started_ts if incoming_started_ts is not None else now_ref
-            start_hhmm = time.strftime("%H:%M", time.localtime(start_ts))
-            elapsed = max(0.0, float(now_ref) - float(start_ts))
-            timer = format_duration_mmss(elapsed)
             text = f"в {start_hhmm} начали прием, прошло {timer}"
             if packets is not None and total_count > 1:
                 text += f" частей {done_count}/{total_count}"
@@ -738,10 +808,17 @@ def format_meta_text(
                     text += f", хопов {_fmt_num(forward_hops)}"
                 else:
                     text += f" хопов {_fmt_num(forward_hops)}"
-            return text
-        if details:
-            return ", ".join(details)
-        return "получение" if is_ru else "receiving"
+        else:
+            text = f"at {start_hhmm} started receiving, elapsed {timer}"
+            if packets is not None and total_count > 1:
+                text += f" parts {done_count}/{total_count}"
+            if attempts is not None and attempts > 0:
+                text += f" attempts {_fmt_num(attempts)}"
+            if forward_hops is not None:
+                text += f", hops {_fmt_num(forward_hops)}"
+        if cmp_tail:
+            text += cmp_tail
+        return text
     if delivered_at_ts is not None:
         sent_at = None
         if sent_at_ts is not None:

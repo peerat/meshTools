@@ -30,18 +30,14 @@ import meshtastic
 from meshtastic import portnums_pb2
 from serial.tools import list_ports
 
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from meshtalk_utils import (
     format_meta_text,
     snapshot_runtime_state,
     normalize_log_text_line,
-    maybe_decompress_after_decrypt,
-    compress_for_encrypt_with_method,
-    compression_method_from_payload,
     build_legacy_chunks,
     build_legacy_wire_payload,
     build_compact_wire_payload,
@@ -49,10 +45,31 @@ from meshtalk_utils import (
     parse_key_exchange_frame,
     key_frame_receive_policy,
     merge_compact_compression,
-    encode_history_text,
-    parse_history_line,
     assemble_compact_parts,
-    HISTORY_TEXT_PREFIX,
+)
+from meshtalk.protocol import (
+    PROTO_VERSION,
+    TYPE_MSG,
+    TYPE_ACK,
+    PeerKeyPinnedError,
+    b64d,
+    b64e,
+    derive_key,
+    load_priv,
+    load_pub,
+    pack_message,
+    parse_payload,
+    pub_fingerprint,
+    try_unpack_message,
+)
+from meshtalk.storage import (
+    Storage,
+    decode_history_meta_token,
+    encode_history_meta_token,
+    harden_dir,
+    harden_file,
+    maybe_set_private_umask,
+    parse_history_record_line,
 )
 from message_text_compression import (
     MODE_BZ2,
@@ -69,10 +86,7 @@ from message_text_compression import (
 )
 
 
-VERSION = "0.3.1"
-PROTO_VERSION = 1
-TYPE_MSG = 1
-TYPE_ACK = 2
+VERSION = "0.3.2"
 DEFAULT_PORTNUM = portnums_pb2.PortNum.PRIVATE_APP
 PAYLOAD_OVERHEAD = 1 + 1 + 8 + 12 + 16  # ver + type + msg_id + nonce + tag
 KEY_REQ_PREFIX = b"KR1|"
@@ -93,8 +107,14 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 INCOMING_FILE = os.path.join(DATA_DIR, "incoming.json")
 RUNTIME_LOG_FILE = os.path.join(DATA_DIR, "runtime.log")
 keydir = os.path.join(DATA_DIR, "keyRings")
-runtime_log_lock = threading.Lock()
-RUNTIME_LOG_ENABLED = True
+_STORAGE = Storage(
+    config_file=CONFIG_FILE,
+    state_file=STATE_FILE,
+    history_file=HISTORY_FILE,
+    incoming_file=INCOMING_FILE,
+    runtime_log_file=RUNTIME_LOG_FILE,
+    keydir=keydir,
+)
 COMPRESSION_MODES = (
     int(MODE_DEFLATE),
     int(MODE_ZLIB),
@@ -106,20 +126,22 @@ COMPRESSION_MODES = (
 )
 LEGACY_COMPRESSION_MODES = tuple(COMPRESSION_MODES)
 AUTO_MIN_GAIN_BYTES = 2
-HISTORY_META_PREFIX = "meta64:"
-HISTORY_META_MAX_BYTES = 8192
 
 
 def ts_local() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
+def ensure_storage_key() -> Optional[bytes]:
+    return _STORAGE.ensure_storage_key()
+
+
 def ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
+    harden_dir(DATA_DIR)
 
 
 def set_data_dir_for_node(node_id_norm: Optional[str]) -> None:
-    global DATA_DIR, STATE_FILE, HISTORY_FILE, CONFIG_FILE, INCOMING_FILE, RUNTIME_LOG_FILE, keydir
+    global DATA_DIR, STATE_FILE, HISTORY_FILE, CONFIG_FILE, INCOMING_FILE, RUNTIME_LOG_FILE, keydir, _STORAGE
     if node_id_norm:
         DATA_DIR = os.path.join(BASE_DIR, node_id_norm)
     else:
@@ -130,8 +152,16 @@ def set_data_dir_for_node(node_id_norm: Optional[str]) -> None:
     INCOMING_FILE = os.path.join(DATA_DIR, "incoming.json")
     RUNTIME_LOG_FILE = os.path.join(DATA_DIR, "runtime.log")
     keydir = os.path.join(DATA_DIR, "keyRings")
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(keydir, exist_ok=True)
+    harden_dir(DATA_DIR)
+    harden_dir(keydir)
+    _STORAGE.set_paths(
+        config_file=CONFIG_FILE,
+        state_file=STATE_FILE,
+        history_file=HISTORY_FILE,
+        incoming_file=INCOMING_FILE,
+        runtime_log_file=RUNTIME_LOG_FILE,
+        keydir=keydir,
+    )
 
 
 def migrate_data_dir(base_dir: str, node_dir: str) -> None:
@@ -141,7 +171,7 @@ def migrate_data_dir(base_dir: str, node_dir: str) -> None:
         return
     try:
         os.makedirs(node_dir, exist_ok=True)
-        for name in ("config.json", "state.json", "history.log", "runtime.log"):
+        for name in ("config.json", "state.json", "incoming.json", "history.log", "runtime.log"):
             src = os.path.join(base_dir, name)
             dst = os.path.join(node_dir, name)
             if os.path.isfile(src) and not os.path.isfile(dst):
@@ -160,205 +190,19 @@ def migrate_data_dir(base_dir: str, node_dir: str) -> None:
 
 
 def load_state(default_peer: Optional[str] = None) -> Dict[str, Dict[str, Dict[str, object]]]:
-    if not os.path.isfile(STATE_FILE):
-        return {}
-    try:
-        import json
-        data = json.loads(open(STATE_FILE, "r", encoding="utf-8").read())
-        pending: Dict[str, Dict[str, Dict[str, object]]] = {}
-        for item in data.get("pending", []):
-            if not isinstance(item, dict):
-                continue
-            mid = item.get("id")
-            if isinstance(mid, str) and mid:
-                peer = item.get("peer")
-                if not isinstance(peer, str) or not peer:
-                    peer = default_peer or "default"
-                pending.setdefault(peer, {})[mid] = item
-        return pending
-    except Exception:
-        return {}
+    return _STORAGE.load_state(default_peer=default_peer)
 
 
 def save_state(pending_by_peer: Dict[str, Dict[str, Dict[str, object]]]) -> None:
-    import json
-    tmp = STATE_FILE + ".tmp"
-    flat = []
-    for peer_id, items in pending_by_peer.items():
-        for rec in items.values():
-            if isinstance(rec, dict):
-                rec = dict(rec)
-                rec.setdefault("peer", peer_id)
-                flat.append(rec)
-    data = {"pending": flat}
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, STATE_FILE)
+    _STORAGE.save_state(pending_by_peer)
 
 
 def load_incoming_state() -> Dict[str, Dict[str, object]]:
-    if not os.path.isfile(INCOMING_FILE):
-        return {}
-    try:
-        import json
-        data = json.loads(open(INCOMING_FILE, "r", encoding="utf-8").read())
-        incoming: Dict[str, Dict[str, object]] = {}
-        for item in data.get("incoming", []):
-            if not isinstance(item, dict):
-                continue
-            peer = item.get("peer")
-            group_id = item.get("group_id")
-            total = item.get("total")
-            parts = item.get("parts") or {}
-            if not isinstance(peer, str) or not peer or not isinstance(group_id, str) or not group_id:
-                continue
-            if not isinstance(total, int) or total <= 0:
-                continue
-            if not isinstance(parts, dict):
-                continue
-            parts_int: Dict[int, str] = {}
-            for k, v in parts.items():
-                try:
-                    ki = int(k)
-                except Exception:
-                    continue
-                parts_int[ki] = str(v)
-            key = f"{peer}:{group_id}"
-            incoming[key] = {
-                "peer": peer,
-                "group_id": group_id,
-                "total": total,
-                "parts": parts_int,
-                "delivery": item.get("delivery"),
-                "hops_sum": float(item.get("hops_sum", 0.0)),
-                "hops_n": int(item.get("hops_n", 0)),
-                "attempts_sum": float(item.get("attempts_sum", 0.0)),
-                "attempts_n": int(item.get("attempts_n", 0)),
-                "compact": bool(item.get("compact", False)),
-                "compression": int(item.get("compression", 0) or 0),
-                "legacy_codec": (str(item.get("legacy_codec")) if item.get("legacy_codec") else None),
-                "payload_cmp": (str(item.get("payload_cmp")) if item.get("payload_cmp") else "none"),
-                "received_at_ts": float(item.get("received_at_ts", 0.0) or 0.0),
-                "incoming_started_ts": float(item.get("incoming_started_ts", 0.0) or 0.0),
-            }
-        return incoming
-    except Exception:
-        return {}
+    return _STORAGE.load_incoming_state()
 
 
 def save_incoming_state(incoming: Dict[str, Dict[str, object]]) -> None:
-    import json
-    tmp = INCOMING_FILE + ".tmp"
-    flat = []
-    for rec in incoming.values():
-        if not isinstance(rec, dict):
-            continue
-        peer = rec.get("peer")
-        group_id = rec.get("group_id")
-        total = rec.get("total")
-        parts = rec.get("parts") or {}
-        if not isinstance(peer, str) or not peer or not isinstance(group_id, str) or not group_id:
-            continue
-        if not isinstance(total, int) or total <= 0:
-            continue
-        if not isinstance(parts, dict):
-            continue
-        parts_str: Dict[str, str] = {}
-        for k, v in parts.items():
-            parts_str[str(k)] = str(v)
-        flat.append(
-            {
-                "peer": peer,
-                "group_id": group_id,
-                "total": total,
-                "parts": parts_str,
-                "delivery": rec.get("delivery"),
-                "hops_sum": float(rec.get("hops_sum", 0.0)),
-                "hops_n": int(rec.get("hops_n", 0)),
-                "attempts_sum": float(rec.get("attempts_sum", 0.0)),
-                "attempts_n": int(rec.get("attempts_n", 0)),
-                "compact": bool(rec.get("compact", False)),
-                "compression": int(rec.get("compression", 0) or 0),
-                "legacy_codec": (str(rec.get("legacy_codec")) if rec.get("legacy_codec") else None),
-                "payload_cmp": (str(rec.get("payload_cmp")) if rec.get("payload_cmp") else "none"),
-                "received_at_ts": float(rec.get("received_at_ts", 0.0) or 0.0),
-                "incoming_started_ts": float(rec.get("incoming_started_ts", 0.0) or 0.0),
-            }
-        )
-    data = {"incoming": flat}
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, INCOMING_FILE)
-
-
-def encode_history_meta_token(meta_data: Optional[Dict[str, object]]) -> str:
-    if not isinstance(meta_data, dict) or not meta_data:
-        return ""
-    try:
-        import json
-
-        raw = json.dumps(meta_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        if len(raw) > int(HISTORY_META_MAX_BYTES):
-            return ""
-        return HISTORY_META_PREFIX + base64.b64encode(raw).decode("ascii")
-    except Exception:
-        return ""
-
-
-def decode_history_meta_token(token: str) -> Optional[Dict[str, object]]:
-    if not isinstance(token, str):
-        return None
-    payload = token.strip()
-    if not payload.startswith(HISTORY_META_PREFIX):
-        return None
-    payload = payload[len(HISTORY_META_PREFIX) :].strip()
-    if not payload:
-        return None
-    try:
-        raw = base64.b64decode(payload.encode("ascii"), validate=True)
-        if len(raw) > int(HISTORY_META_MAX_BYTES):
-            return None
-        import json
-
-        data = json.loads(raw.decode("utf-8", errors="replace"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        return None
-    return None
-
-
-def parse_history_record_line(
-    line: str,
-) -> Optional[Tuple[str, str, str, str, str, Optional[Dict[str, object]]]]:
-    if not isinstance(line, str):
-        return None
-    parts = line.rstrip("\n").split(" | ")
-    if len(parts) < 5:
-        return None
-    base_line = " | ".join(parts[:5])
-    parsed = parse_history_line(base_line, strict_encoded=True)
-    if parsed is None:
-        # Backward compatibility: legacy history rows could store plain text
-        # without b64 prefix. Keep strict behavior for malformed b64 payloads.
-        text_wire = str(parts[4] or "")
-        if text_wire.startswith(HISTORY_TEXT_PREFIX):
-            return None
-        # Parse full legacy line first to preserve plain text that may contain
-        # " | " separators.
-        parsed = parse_history_line(line.rstrip("\n"), strict_encoded=False)
-        if parsed is None:
-            parsed = parse_history_line(base_line, strict_encoded=False)
-    if parsed is None:
-        return None
-    meta_data: Optional[Dict[str, object]] = None
-    for token in parts[5:]:
-        decoded = decode_history_meta_token(token)
-        if isinstance(decoded, dict):
-            meta_data = decoded
-            break
-    ts_part, direction, peer_id, msg_id, text = parsed
-    return (ts_part, direction, peer_id, msg_id, text, meta_data)
+    _STORAGE.save_incoming_state(incoming)
 
 
 def append_history(
@@ -369,61 +213,19 @@ def append_history(
     extra: str = "",
     meta_data: Optional[Dict[str, object]] = None,
 ) -> None:
-    peer_norm = norm_id_for_filename(peer_id)
-    line = f"{ts_local()} | {direction} | {peer_norm} | {msg_id} | {encode_history_text(text)}"
-    extras: list[str] = []
-    extra_text = str(extra).strip()
-    if extra_text:
-        extras.append(extra_text)
-    meta_token = encode_history_meta_token(meta_data)
-    if meta_token:
-        extras.append(meta_token)
-    if extras:
-        line += " | " + " | ".join(extras)
-    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    append_runtime_log(line)
+    _STORAGE.append_history(direction, peer_id, msg_id, text, extra=extra, meta_data=meta_data, peer_norm_fn=norm_id_for_filename)
 
 
 def append_runtime_log(line: str) -> None:
-    if not line:
-        return
-    if not RUNTIME_LOG_ENABLED:
-        return
-    try:
-        os.makedirs(os.path.dirname(RUNTIME_LOG_FILE) or ".", exist_ok=True)
-        with runtime_log_lock:
-            with open(RUNTIME_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except Exception:
-        pass
+    _STORAGE.append_runtime_log(line)
 
 
 def load_config() -> Dict[str, object]:
-    if not os.path.isfile(CONFIG_FILE):
-        return {}
-    try:
-        import json
-        return json.loads(open(CONFIG_FILE, "r", encoding="utf-8").read())
-    except Exception:
-        return {}
+    return _STORAGE.load_config()
 
 
 def save_config(cfg: Dict[str, object]) -> None:
-    import json
-    tmp = CONFIG_FILE + ".tmp"
-    os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False)
-    os.replace(tmp, CONFIG_FILE)
-
-
-def b64e(b: bytes) -> str:
-    return base64.b64encode(b).decode("ascii")
-
-
-def b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("ascii"))
+    _STORAGE.save_config(cfg)
 
 
 def infer_compact_cmp_label_from_chunk(chunk: bytes) -> Optional[str]:
@@ -489,76 +291,7 @@ def effective_payload_cmp_label(
     return "none"
 
 
-def load_priv(path: str) -> x25519.X25519PrivateKey:
-    raw = b64d(open(path, "r", encoding="utf-8").read().strip())
-    return x25519.X25519PrivateKey.from_private_bytes(raw)
-
-
-def load_pub(path: str) -> x25519.X25519PublicKey:
-    raw = b64d(open(path, "r", encoding="utf-8").read().strip())
-    return x25519.X25519PublicKey.from_public_bytes(raw)
-
-
-def derive_key(priv: x25519.X25519PrivateKey, peer: x25519.X25519PublicKey) -> bytes:
-    shared = priv.exchange(peer)
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=b"meshTalk v1",
-        info=b"meshTalk v1",
-    )
-    return hkdf.derive(shared)
-
-
-def pack_message(
-    msg_type: int,
-    msg_id: bytes,
-    aes: AESGCM,
-    plaintext: bytes,
-    allow_payload_compress: bool = True,
-) -> Tuple[bytes, str]:
-    nonce = os.urandom(12)
-    if allow_payload_compress:
-        pt_wrapped, compression_method = compress_for_encrypt_with_method(plaintext)
-    else:
-        pt_wrapped = plaintext
-        compression_method = "none"
-    ct = aes.encrypt(nonce, pt_wrapped, msg_id)
-    return bytes([PROTO_VERSION, msg_type]) + msg_id + nonce + ct, compression_method
-
-
-def try_unpack_message(payload: bytes, aes: AESGCM) -> Tuple[str, Optional[int], Optional[bytes], Optional[bytes], str]:
-    if len(payload) < (1 + 1 + 8 + 12 + 16):
-        return ("nope", None, None, None, "n/a")
-    ver = payload[0]
-    if ver != PROTO_VERSION:
-        return ("nope", None, None, None, "n/a")
-    msg_type = payload[1]
-    if msg_type not in (TYPE_MSG, TYPE_ACK):
-        return ("nope", None, None, None, "n/a")
-    msg_id = payload[2:10]
-    nonce = payload[10:22]
-    ct = payload[22:]
-    try:
-        pt = aes.decrypt(nonce, ct, msg_id)
-    except Exception:
-        return ("decrypt_fail", msg_type, msg_id, None, "n/a")
-    compression_method = compression_method_from_payload(pt)
-    pt = maybe_decompress_after_decrypt(pt)
-    return ("ok", msg_type, msg_id, pt, compression_method)
-
-
-def parse_payload(raw) -> Optional[bytes]:
-    if raw is None:
-        return None
-    if isinstance(raw, (bytes, bytearray)):
-        return bytes(raw)
-    if isinstance(raw, str):
-        try:
-            return base64.b64decode(raw)
-        except Exception:
-            return None
-    return None
+# Protocol/crypto helpers live in meshtalk.protocol and are imported above.
 
 
 def detect_serial_port() -> Optional[str]:
@@ -627,8 +360,12 @@ class PeerState:
     def __init__(self, peer_id_norm: str, aes: Optional[AESGCM] = None) -> None:
         self.peer_id_norm = peer_id_norm
         self.aes = aes
+        self.last_seen_ts = 0.0
+        # Set only after confirmed two-way key exchange (peer has our pub and we have peer pub).
+        self.key_confirmed_ts = 0.0
         self.compression_capable = False
         self.compression_modes = set(LEGACY_COMPRESSION_MODES)
+        self.aad_type_bound = False
         self.pending: Dict[str, Dict[str, object]] = {}
         self.last_send_ts = 0.0
         self.next_key_req_ts = 0.0
@@ -664,7 +401,7 @@ def peer_request_id(args_user: Optional[str]) -> Optional[str]:
     return args_user
 
 
-def parse_key_frame(payload: bytes) -> Optional[Tuple[str, str, bytes, Optional[set[int]]]]:
+def parse_key_frame(payload: bytes) -> Optional[Tuple[str, str, bytes, Optional[set[int]], Optional[set[str]]]]:
     parsed = parse_key_exchange_frame(
         payload=payload,
         key_req_prefix=KEY_REQ_PREFIX,
@@ -673,8 +410,14 @@ def parse_key_frame(payload: bytes) -> Optional[Tuple[str, str, bytes, Optional[
     )
     if parsed is None:
         return None
-    kind, peer_id, pub_raw, peer_modes = parsed
-    return (kind, peer_id, pub_raw, set(peer_modes) if peer_modes else None)
+    kind, peer_id, pub_raw, peer_modes, peer_caps = parsed
+    return (
+        kind,
+        peer_id,
+        pub_raw,
+        set(peer_modes) if peer_modes else None,
+        set(peer_caps) if peer_caps else None,
+    )
 
 
 def load_known_peers(keydir: str, self_id_norm: str) -> Dict[str, x25519.X25519PublicKey]:
@@ -718,6 +461,7 @@ def get_self_id(interface: SerialInterface) -> Optional[str]:
 
 
 def main() -> int:
+    maybe_set_private_umask()
     cfg_cli: Dict[str, object] = {}
     discovery_enabled = True
     discovery_send = discovery_enabled
@@ -831,6 +575,7 @@ def main() -> int:
         set_data_dir_for_node(self_id)
         migrate_data_dir(os.path.join(LEGACY_BASE_DIR, self_id), DATA_DIR)
         migrate_data_dir(LEGACY_BASE_DIR, DATA_DIR)
+        ensure_storage_key()
         priv_path = os.path.join(keydir, f"{self_id}.key")
         pub_path = os.path.join(keydir, f"{self_id}.pub")
         # Ensure key files exist (auto-generate if missing)
@@ -851,8 +596,12 @@ def main() -> int:
                 f.write(b64e(priv_raw))
             with open(pub_path, "w", encoding="utf-8") as f:
                 f.write(b64e(pub_raw))
+            harden_file(priv_path)
+            harden_file(pub_path)
             generated_now = True
             ui_emit("log", f"{ts_local()} KEY: auto-generated keys -> {priv_path}, {pub_path}")
+        harden_file(priv_path)
+        harden_file(pub_path)
         priv = load_priv(priv_path)
         pub_self = load_pub(pub_path)
         pub_self_raw = pub_self.public_bytes(
@@ -981,8 +730,20 @@ def main() -> int:
         peer_id_norm = norm_id_for_filename(peer_id)
         path = os.path.join(keydir, f"{peer_id_norm}.pub")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # TOFU pinning: never silently overwrite an existing peer key.
+        if os.path.isfile(path):
+            try:
+                prev = b64d(open(path, "r", encoding="utf-8").read().strip())
+                if isinstance(prev, (bytes, bytearray)) and bytes(prev) != pub_raw_bytes:
+                    raise PeerKeyPinnedError(peer_id_norm, pub_fingerprint(bytes(prev)), pub_fingerprint(pub_raw_bytes))
+            except PeerKeyPinnedError:
+                raise
+            except Exception:
+                # Corrupted key file: allow overwrite to recover.
+                pass
         with open(path, "w", encoding="utf-8") as f:
             f.write(b64e(pub_raw_bytes))
+        harden_file(path)
         update_peer_pub(peer_id_norm, pub_raw_bytes)
         return path
 
@@ -1000,10 +761,22 @@ def main() -> int:
         if not payload:
             return
 
+        # Peer presence signal: any packet on our port counts as "seen".
+        try:
+            now_seen = time.time()
+            from_id_seen = packet.get("fromId")
+            peer_norm_seen = norm_id_for_filename(from_id_seen) if from_id_seen else None
+            if peer_norm_seen:
+                st_seen = get_peer_state(peer_norm_seen)
+                if st_seen:
+                    st_seen.last_seen_ts = now_seen
+        except Exception:
+            pass
+
         # Key exchange frames are plaintext
         key_frame = parse_key_frame(payload)
         if key_frame:
-            kind, peer_id, pub_raw, peer_modes = key_frame
+            kind, peer_id, pub_raw, peer_modes, peer_caps = key_frame
             from_id_raw = packet.get("fromId")
             to_id = packet.get("toId") or packet.get("to")
             accepted_frame, trusted_capabilities, reject_reason, is_broadcast, from_id = key_frame_receive_policy(
@@ -1029,26 +802,19 @@ def main() -> int:
             if not accepted_frame:
                 ui_emit("log", f"{ts_local()} KEY: reject frame from {peer_id}.")
                 return
-            prev_pub_raw = None
-            try:
-                prev_pub = known_peers.get(peer_norm)
-                if prev_pub is not None:
-                    prev_pub_raw = prev_pub.public_bytes(
-                        encoding=serialization.Encoding.Raw,
-                        format=serialization.PublicFormat.Raw,
-                    )
-            except Exception:
-                prev_pub_raw = None
-            st_before = peer_states.get(peer_norm)
-            had_key_ready = bool(st_before and st_before.key_ready)
             try:
                 store_peer_pub(peer_id, pub_raw)
+            except PeerKeyPinnedError as ex:
+                ui_emit(
+                    "log",
+                    f"{ts_local()} KEY: pinned key mismatch for {peer_id} old={ex.old_fp} new={ex.new_fp}. Use 'Reset key' to accept new.",
+                )
+                return
             except Exception:
                 ui_emit("log", f"{ts_local()} KEY: reject invalid public key from {peer_id}.")
                 return
             last_activity_ts = time.time()
             st = get_peer_state(peer_norm)
-            key_changed = (prev_pub_raw != pub_raw)
             if st and trusted_capabilities:
                 # Capabilities from key frames are accepted only for verifiable unicast sources.
                 if peer_modes:
@@ -1058,18 +824,14 @@ def main() -> int:
                     # Missing modes means peer is legacy or downgraded: reset stale capabilities.
                     st.compression_capable = False
                     st.compression_modes = set(LEGACY_COMPRESSION_MODES)
-            if st and st.key_ready and (key_changed or not had_key_ready):
+                st.aad_type_bound = bool(peer_caps and ("aad_type" in peer_caps))
+            if st and st.key_ready and kind == "resp":
                 st.last_key_ok_ts = time.time()
-                if kind == "resp":
-                    ui_emit("log", f"{ts_local()} KEY: exchange complete with {peer_id}. Encryption active.")
-                    st.force_key_req = False
-                    st.await_key_confirm = False
-                    st.next_key_req_ts = float("inf")
-                else:
-                    # For unicast request, keep retrying until peer confirms receipt.
-                    if not is_broadcast:
-                        st.await_key_confirm = True
-                        st.next_key_req_ts = time.time() + max(1.0, float(args.retry_seconds))
+                st.key_confirmed_ts = st.last_key_ok_ts
+                ui_emit("log", f"{ts_local()} KEYOK: exchange complete with {peer_id}. Confirmed.")
+                st.force_key_req = False
+                st.await_key_confirm = False
+                st.next_key_req_ts = float("inf")
             if kind == "req":
                 ui_emit("log", f"{ts_local()} KEY: request from {peer_id}")
                 now = time.time()
@@ -1095,6 +857,7 @@ def main() -> int:
                         + b64e(pub_self_raw).encode("ascii")
                         + b"|mc_modes="
                         + modes_bytes
+                        + b"|mt_caps=aad_type"
                     )
                     if from_id:
                         interface.sendData(
@@ -1110,12 +873,14 @@ def main() -> int:
                     st.await_key_confirm = True
                     st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
             else:
-                ui_emit("log", f"{ts_local()} KEY: response from {peer_id}")
                 if st:
                     st.force_key_req = False
                     st.await_key_confirm = False
                     st.next_key_req_ts = float("inf")
                     st.last_key_ok_ts = time.time()
+                    if st.key_ready and st.key_confirmed_ts <= 0.0:
+                        # Response implies peer received our pub key, so this is confirmed.
+                        st.key_confirmed_ts = st.last_key_ok_ts
             ui_emit("peer_update", peer_norm)
             return
 
@@ -1133,9 +898,12 @@ def main() -> int:
                         send_key_request(peer_norm)
                         st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
                         ui_emit("log", f"{ts_local()} KEY: request (no key) -> {from_id}")
+                        ui_emit("peer_update", peer_norm)
             return
 
-        status, msg_type, msg_id, pt, rx_compression = try_unpack_message(payload, st.aes)
+        status, msg_type, msg_id, pt, rx_compression = try_unpack_message(
+            payload, st.aes, bind_aad_type=bool(getattr(st, "aad_type_bound", False))
+        )
         if status == "decrypt_fail":
             now = time.time()
             if (st.last_decrypt_fail_ts <= 0.0) or ((now - st.last_decrypt_fail_ts) > 30.0):
@@ -1155,6 +923,7 @@ def main() -> int:
                 if now >= st.next_key_req_ts:
                     send_key_request(peer_norm)
                     st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
+                ui_emit("peer_update", peer_norm)
             return
         if status != "ok" or msg_type is None or msg_id is None:
             return
@@ -1165,8 +934,9 @@ def main() -> int:
             st.force_key_req = False
             st.next_key_req_ts = float("inf")
             st.last_key_ok_ts = time.time()
+            st.key_confirmed_ts = st.last_key_ok_ts
             if from_id:
-                ui_emit("log", f"{ts_local()} KEY: confirmed by encrypted traffic from {from_id}.")
+                ui_emit("log", f"{ts_local()} KEYOK: confirmed by encrypted traffic from {from_id}.")
 
         def build_ack_text(hops: Optional[int]) -> bytes:
             parts = ["ACK", "mc=1", f"mc_modes={','.join(str(m) for m in COMPRESSION_MODES)}"]
@@ -1252,7 +1022,13 @@ def main() -> int:
                         hops = None
                         if isinstance(hop_start, int) and isinstance(hop_limit, int):
                             hops = max(0, hop_start - hop_limit)
-                        ack_payload, _ack_cmp = pack_message(TYPE_ACK, msg_id, st.aes, build_ack_text(hops))
+                        ack_payload, _ack_cmp = pack_message(
+                            TYPE_ACK,
+                            msg_id,
+                            st.aes,
+                            build_ack_text(hops),
+                            bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
+                        )
                         try:
                             interface.sendData(
                                 ack_payload,
@@ -1351,7 +1127,13 @@ def main() -> int:
                             hops = None
                             if isinstance(hop_start, int) and isinstance(hop_limit, int):
                                 hops = max(0, hop_start - hop_limit)
-                            ack_payload, _ack_cmp = pack_message(TYPE_ACK, msg_id, st.aes, build_ack_text(hops))
+                            ack_payload, _ack_cmp = pack_message(
+                                TYPE_ACK,
+                                msg_id,
+                                st.aes,
+                                build_ack_text(hops),
+                                bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
+                            )
                             try:
                                 interface.sendData(
                                     ack_payload,
@@ -1364,10 +1146,8 @@ def main() -> int:
                                 ui_emit("radio_lost", None)
                             return
                     seen_parts[part_key] = now
-            if compact_wire:
-                print(f"RECV from {from_id}: part {part}/{total}")
-            else:
-                print(f"RECV from {from_id}: {text}")
+            recv_group = group_id if group_id is not None else msg_hex
+            print(f"RECV from {from_id}: id={recv_group} part {part}/{total}")
             log_cmp = (
                 effective_payload_cmp_label(
                     payload_cmp,
@@ -1416,7 +1196,13 @@ def main() -> int:
                 hops = None
                 if isinstance(hop_start, int) and isinstance(hop_limit, int):
                     hops = max(0, hop_start - hop_limit)
-                ack_payload, _ack_cmp = pack_message(TYPE_ACK, msg_id, st.aes, build_ack_text(hops))
+                ack_payload, _ack_cmp = pack_message(
+                    TYPE_ACK,
+                    msg_id,
+                    st.aes,
+                    build_ack_text(hops),
+                    bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
+                )
                 try:
                     interface.sendData(
                         ack_payload,
@@ -1467,6 +1253,8 @@ def main() -> int:
             f.write(b64e(priv_raw))
         with open(pub_path, "w", encoding="utf-8") as f:
             f.write(b64e(pub_raw))
+        harden_file(priv_path)
+        harden_file(pub_path)
         priv = load_priv(priv_path)
         pub_self = load_pub(pub_path)
         pub_self_raw = pub_self.public_bytes(
@@ -1502,6 +1290,7 @@ def main() -> int:
             + b64e(pub_self_raw).encode("ascii")
             + b"|mc_modes="
             + modes_bytes
+            + b"|mt_caps=aad_type"
         )
         try:
             interface.sendData(
@@ -1535,6 +1324,7 @@ def main() -> int:
             + b64e(pub_self_raw).encode("ascii")
             + b"|mc_modes="
             + modes_bytes
+            + b"|mt_caps=aad_type"
         )
         try:
             interface.sendData(
@@ -1725,7 +1515,7 @@ def main() -> int:
             print(f"QUEUE: {group_id} parts={total} bytes={len(text_bytes)} cmp={cmp_label}")
         else:
             print(f"WAITING KEY: queued for {peer_norm} id={group_id}")
-        ui_emit("queued", (peer_norm, text))
+        ui_emit("queued", (peer_norm, group_id, len(text_bytes), int(total), str(cmp_label)))
         tracked_peers.add(peer_norm)
         return (group_id, total, normalize_compression_name(cmp_label), cmp_eff_pct)
 
@@ -1859,6 +1649,7 @@ def main() -> int:
                     st.aes,
                     pt,
                     allow_payload_compress=False,
+                    bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
                 )
                 if len(payload) > args.max_bytes:
                     with pending_lock:
@@ -2051,6 +1842,7 @@ def main() -> int:
                 "group_rename_failed": "Group not found.",
                 "pinned": "Pinned",
                 "recent": "Contact list",
+                "last_seen": "Last seen",
                 "peer_delete": "Delete contact",
                 "peer_delete_confirm": "Delete contact '{name}'?",
                 "clear_history": "Clear history",
@@ -2116,6 +1908,7 @@ def main() -> int:
                 "group_rename_failed": "Группа не найдена.",
                 "pinned": "Закреплённые",
                 "recent": "Список контактов",
+                "last_seen": "Last seen",
                 "peer_delete": "Удалить собеседника",
                 "peer_delete_confirm": "Удалить собеседника '{name}'?",
                 "clear_history": "Очистить историю",
@@ -2161,8 +1954,7 @@ def main() -> int:
         hidden_contacts = set(cfg.get("hidden_contacts", []))
         groups_cfg = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
         clear_pending_on_switch = bool(cfg.get("clear_pending_on_switch", True))
-        global RUNTIME_LOG_ENABLED
-        RUNTIME_LOG_ENABLED = runtime_log_file
+        _STORAGE.set_runtime_log_enabled(runtime_log_file)
         if current_lang not in ("ru", "en"):
             current_lang = "ru"
 
@@ -2301,10 +2093,8 @@ def main() -> int:
                 lock_state = data.get("lock")
                 unread = int(data.get("unread", 0) or 0)
                 rect = option.rect
-                size = 14
                 pad = 4
-                x = rect.right() - size - pad
-                y = rect.bottom() - size - pad
+                selected = bool(option.state & QtWidgets.QStyle.State_Selected)
                 painter.save()
                 if unread > 0:
                     dot = 8
@@ -2313,14 +2103,36 @@ def main() -> int:
                     painter.setPen(QtCore.Qt.NoPen)
                     painter.setBrush(QtGui.QColor("#ff9800"))
                     painter.drawEllipse(QtCore.QRect(dot_x, dot_y, dot, dot))
-                if lock_state == "ok":
-                    color = QtGui.QColor("#8a7f8b")
-                    text = "🔒"
-                    painter.setPen(color)
-                    font = painter.font()
-                    font.setPointSize(9)
-                    painter.setFont(font)
-                    painter.drawText(QtCore.QRect(x, y, size, size), QtCore.Qt.AlignCenter, text)
+                fg = QtGui.QColor("#2b0a22") if selected else QtGui.QColor("#8a7f8b")
+                painter.setPen(fg)
+                font = painter.font()
+                font.setPointSize(8)
+                painter.setFont(font)
+                fm = QtGui.QFontMetrics(font)
+                line_h = int(max(10, fm.height()))
+                y = rect.bottom() - pad - line_h
+                try:
+                    key_h = int(data.get("key_h")) if data.get("key_h") is not None else None
+                except Exception:
+                    key_h = None
+                try:
+                    seen_h = int(data.get("seen_h")) if data.get("seen_h") is not None else None
+                except Exception:
+                    seen_h = None
+                if lock_state == "ok" and key_h is not None:
+                    lock_text = f"🔒 {key_h} h"
+                    painter.drawText(
+                        QtCore.QRect(rect.left() + pad, y, rect.width() - pad * 2, line_h),
+                        int(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter),
+                        lock_text,
+                    )
+                    y -= line_h
+                seen_text = f"{tr('last_seen')}: {seen_h} h" if seen_h is not None else f"{tr('last_seen')}: -"
+                painter.drawText(
+                    QtCore.QRect(rect.left() + pad, y, rect.width() - pad * 2, line_h),
+                    int(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter),
+                    seen_text,
+                )
                 painter.restore()
 
         items_list.setItemDelegate(ContactDelegate(items_list))
@@ -2345,11 +2157,39 @@ def main() -> int:
             QLabel#hint { color: #bcaec0; font-size: 10px; }
             QLabel#section { color: #c0b7c2; font-size: 13px; font-weight: 400; }
             QWidget#headerBar { background: #c24f00; }
-            QWidget#headerBar QLabel { background: #c24f00; font-weight: 600; color: #2b0a22; }
+            QWidget#headerBar QLabel { background: transparent; font-weight: 600; color: #2b0a22; }
+            QWidget#headerBar[mtStatus="ok"] { background: #0b3d1f; }
+            QWidget#headerBar[mtStatus="ok"] QLabel { color: #eaffea; }
+            QWidget#headerBar[mtStatus="error"] { background: #6b1d1d; }
+            QWidget#headerBar[mtStatus="error"] QLabel { color: #ffecec; }
             QListWidget::item { padding: 8px 0px; }
-            QListWidget::item:selected { background: #3a0f2c; }
+            QListWidget::item:selected { background: #ff9800; color: #2b0a22; }
+            QListWidget::item:selected:!active { background: #ff9800; color: #2b0a22; }
             """
         )
+
+        header_status = "init"
+        errors_need_ack = False
+        header_bar.setProperty("mtStatus", header_status)
+
+        def set_header_status(status: str) -> None:
+            nonlocal header_status
+            st = str(status or "init").strip().lower()
+            if st not in ("init", "ok", "error"):
+                st = "init"
+            if st == header_status:
+                return
+            header_status = st
+            header_bar.setProperty("mtStatus", st)
+            try:
+                header_bar.style().unpolish(header_bar)
+                header_bar.style().polish(header_bar)
+            except Exception:
+                pass
+            header_bar.update()
+
+        peer_meta: Dict[str, Dict[str, float]] = {}
+        peer_meta_dirty = False
 
         groups: Dict[str, set] = {k: set(v) for k, v in groups_cfg.items() if isinstance(k, str) and isinstance(v, list)}
         dialogs: Dict[str, Dict[str, object]] = {}
@@ -2377,6 +2217,7 @@ def main() -> int:
                     "discovery_send": discovery_send,
                     "discovery_reply": discovery_reply,
                     "clear_pending_on_switch": clear_pending_on_switch,
+                    "peer_meta": peer_meta,
                 }
             )
 
@@ -2388,6 +2229,30 @@ def main() -> int:
             send_btn.setText(tr("send"))
             search_field.setPlaceholderText(tr("search"))
 
+        def update_peer_meta(peer_norm: Optional[str]) -> None:
+            nonlocal peer_meta_dirty
+            if not peer_norm:
+                return
+            st = peer_states.get(peer_norm)
+            if not st:
+                return
+            prev_rec = peer_meta.get(peer_norm, {})
+            rec: Dict[str, float] = dict(prev_rec) if isinstance(prev_rec, dict) else {}
+            changed = False
+            if float(getattr(st, "last_seen_ts", 0.0) or 0.0) > 0.0:
+                prev = float(rec.get("last_seen_ts", 0.0) or 0.0)
+                if float(st.last_seen_ts) > (prev + 1.0):
+                    rec["last_seen_ts"] = float(st.last_seen_ts)
+                    changed = True
+            if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) > 0.0:
+                prev = float(rec.get("key_confirmed_ts", 0.0) or 0.0)
+                if float(st.key_confirmed_ts) > (prev + 1.0):
+                    rec["key_confirmed_ts"] = float(st.key_confirmed_ts)
+                    changed = True
+            if changed:
+                peer_meta[peer_norm] = rec
+                peer_meta_dirty = True
+
         settings_log_view: Optional["QtWidgets.QTextEdit"] = None
 
         def open_settings() -> None:
@@ -2396,6 +2261,9 @@ def main() -> int:
             nonlocal runtime_log_file
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
+            nonlocal errors_need_ack
+            errors_need_ack = False
+            update_status()
             dlg = QtWidgets.QDialog(win)
             dlg.setWindowTitle(tr("settings_title"))
             dlg.resize(700, 560)
@@ -2551,8 +2419,7 @@ def main() -> int:
                 nonlocal verbose_log, runtime_log_file, discovery_send, discovery_reply, clear_pending_on_switch
                 verbose_log = cb_verbose.isChecked()
                 runtime_log_file = cb_runtime_log.isChecked()
-                global RUNTIME_LOG_ENABLED
-                RUNTIME_LOG_ENABLED = runtime_log_file
+                _STORAGE.set_runtime_log_enabled(runtime_log_file)
                 prev_send = discovery_send
                 discovery_send = cb_discovery_send.isChecked()
                 discovery_reply = cb_discovery_reply.isChecked()
@@ -2604,9 +2471,7 @@ def main() -> int:
                     log_buffer.clear()
                     if settings_log_view is not None:
                         settings_log_view.clear()
-                    with runtime_log_lock:
-                        with open(RUNTIME_LOG_FILE, "w", encoding="utf-8") as f:
-                            f.write("")
+                    _STORAGE.clear_runtime_log()
                 except Exception:
                     pass
             def on_full_reset():
@@ -2664,15 +2529,24 @@ def main() -> int:
                     os.makedirs(keydir, exist_ok=True)
                 except Exception:
                     pass
+                # New storage key for encrypted history/state at rest.
+                _STORAGE.set_paths(
+                    config_file=CONFIG_FILE,
+                    state_file=STATE_FILE,
+                    history_file=HISTORY_FILE,
+                    incoming_file=INCOMING_FILE,
+                    runtime_log_file=RUNTIME_LOG_FILE,
+                    keydir=keydir,
+                )
+                ensure_storage_key()
                 # Reset runtime options to defaults.
                 current_lang = "ru"
                 verbose_log = True
-                runtime_log_file = True
-                discovery_send = True
-                discovery_reply = True
+                runtime_log_file = False
+                discovery_send = False
+                discovery_reply = False
                 clear_pending_on_switch = True
-                global RUNTIME_LOG_ENABLED
-                RUNTIME_LOG_ENABLED = True
+                _STORAGE.set_runtime_log_enabled(runtime_log_file)
                 try:
                     args.retry_seconds = 30
                     args.max_seconds = 3600
@@ -3096,6 +2970,7 @@ def main() -> int:
 
         def refresh_list() -> None:
             items_list.clear()
+            now_ts = time.time()
             ordered = sorted(
                 dialogs.items(),
                 key=lambda kv: float(kv[1].get("last_rx_ts", kv[1].get("last_ts", 0.0))),
@@ -3124,9 +2999,28 @@ def main() -> int:
                 if item_id.startswith("group:"):
                     return None
                 st = get_peer_state(item_id)
-                if st and st.key_ready:
-                    if (time.time() - st.last_key_ok_ts) <= 86400.0:
-                        return "ok"
+                if not st or not st.key_ready:
+                    return None
+                # Apply persisted peer metadata (if any) to in-memory state for UI purposes.
+                meta = peer_meta.get(item_id, {})
+                if isinstance(meta, dict):
+                    try:
+                        ls = meta.get("last_seen_ts")
+                        if float(getattr(st, "last_seen_ts", 0.0) or 0.0) <= 0.0 and isinstance(ls, (int, float)) and float(ls) > 0.0:
+                            st.last_seen_ts = float(ls)
+                    except Exception:
+                        pass
+                    try:
+                        kc = meta.get("key_confirmed_ts")
+                        if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) <= 0.0 and isinstance(kc, (int, float)) and float(kc) > 0.0:
+                            st.key_confirmed_ts = float(kc)
+                    except Exception:
+                        pass
+                # Show lock only after confirmed two-way exchange.
+                if bool(getattr(st, "await_key_confirm", False)):
+                    return None
+                if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) > 0.0:
+                    return "ok"
                 return None
 
             def add_item(item_id: str, last_text: str = "") -> None:
@@ -3146,9 +3040,35 @@ def main() -> int:
                 item.setForeground(QtGui.QColor(tx_hex))
                 item.setIcon(make_avatar(item_id))
                 unread = int(dialogs.get(item_id, {}).get("unread", 0) or 0)
+                lock_state = lock_state_for_item(item_id)
+                seen_h = None
+                key_h = None
+                if not item_id.startswith("group:"):
+                    st = peer_states.get(item_id)
+                    if st:
+                        try:
+                            seen_ts = float(getattr(st, "last_seen_ts", 0.0) or 0.0)
+                        except Exception:
+                            seen_ts = 0.0
+                        if seen_ts > 0.0:
+                            seen_h = int(max(0.0, (float(now_ts) - float(seen_ts)) // 3600.0))
+                        if lock_state == "ok":
+                            try:
+                                key_ts = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0)
+                            except Exception:
+                                key_ts = 0.0
+                            if key_ts > 0.0:
+                                key_h = int(max(0.0, (float(now_ts) - float(key_ts)) // 3600.0))
                 item.setData(
                     QtCore.Qt.UserRole,
-                    {"id": item_id, "pinned": item_id in pinned_dialogs, "unread": unread, "lock": lock_state_for_item(item_id)},
+                    {
+                        "id": item_id,
+                        "pinned": item_id in pinned_dialogs,
+                        "unread": unread,
+                        "lock": lock_state,
+                        "seen_h": seen_h,
+                        "key_h": key_h,
+                    },
                 )
                 items_list.addItem(item)
                 list_index.append(item_id)
@@ -3173,6 +3093,12 @@ def main() -> int:
                     add_item(gid, "")
             update_status()
             chat_label.setText(self_title())
+            # Keep current dialog visibly highlighted after list rebuild.
+            if current_dialog and current_dialog in list_index:
+                try:
+                    items_list.setCurrentRow(list_index.index(current_dialog))
+                except Exception:
+                    pass
 
         def set_language(lang: str, persist: bool = False) -> None:
             nonlocal current_lang
@@ -3781,13 +3707,25 @@ def main() -> int:
         def log_append_view(view: QtWidgets.QTextEdit, text: str, level: str) -> None:
             if level == "error":
                 color = "#f92672"
+            elif level == "keyok":
+                color = "#ad7fa8"
             elif level == "key":
                 color = "#6fdc6f"
+            elif level == "warn":
+                color = "#fd971f"
             else:
                 color = "#8a7f8b"
             append_html(view, text, color)
 
         def log_line(text: str, level: str = "info") -> None:
+            nonlocal errors_need_ack
+            try:
+                # Avoid touching Qt widgets from non-GUI threads.
+                if QtCore.QThread.currentThread() != app.thread():
+                    ui_emit("log", str(text))
+                    return
+            except Exception:
+                pass
             text, body = normalize_log_text_line(text, fallback_ts=ts_local())
             now = time.time()
             if not hasattr(log_line, "_last"):
@@ -3797,11 +3735,20 @@ def main() -> int:
             if body and body == str(last.get("body", "")) and (now - float(last.get("ts", 0.0))) < 0.6:
                 return
             log_line._last = {"body": body, "ts": now}
-            lvl = level
-            if ("ERROR" in text) or ("Exception" in text) or ("Traceback" in text):
-                lvl = "error"
-            elif "KEY:" in text:
-                lvl = "key"
+            lvl = str(level or "info").strip().lower()
+            low = text.lower()
+            if lvl == "info":
+                if ("pinned key mismatch" in low) or ("reject invalid public key" in low):
+                    lvl = "error"
+                elif ("error" in low) or ("exception" in low) or ("traceback" in low):
+                    # Keep it simple: treat traceback/exception/error keywords as errors.
+                    lvl = "error"
+                elif "keyok:" in low:
+                    lvl = "keyok"
+                elif "key:" in low:
+                    lvl = "key"
+            if lvl == "error" and settings_log_view is None:
+                errors_need_ack = True
             log_buffer.append((text, lvl))
             append_runtime_log(text)
             if settings_log_view is not None:
@@ -3813,7 +3760,7 @@ def main() -> int:
         def _gui_print(*args, **kwargs) -> None:
             text = " ".join(str(a) for a in args)
             if text:
-                log_line(text, "info")
+                ui_emit("log", text)
 
         _builtins.print = _gui_print
 
@@ -4092,8 +4039,12 @@ def main() -> int:
             )
 
         def update_status() -> None:
-            # Status is shown in Settings dialog; no-op placeholder for compatibility.
-            return
+            if errors_need_ack:
+                set_header_status("error")
+            elif radio_ready and not initializing:
+                set_header_status("ok")
+            else:
+                set_header_status("init")
 
         def dialog_has_dynamic_pending(dialog_id: Optional[str]) -> bool:
             if not dialog_id:
@@ -4197,6 +4148,7 @@ def main() -> int:
             nonlocal interface, self_id, self_id_raw, radio_ready, known_peers, peer_states, peer_names
             nonlocal initial_port_arg
             nonlocal clear_pending_on_switch, last_loaded_profile
+            nonlocal peer_meta_dirty
             if initializing:
                 now = time.time()
                 if (now - last_init_label_ts) >= 0.5:
@@ -4210,6 +4162,7 @@ def main() -> int:
                 except queue.Empty:
                     break
                 if evt == "peer_update":
+                    update_peer_meta(str(payload) if isinstance(payload, str) else None)
                     refresh_list()
                 elif evt == "config_reload":
                     cfg_new = payload if isinstance(payload, dict) else {}
@@ -4221,21 +4174,20 @@ def main() -> int:
                         current_lang = "ru"
                     verbose_log = bool(cfg.get("log_verbose", verbose_log))
                     runtime_log_file = bool(cfg.get("runtime_log_file", runtime_log_file))
-                    global RUNTIME_LOG_ENABLED
-                    RUNTIME_LOG_ENABLED = runtime_log_file
+                    _STORAGE.set_runtime_log_enabled(runtime_log_file)
                     legacy_discovery = cfg.get("discovery_enabled", None)
                     if "discovery_send" in cfg:
                         discovery_send = bool(cfg.get("discovery_send"))
                     elif legacy_discovery is not None:
                         discovery_send = bool(legacy_discovery)
                     else:
-                        discovery_send = True
+                        discovery_send = bool(discovery_send)
                     if "discovery_reply" in cfg:
                         discovery_reply = bool(cfg.get("discovery_reply"))
                     elif legacy_discovery is not None:
                         discovery_reply = bool(legacy_discovery)
                     else:
-                        discovery_reply = True
+                        discovery_reply = bool(discovery_reply)
                     clear_pending_on_switch = bool(cfg.get("clear_pending_on_switch", True))
                     args.retry_seconds = int(cfg.get("retry_seconds", args.retry_seconds))
                     args.max_seconds = int(cfg.get("max_seconds", args.max_seconds))
@@ -4243,6 +4195,37 @@ def main() -> int:
                     args.rate_seconds = int(float(cfg.get("rate_seconds", args.rate_seconds)))
                     pinned_dialogs = set(cfg.get("pinned_dialogs", []))
                     hidden_contacts = set(cfg.get("hidden_contacts", []))
+                    peer_meta_dirty = False
+                    peer_meta.clear()
+                    peer_meta_raw = cfg.get("peer_meta", {})
+                    if isinstance(peer_meta_raw, dict):
+                        for peer_id_raw, meta_raw in peer_meta_raw.items():
+                            if not isinstance(peer_id_raw, str) or not isinstance(meta_raw, dict):
+                                continue
+                            peer_norm = norm_id_for_filename(peer_id_raw)
+                            if not peer_norm:
+                                continue
+                            rec: Dict[str, float] = {}
+                            try:
+                                ls = meta_raw.get("last_seen_ts")
+                                if isinstance(ls, (int, float)) and float(ls) > 0.0:
+                                    rec["last_seen_ts"] = float(ls)
+                            except Exception:
+                                pass
+                            try:
+                                kc = meta_raw.get("key_confirmed_ts")
+                                if isinstance(kc, (int, float)) and float(kc) > 0.0:
+                                    rec["key_confirmed_ts"] = float(kc)
+                            except Exception:
+                                pass
+                            if rec:
+                                peer_meta[peer_norm] = rec
+                                st = peer_states.get(peer_norm)
+                                if st:
+                                    if float(getattr(st, "last_seen_ts", 0.0) or 0.0) <= 0.0 and rec.get("last_seen_ts"):
+                                        st.last_seen_ts = float(rec["last_seen_ts"])
+                                    if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) <= 0.0 and rec.get("key_confirmed_ts"):
+                                        st.key_confirmed_ts = float(rec["key_confirmed_ts"])
                     groups_cfg_local = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
                     groups.clear()
                     for k, v in groups_cfg_local.items():
@@ -4331,6 +4314,7 @@ def main() -> int:
                     else:
                         continue
                     peer_norm = norm_id_for_filename(from_id)
+                    update_peer_meta(peer_norm)
                     if peer_norm:
                         recv_now_ts = time.time()
                         key = f"{peer_norm}:{group_id}"
@@ -4486,10 +4470,30 @@ def main() -> int:
                             incoming_state.pop(key, None)
                             save_incoming_state(incoming_state)
                 elif evt == "queued":
-                    peer_norm, text = payload
-                    log_line(f"QUEUE -> {peer_norm}: {text}", "info")
+                    if isinstance(payload, tuple) and payload:
+                        peer_norm = str(payload[0] or "")
+                        if len(payload) >= 5:
+                            group_id = str(payload[1] or "")
+                            try:
+                                nbytes = int(payload[2] or 0)
+                            except Exception:
+                                nbytes = 0
+                            try:
+                                parts = int(payload[3] or 0)
+                            except Exception:
+                                parts = 0
+                            cmp_label = str(payload[4] or "")
+                            log_line(f"QUEUE -> {peer_norm}: id={group_id} parts={parts} bytes={nbytes} cmp={cmp_label}", "info")
+                        elif len(payload) >= 2:
+                            # Legacy payload: never log message text.
+                            text_legacy = str(payload[1] or "")
+                            log_line(
+                                f"QUEUE -> {peer_norm}: (redacted) bytes={len(text_legacy.encode('utf-8'))}",
+                                "info",
+                            )
                 elif evt == "ack":
                     peer_norm, group_id, delivery, attempts, total, fwd_hops, ack_hops = payload
+                    update_peer_meta(str(peer_norm) if isinstance(peer_norm, str) else None)
                     if not hasattr(process_ui_events, "_outgoing"):
                         process_ui_events._outgoing = {}
                     outgoing = process_ui_events._outgoing
@@ -4536,6 +4540,7 @@ def main() -> int:
                         outgoing.pop(group_id, None)
                 elif evt == "failed":
                     peer_norm, group_id, reason, attempts, total = payload
+                    update_peer_meta(str(peer_norm) if isinstance(peer_norm, str) else None)
                     update_sent_failed(str(peer_norm), str(group_id), str(reason), int(attempts), int(total))
                 elif evt == "log":
                     log_line(str(payload), "info")
@@ -4703,6 +4708,17 @@ def main() -> int:
         pending_meta_timer = QtCore.QTimer()
         pending_meta_timer.timeout.connect(refresh_dynamic_pending_meta)
         pending_meta_timer.start(1000)
+
+        def flush_peer_meta() -> None:
+            nonlocal peer_meta_dirty
+            if not peer_meta_dirty:
+                return
+            peer_meta_dirty = False
+            save_gui_config()
+
+        peer_meta_timer = QtCore.QTimer()
+        peer_meta_timer.timeout.connect(flush_peer_meta)
+        peer_meta_timer.start(30000)
 
         def radio_loop() -> None:
             nonlocal initializing, radio_loop_running

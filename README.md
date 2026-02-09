@@ -1,7 +1,7 @@
 # meshTools
 
 Author: Anton Vologzhanin (R3VAF)
-Current version: 0.3.1
+Current version: 0.3.2
 
 Small utilities around Meshtastic.
 
@@ -36,6 +36,7 @@ Small utilities around Meshtastic.
 - Python 3.9+
 - Meshtastic CLI in PATH (`meshtastic`)
 - `cryptography` package (for `meshTalk.py`)
+- `PySide6` package (Qt GUI for `meshTalk.py`)
 - Graphviz in PATH (`dot`) for `graphGen.py`
 
 ## Windows notes
@@ -103,20 +104,24 @@ python graphGen.py --root .
 
 Reliable P2P messaging (E2EE + ACK):
 
-Interactive chat (stdin -> ACK on each line):
+Qt GUI app:
 
 ```bash
-python meshTalk.py --user 02e591e0
+python meshTalk.py
 ```
 
 `meshTalk.py` uses a direct serial connection to the radio (USB/COM).
 Default `--port` is `auto`: on startup the app scans serial ports and picks the best candidate automatically.
 
+In the GUI, use the search box to type a node id (e.g. `02e591e0` or `!02e591e0`) and press Enter to open a dialog.
+
 Keys are stored in `keyRings/` as `<id>.key` and `<id>.pub` (leading `!` is stripped).
 If `keyRings/<id>.key` / `keyRings/<id>.pub` are missing, they are generated automatically.
+At-rest encryption key is stored in `keyRings/storage.key` (32 bytes, base64; created automatically).
 The script detects your node id from the radio automatically.
 If a peer key is missing, a key exchange is requested automatically.
 Outgoing messages are stored per node profile in `<node_id>/state.json` and `<node_id>/history.log`.
+Message text persisted on disk is stored encrypted as `enc1:...` (AES-256-GCM; key in `keyRings/storage.key`).
 Type `/keys` to rotate your keys (they will be regenerated and exchanged again).
 
 ### Text Compression (Optional)
@@ -182,12 +187,14 @@ Output: `dist\meshTalk.exe`
 - `nodeDbUpdater.py` — legacy text DB updater.
 - `graphGen.py` — Graphviz + D3 generator.
 - `meshTalk.py` — encrypted messenger.
+- `meshtalk/` — internal meshTalk modules:
+  - `meshtalk/protocol.py` — wire protocol + E2EE helpers.
+  - `meshtalk/storage.py` — config/state/history/incoming storage + at-rest encryption.
 - `meshtalk_utils.py` — shared helpers/parsers/formatters.
 - `message_text_compression.py` — text compression modes/codecs.
 - `requirements.txt` — Python dependencies.
 - `run_meshTalk.bat` / `build_meshTalk.bat` — Windows run/build scripts.
 - `README.md` / `CHANGELOG.md` / `meshTalk.txt` — docs.
-- `tests/` — unit tests.
 
 ### Generated during runtime (not source code)
 
@@ -195,7 +202,7 @@ Output: `dist\meshTalk.exe`
 - `graphGen/` — generated graph output (`dot/svg/html/json`).
 - `meshLogger.db` — generated SQLite DB.
 - `nodeDb.txt` — generated node DB (legacy mode).
-- `keyRings/` — generated key files (`<id>.key`, `<id>.pub`).
+- `keyRings/` — generated key files (`<id>.key`, `<id>.pub`, peer public keys, `storage.key`).
 - `<node_id>/` — per-node runtime profile directory:
   - `config.json`, `state.json`, `incoming.json`, `history.log`, `runtime.log`, `keyRings/`.
 
@@ -321,10 +328,10 @@ python graphGen.py --root .
 
 Надежный P2P-обмен (E2EE + ACK):
 
-Интерактивный чат (stdin -> ACK на каждую строку):
+Qt GUI app:
 
 ```bash
-python meshTalk.py --user 02e591e0
+python meshTalk.py
 ```
 
 `meshTalk.py` работает через прямое serial-подключение к радио (USB/COM).
@@ -332,9 +339,11 @@ python meshTalk.py --user 02e591e0
 
 Ключи хранятся в `keyRings/` как `<id>.key` и `<id>.pub` (ведущий `!` убирается).
 Если `keyRings/<id>.key` / `keyRings/<id>.pub` отсутствуют, они создаются автоматически.
+Ключ шифрования на диске хранится в `keyRings/storage.key` (32 байта, base64; создается автоматически).
 Скрипт автоматически определяет id узла из радио.
 Если ключ собеседника отсутствует, автоматически запрашивается обмен ключами.
 Исходящие сообщения сохраняются в профиле узла: `<node_id>/state.json` и `<node_id>/history.log`.
+Текст сообщений при сохранении на диск хранится в зашифрованном виде `enc1:...` (AES-256-GCM; ключ в `keyRings/storage.key`).
 Команда `/keys` пересоздаёт ваши ключи и запускает новый обмен.
 
 ### Сжатие текста (опционально)
@@ -400,12 +409,14 @@ build_meshTalk.bat
 - `nodeDbUpdater.py` — legacy-обновление текстовой БД.
 - `graphGen.py` — генерация Graphviz + D3.
 - `meshTalk.py` — шифрованный мессенджер.
+- `meshtalk/` — внутренние модули meshTalk:
+  - `meshtalk/protocol.py` — wire-протокол + E2EE-хелперы.
+  - `meshtalk/storage.py` — хранение config/state/history/incoming + шифрование на диске.
 - `meshtalk_utils.py` — общие утилиты/парсеры/форматтеры.
 - `message_text_compression.py` — режимы/кодеки сжатия текста.
 - `requirements.txt` — Python-зависимости.
 - `run_meshTalk.bat` / `build_meshTalk.bat` — скрипты запуска/сборки для Windows.
 - `README.md` / `CHANGELOG.md` / `meshTalk.txt` — документация.
-- `tests/` — unit-тесты.
 
 ### Генерируется во время работы (не исходники)
 
@@ -413,7 +424,7 @@ build_meshTalk.bat
 - `graphGen/` — сгенерированные файлы графов (`dot/svg/html/json`).
 - `meshLogger.db` — сгенерированная SQLite-база.
 - `nodeDb.txt` — сгенерированная база узлов (legacy-режим).
-- `keyRings/` — сгенерированные ключи (`<id>.key`, `<id>.pub`).
+- `keyRings/` — сгенерированные ключи (`<id>.key`, `<id>.pub`, публичные ключи пиров, `storage.key`).
 - `<node_id>/` — runtime-профиль конкретной ноды:
   - `config.json`, `state.json`, `incoming.json`, `history.log`, `runtime.log`, `keyRings/`.
 

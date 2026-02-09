@@ -4,24 +4,22 @@
 
 ### Unreleased
 
+- No changes yet.
+
+### 0.3.2
+
 Added
-- Key exchange confirmation retries until peer confirmation (`KR2`) or encrypted traffic is observed.
-- Optional compression profile IDs `NLTK`, `SPACY`, `TENSORFLOW` as wire-level mode aliases over built-in codecs.
-- `requirements-ml.txt` for optional NLP stack experiments.
-- Added Apache-2.0 licensing files: `LICENSE` and `NOTICE` with attribution guidance.
-- Added per-file text references for all tracked Python modules/scripts.
+- Encrypted at-rest storage for profile data (`history.log`, `state.json`, `incoming.json`) using AES-GCM (per-profile key in `keyRings/storage.key`).
+- Internal modules `meshtalk/protocol.py` and `meshtalk/storage.py` (plus docs) to separate protocol + storage concerns.
+- Apache-2.0 licensing files (`LICENSE`, `NOTICE`) + SPDX headers in Python files.
 
 Changed
-- Outgoing text-compression settings were removed from UI; mode selection is now fully automatic.
-- Compression capability negotiation now advertises and accepts extended mode IDs.
-- Header click-to-copy logic for `Client ID` was fixed for centered/right-aligned text.
-- Documentation synchronized with implementation (USB/COM auto-detect, automatic compression, source-vs-generated file map).
-- `.gitignore` expanded for local runtime/test/archive artifacts.
-- Added SPDX license identifiers to all tracked Python files.
+- Key exchange waits for confirmation: retries until peer confirmation (`KR2`) or encrypted traffic is observed; logs `KEYOK` on confirmed handshake.
+- Text compression selection is automatic; Settings no longer exposes compression choice. Added wire-level aliases `NLTK`/`SPACY`/`TENSORFLOW` mapped to built-in codecs.
+- Discovery broadcast and `runtime.log` are enabled by default; `.gitignore` updated to keep local artifacts (tests, zips, runtime data) out of git.
 
 Removed
 - Compression preference controls from Settings.
-- Test utilities and local ZIP archives from tracked repository files (kept local via ignore rules).
 
 ### 0.3.1
 
@@ -97,24 +95,22 @@ Removed
 
 ### Unreleased
 
+- Пока без изменений.
+
+### 0.3.2
+
 Добавлено
-- Повторы подтверждения обмена ключами до подтверждения от peer (`KR2`) или получения зашифрованного трафика.
-- Опциональные ID профилей сжатия `NLTK`, `SPACY`, `TENSORFLOW` как wire-level алиасы поверх встроенных кодеков.
-- `requirements-ml.txt` для опциональных NLP-экспериментов.
-- Добавлены файлы лицензирования Apache-2.0: `LICENSE` и `NOTICE` с указанием атрибуции.
-- Добавлены текстовые справки по каждому отслеживаемому Python-модулю/скрипту.
+- Шифрование данных профиля на диске (`history.log`, `state.json`, `incoming.json`) через AES-GCM (ключ профиля: `keyRings/storage.key`).
+- Внутренние модули `meshtalk/protocol.py` и `meshtalk/storage.py` (и документация) для разделения protocol + storage логики.
+- Лицензирование Apache-2.0 (`LICENSE`, `NOTICE`) + SPDX‑заголовки в Python‑файлах.
 
 Изменено
-- Настройки сжатия исходящего текста убраны из UI; выбор режима теперь полностью автоматический.
-- Обмен возможностями сжатия теперь объявляет и принимает расширенные ID режимов.
-- Исправлена логика клика для копирования `Client ID` в заголовке при центрированном/правом выравнивании.
-- Документация синхронизирована с реализацией (USB/COM auto-detect, автосжатие, карта исходников и генерируемых файлов).
-- Расширен `.gitignore` для локальных runtime/test/archive артефактов.
-- Во все отслеживаемые Python-файлы добавлены SPDX-идентификаторы лицензии.
+- Обмен ключами теперь ждет подтверждения: повторы до `KR2` или появления зашифрованного трафика; в логе появляется `KEYOK` при подтвержденном обмене.
+- Выбор сжатия текста полностью автоматический; настройки выбора алгоритма убраны. Добавлены wire-level алиасы `NLTK`/`SPACY`/`TENSORFLOW` поверх встроенных кодеков.
+- Discovery broadcast и `runtime.log` включены по умолчанию; `.gitignore` обновлен, чтобы локальные артефакты (tests, zip, runtime data) не попадали в git.
 
 Удалено
 - Элементы настроек приоритета сжатия из окна Settings.
-- Тестовые утилиты и локальные ZIP-архивы из отслеживаемых файлов репозитория (сохраняются локально по ignore-правилам).
 
 ### 0.3.1
 

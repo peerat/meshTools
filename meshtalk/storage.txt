@@ -1,0 +1,77 @@
+meshtalk/storage.py reference
+Author: Anton Vologzhanin (R3VAF)
+
+========================
+EN
+========================
+
+Purpose
+- Internal storage layer extracted from `meshTalk.py`.
+- Centralizes config/state/history persistence and at-rest hardening.
+
+License
+- Apache License 2.0 (`LICENSE`).
+- Keep attribution notices from `NOTICE` when redistributing.
+
+Scope
+- POSIX hardening helpers:
+  - `maybe_set_private_umask()` sets `umask(077)` best-effort.
+  - `harden_dir()` -> `chmod 700` (best-effort).
+  - `harden_file()` -> `chmod 600` (best-effort).
+- At-rest encryption key management:
+  - `Storage.ensure_storage_key()` loads/creates `keyRings/storage.key` (32 bytes, base64).
+  - The key is local-only and never transmitted over the mesh.
+- Persistence (atomic where possible):
+  - `config.json` (GUI/runtime options)
+  - `state.json` (outgoing queue; sensitive fields stored as `enc1:`)
+  - `incoming.json` (multipart assembly; part blobs stored as `enc1:`)
+  - `history.log` (message history; text stored as `enc1:` + optional `meta64:` JSON)
+  - `runtime.log` (optional; gated by `runtime_log_enabled`)
+- History helpers:
+  - `encode_history_meta_token()` / `decode_history_meta_token()` for `meta64:` JSON payload.
+  - `parse_history_record_line()` for backward-compatible history parsing.
+
+Used by
+- `meshTalk.py` instantiates `Storage(...)` once and delegates all file I/O.
+
+Security notes
+- At-rest encryption uses AES-256-GCM; message text AAD binds to `direction|peer|msg_id`.
+- If `storage.key` is missing/rotated, encrypted entries become unreadable and are skipped (privacy over recovery).
+
+========================
+RU
+========================
+
+Назначение
+- Внутренний слой хранения, вынесенный из `meshTalk.py`.
+- Централизует config/state/history и hardening файлов на диске.
+
+Лицензия
+- Apache License 2.0 (`LICENSE`).
+- При распространении сохраняйте атрибуцию из `NOTICE`.
+
+Область ответственности
+- POSIX hardening helpers:
+  - `maybe_set_private_umask()` ставит `umask(077)` best-effort.
+  - `harden_dir()` -> `chmod 700` (best-effort).
+  - `harden_file()` -> `chmod 600` (best-effort).
+- Управление ключом шифрования на диске:
+  - `Storage.ensure_storage_key()` грузит/создает `keyRings/storage.key` (32 байта, base64).
+  - Ключ строго локальный и никогда не отправляется по mesh.
+- Сохранение/загрузка (по возможности атомарно):
+  - `config.json` (настройки GUI/runtime)
+  - `state.json` (очередь исходящих; чувствительные поля как `enc1:`)
+  - `incoming.json` (сборка multipart; части как `enc1:`)
+  - `history.log` (история; текст как `enc1:` + опционально `meta64:` JSON)
+  - `runtime.log` (опционально; включается `runtime_log_enabled`)
+- Хелперы истории:
+  - `encode_history_meta_token()` / `decode_history_meta_token()` для `meta64:` JSON.
+  - `parse_history_record_line()` для обратной совместимости парсинга истории.
+
+Используется
+- `meshTalk.py` создает `Storage(...)` один раз и делегирует весь file I/O.
+
+Заметки по безопасности
+- Шифрование на диске: AES-256-GCM; AAD привязан к `direction|peer|msg_id`.
+- Если `storage.key` удален/переиздан, зашифрованные записи становятся нечитаемыми и пропускаются (приватность важнее восстановления).
+
