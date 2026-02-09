@@ -4,6 +4,7 @@ graphGen/
 meshTalk/
 keyRings/
 nodeDb*.txt
+!nodeDbUpdater.txt
 nodes.txt
 meshLogger.db
 *.db

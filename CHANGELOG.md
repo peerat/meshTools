@@ -9,6 +9,7 @@ Added
 - Optional compression profile IDs `NLTK`, `SPACY`, `TENSORFLOW` as wire-level mode aliases over built-in codecs.
 - `requirements-ml.txt` for optional NLP stack experiments.
 - Added Apache-2.0 licensing files: `LICENSE` and `NOTICE` with attribution guidance.
+- Added per-file text references for all tracked Python modules/scripts.
 
 Changed
 - Outgoing text-compression settings were removed from UI; mode selection is now fully automatic.
@@ -16,6 +17,7 @@ Changed
 - Header click-to-copy logic for `Client ID` was fixed for centered/right-aligned text.
 - Documentation synchronized with implementation (USB/COM auto-detect, automatic compression, source-vs-generated file map).
 - `.gitignore` expanded for local runtime/test/archive artifacts.
+- Added SPDX license identifiers to all tracked Python files.
 
 Removed
 - Compression preference controls from Settings.
@@ -100,6 +102,7 @@ Removed
 - Опциональные ID профилей сжатия `NLTK`, `SPACY`, `TENSORFLOW` как wire-level алиасы поверх встроенных кодеков.
 - `requirements-ml.txt` для опциональных NLP-экспериментов.
 - Добавлены файлы лицензирования Apache-2.0: `LICENSE` и `NOTICE` с указанием атрибуции.
+- Добавлены текстовые справки по каждому отслеживаемому Python-модулю/скрипту.
 
 Изменено
 - Настройки сжатия исходящего текста убраны из UI; выбор режима теперь полностью автоматический.
@@ -107,6 +110,7 @@ Removed
 - Исправлена логика клика для копирования `Client ID` в заголовке при центрированном/правом выравнивании.
 - Документация синхронизирована с реализацией (USB/COM auto-detect, автосжатие, карта исходников и генерируемых файлов).
 - Расширен `.gitignore` для локальных runtime/test/archive артефактов.
+- Во все отслеживаемые Python-файлы добавлены SPDX-идентификаторы лицензии.
 
 Удалено
 - Элементы настроек приоритета сжатия из окна Settings.

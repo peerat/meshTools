@@ -9,6 +9,10 @@ Purpose
 - Encrypted P2P messenger over Meshtastic.
 - Focused on reliable delivery, delivery stats, and mesh behavior study.
 
+License
+- Apache License 2.0 (`LICENSE`).
+- Redistribution must preserve attribution notices from `NOTICE`.
+
 Project vision
 - Intended for civilian/hobby/research use.
 - Built for reliability experiments and mesh behavior study.
@@ -98,6 +102,11 @@ Project files (repository / source-controlled)
 - `requirements-ml.txt`: optional NLP-related dependencies for additional compression profiles.
 - `README.md`: project-level usage and options.
 - `meshTalk.txt`: focused meshTalk behavior reference.
+- `meshLogger.txt`: focused meshLogger behavior reference.
+- `graphGen.txt`: focused graphGen behavior reference.
+- `nodeDbUpdater.txt`: focused nodeDbUpdater behavior reference.
+- `meshtalk_utils.txt`: focused meshtalk_utils module reference.
+- `message_text_compression.txt`: focused text-compression module reference.
 - `CHANGELOG.md`: changes between versions.
 - `tests/test_meshtalk_utils.py`: history/parsing/metadata behavior.
 - `tests/test_message_text_compression.py`: compression behavior.
@@ -127,6 +136,10 @@ RU
 Назначение
 - Шифрованный P2P‑мессенджер поверх Meshtastic.
 - Фокус: надежная доставка, статистика доставки и изучение поведения mesh-сети.
+
+Лицензия
+- Apache License 2.0 (`LICENSE`).
+- При распространении необходимо сохранять атрибуцию из `NOTICE`.
 
 Видение проекта
 - Для гражданского/любительского/исследовательского использования.
@@ -217,6 +230,11 @@ RU
 - `requirements-ml.txt`: опциональные NLP-зависимости для дополнительных профилей сжатия.
 - `README.md`: общее использование проекта и параметры.
 - `meshTalk.txt`: целевая справка по поведению meshTalk.
+- `meshLogger.txt`: целевая справка по поведению meshLogger.
+- `graphGen.txt`: целевая справка по поведению graphGen.
+- `nodeDbUpdater.txt`: целевая справка по поведению nodeDbUpdater.
+- `meshtalk_utils.txt`: целевая справка по модулю meshtalk_utils.
+- `message_text_compression.txt`: целевая справка по модулю сжатия текста.
 - `CHANGELOG.md`: изменения между версиями.
 - `tests/test_meshtalk_utils.py`: история/парсинг/метаданные.
 - `tests/test_message_text_compression.py`: поведение сжатия.

@@ -1,0 +1,76 @@
+nodeDbUpdater.py reference
+Author: Anton Vologzhanin (R3VAF)
+
+========================
+EN
+========================
+
+Purpose
+- One-shot updater for node database from Meshtastic CLI output.
+- Maintains local `nodeDb.txt` snapshot for tooling compatibility.
+
+License
+- Apache License 2.0 (`LICENSE`).
+- Keep attribution notices from `NOTICE` when redistributing.
+
+Runtime requirements
+- Meshtastic CLI in PATH (`meshtastic`) or via `--meshtastic-bin`.
+- USB/serial-connected radio.
+
+Input/Output
+- Input: Meshtastic CLI responses (`--nodes`, `--info`).
+- Output: `nodeDb.txt` (JSON-like node snapshot DB).
+
+Main options
+- `--port`: serial port.
+- `--db`: output DB file path (default `nodeDb.txt`).
+- `--timeout`: command timeout.
+- `--channel`: optional channel index.
+- `--regenerate`: rebuild DB from scratch.
+- `--prune-days`: remove stale nodes.
+
+Usage examples
+- `python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt`
+- `python nodeDbUpdater.py --regenerate`
+- `python nodeDbUpdater.py --prune-days 30`
+
+Notes
+- Full parameters: `python nodeDbUpdater.py --help`.
+- `nodeDb.txt` is a generated runtime file; usually keep it out of public repo.
+
+========================
+RU
+========================
+
+Назначение
+- Одноразовый обновитель базы узлов по данным Meshtastic CLI.
+- Поддерживает локальный `nodeDb.txt` для совместимости с инструментами.
+
+Лицензия
+- Apache License 2.0 (`LICENSE`).
+- При распространении сохраняйте атрибуцию из `NOTICE`.
+
+Требования
+- Meshtastic CLI в PATH (`meshtastic`) или через `--meshtastic-bin`.
+- Радио по USB/serial.
+
+Вход/Выход
+- Вход: ответы Meshtastic CLI (`--nodes`, `--info`).
+- Выход: `nodeDb.txt` (снимок базы узлов).
+
+Основные параметры
+- `--port`: serial-порт.
+- `--db`: путь к файлу БД (по умолчанию `nodeDb.txt`).
+- `--timeout`: таймаут команд.
+- `--channel`: опциональный индекс канала.
+- `--regenerate`: пересоздать БД с нуля.
+- `--prune-days`: удалить давно не видимые узлы.
+
+Примеры
+- `python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt`
+- `python nodeDbUpdater.py --regenerate`
+- `python nodeDbUpdater.py --prune-days 30`
+
+Примечания
+- Полный список параметров: `python nodeDbUpdater.py --help`.
+- `nodeDb.txt` — генерируемый runtime-файл, обычно не коммитится в публичный репозиторий.

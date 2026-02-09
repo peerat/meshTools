@@ -1,0 +1,80 @@
+meshLogger.py reference
+Author: Anton Vologzhanin (R3VAF)
+
+========================
+EN
+========================
+
+Purpose
+- Periodic Meshtastic traceroute logger.
+- Stores route/node data in SQLite for later graph/stat analysis.
+
+License
+- Apache License 2.0 (`LICENSE`).
+- Keep attribution notices from `NOTICE` when redistributing.
+
+Runtime requirements
+- Meshtastic CLI in PATH (`meshtastic`).
+- USB/serial-connected radio.
+
+Primary output
+- `meshLogger.db` (SQLite database).
+- Traceroute/listen-events are persisted in SQLite.
+
+Main options
+- `--port`: serial port (`/dev/ttyUSB0`, `COM3`, etc.).
+- `--hours`: active node window for polling selection.
+- `--timeout`: timeout per traceroute command.
+- `--pause`: delay between traceroute requests.
+- `--db`: SQLite DB path.
+- `--once`: one full pass and exit.
+- `--node`: poll a single node.
+- `--id-list`: poll only node IDs from file.
+
+Usage examples
+- `python meshLogger.py --port /dev/ttyUSB0`
+- `python meshLogger.py --once --db meshLogger.db`
+- `python meshLogger.py --db-schema`
+
+Notes
+- Use `python meshLogger.py --help` for full CLI options.
+- Database files are runtime artifacts and usually should not be committed.
+
+========================
+RU
+========================
+
+Назначение
+- Периодический логгер traceroute для Meshtastic.
+- Сохраняет маршруты/данные узлов в SQLite для дальнейшего анализа и построения графов.
+
+Лицензия
+- Apache License 2.0 (`LICENSE`).
+- При распространении сохраняйте атрибуцию из `NOTICE`.
+
+Требования для запуска
+- Meshtastic CLI в PATH (`meshtastic`).
+- Радио по USB/serial.
+
+Основной выход
+- `meshLogger.db` (SQLite база).
+- Traceroute/listen-события сохраняются в SQLite.
+
+Основные параметры
+- `--port`: serial-порт (`/dev/ttyUSB0`, `COM3` и т.д.).
+- `--hours`: окно активности узлов для выбора опроса.
+- `--timeout`: таймаут на один traceroute.
+- `--pause`: пауза между запросами traceroute.
+- `--db`: путь к SQLite БД.
+- `--once`: один полный проход и выход.
+- `--node`: опрос одного узла.
+- `--id-list`: опрашивать только ID из файла.
+
+Примеры
+- `python meshLogger.py --port /dev/ttyUSB0`
+- `python meshLogger.py --once --db meshLogger.db`
+- `python meshLogger.py --db-schema`
+
+Примечания
+- Полный список параметров: `python meshLogger.py --help`.
+- Файлы БД являются runtime-артефактами и обычно не коммитятся.

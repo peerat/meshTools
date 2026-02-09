@@ -28,6 +28,8 @@ Small utilities around Meshtastic.
 - `graphGen.py` builds Graphviz (DOT/SVG) and D3.js (HTML/JSON) graphs from logs and node DB in `graphGen/` (SQLite preferred, `nodeDb.txt` fallback).
 - `meshTalk.py` provides encrypted, ACK-based point-to-point messaging over Meshtastic (Python API).
 - meshTalk UI: unread indicator (orange dot) in contact list.
+- Per-file references:
+  - `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
 
 ## Requirements
 
@@ -244,6 +246,8 @@ Output: `dist\meshTalk.exe`
 - `nodeDbUpdater.py` — устаревший (текстовый) вариант; нужен только если нужен `nodeDb.txt`.
 - `graphGen.py` строит графы Graphviz (DOT/SVG) и D3.js (HTML/JSON) из логов и базы узлов в `graphGen/` (предпочитает SQLite, fallback — `nodeDb.txt`).
 - `meshTalk.py` — шифрованный P2P-обмен с ACK поверх Meshtastic (Python API).
+- Текстовые справки по каждому Python-файлу:
+  - `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
 
 ## Требования
 

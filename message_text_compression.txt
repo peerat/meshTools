@@ -1,0 +1,66 @@
+message_text_compression.py reference
+Author: Anton Vologzhanin (R3VAF)
+
+========================
+EN
+========================
+
+Purpose
+- Text compression module for meshTalk message payloads.
+- Defines MC block format, mode IDs, tokenization, CRC validation, and roundtrip-safe decode.
+
+License
+- Apache License 2.0 (`LICENSE`).
+- Keep attribution notices from `NOTICE` when redistributing.
+
+MC block format
+- Header: `[MAGIC][VER][MODE][DICT_ID][FLAGS]`
+- Body: compressed data.
+- Trailer: `CRC8`.
+
+Modes
+- `0 BYTE_DICT`, `1 FIXED_BITS`, `2 DEFLATE`, `3 ZLIB`, `4 BZ2`, `5 LZMA`.
+- `6 NLTK`, `7 SPACY`, `8 TENSORFLOW` are wire-level aliases over built-in codecs.
+
+Core API
+- `compress_text(text, mode, preserve_case)`
+- `decompress_text(blob)`
+- `should_compress(text, mode, min_gain_bytes, preserve_case)`
+- `mode_name(mode)`
+
+Compatibility notes
+- Decoder validates MAGIC/version/dictionary id/CRC.
+- Unknown or malformed payloads raise compression format errors.
+- Alias modes keep decode path dependency-free.
+
+========================
+RU
+========================
+
+Назначение
+- Модуль сжатия текста для payload сообщений meshTalk.
+- Определяет формат MC-блока, ID режимов, токенизацию, CRC-проверку и безопасный roundtrip-декод.
+
+Лицензия
+- Apache License 2.0 (`LICENSE`).
+- При распространении сохраняйте атрибуцию из `NOTICE`.
+
+Формат MC-блока
+- Заголовок: `[MAGIC][VER][MODE][DICT_ID][FLAGS]`
+- Тело: сжатые данные.
+- Хвост: `CRC8`.
+
+Режимы
+- `0 BYTE_DICT`, `1 FIXED_BITS`, `2 DEFLATE`, `3 ZLIB`, `4 BZ2`, `5 LZMA`.
+- `6 NLTK`, `7 SPACY`, `8 TENSORFLOW` — wire-level алиасы поверх встроенных кодеков.
+
+Основной API
+- `compress_text(text, mode, preserve_case)`
+- `decompress_text(blob)`
+- `should_compress(text, mode, min_gain_bytes, preserve_case)`
+- `mode_name(mode)`
+
+Заметки по совместимости
+- Декодер валидирует MAGIC/version/dictionary id/CRC.
+- Неизвестный или поврежденный payload вызывает ошибку формата сжатия.
+- Алиасные режимы сохраняют путь декодирования без обязательных внешних зависимостей.
