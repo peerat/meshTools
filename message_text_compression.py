@@ -251,7 +251,7 @@ def _build_default_dict_tokens() -> List[str]:
         "надо", "можно", "нельзя", "пока", "потом", "снова", "сразу", "длинное", "короткое", "имя", "id",
         "public", "pub", "ack", "mesh", "lora", "node", "message", "send", "recv", "queue", "radio", "gui",
         "error", "timeout", "retry", "config", "history", "runtime", "clear", "delete", "request", "response",
-        "exchange", "encryption", "active", "waiting", "ready", "connected", "disconnected", "self", "peer",
+        "exchange", "crypto", "active", "waiting", "ready", "connected", "disconnected", "self", "peer",
         "part", "parts", "done", "in", "at", "elapsed", "hops", "there", "back", "delivered", "received",
         "sent", "start", "stop", "mode", "byte", "fixed", "dict", "compression", "enabled", "disabled",
         "русский", "английский", "принято", "отправил", "получил", "перезапуск", "профиль", "инициализация",

@@ -5,24 +5,37 @@
 ### Unreleased
 
 Added
+- (none)
+
+Changed
+- (none)
+
+### 0.3.3 (2026-02-10)
+
+Added
 - Wire protocol version advertisement in key-exchange frames (`mt_wire`, `mt_msg`, `mt_mc`) for forward/backward compatibility tracking.
 - Extended wire protocol specification in docs (with explicit versioning).
 - Settings: `parallel_sends` (packets per `rate_seconds` window) to allow short send bursts without waiting for ACK between packets.
 - Settings: `auto_pacing` (adaptive) to auto-tune `rate_seconds`/`parallel_sends` from recent ACK stats.
+- Contact context action: traceroute (Meshtastic `TRACEROUTE_APP`) and post output into dialog.
 
 Changed
-- Changelog entries now include release dates in headings.
-- Documentation files include "Updated" dates.
+- Traceroute uses retry/backoff policy similar to outgoing sends and shows attempts/hops in message status.
+- Traceroute output resolves node names from Meshtastic node DB as `LongName [Short] !id` and is refreshed periodically.
+- Traceroute and key-exchange events now include detailed diagnostics in runtime log (initiator/reason, retries, timeouts); crypto log lines are highlighted.
+- Contact list: lock icon is shown only for confirmed two-way key exchange and expires after 24 hours; key age/last-seen annotations refined.
+- GUI: prevent Ctrl+wheel zoom in chat/log views; current dialog highlight is darker for clarity.
+- Documentation wording updated to avoid security/privacy guarantees.
 
 ### 0.3.2 (2026-02-10)
 
 Added
-- Encrypted at-rest storage for profile data (`history.log`, `state.json`, `incoming.json`) using AES-GCM (per-profile key in `keyRings/storage.key`).
+- At-rest storage sealing for profile data (`history.log`, `state.json`, `incoming.json`) using AES-GCM (per-profile key in `keyRings/storage.key`).
 - Internal modules `meshtalk/protocol.py` and `meshtalk/storage.py` (plus docs) to separate protocol + storage concerns.
 - Apache-2.0 licensing files (`LICENSE`, `NOTICE`) + SPDX headers in Python files.
 
 Changed
-- Key exchange waits for confirmation: retries until peer confirmation (`KR2`) or encrypted traffic is observed; logs `KEYOK` on confirmed handshake.
+- Key exchange waits for confirmation: retries until peer confirmation (`KR2`) or verified payload is observed; logs `KEYOK` on confirmed handshake.
 - Text compression selection is automatic; Settings no longer exposes compression choice. Added wire-level aliases `NLTK`/`SPACY`/`TENSORFLOW` mapped to built-in codecs.
 - Discovery broadcast and `runtime.log` are enabled by default; `.gitignore` updated to keep local artifacts (tests, zips, runtime data) out of git.
 
@@ -53,7 +66,7 @@ Added
 - Safer history/incoming parsing and multipart receive resume after restart.
 
 Changed
-- Compression is applied before encryption and only when size gain reaches `min_gain_bytes`.
+- Compression is applied before MT-WIRE sealing and only when size gain reaches `min_gain_bytes`.
 - Status text is rebuilt from metadata on language switch.
 - Pending state highlight uses orange status/meta text only.
 - Group send is marked as sent only if at least one recipient is actually queued.
@@ -104,24 +117,35 @@ Removed
 ### Unreleased
 
 Добавлено
+- (нет)
+
+Изменено
+- (нет)
+
+### 0.3.3 (2026-02-10)
+
+Добавлено
 - Объявление версий wire-протокола в key‑exchange кадрах (`mt_wire`, `mt_msg`, `mt_mc`) для отслеживания совместимости.
 - Расширенная спецификация wire‑протокола в документации (с явным версионированием).
 - Настройки: `parallel_sends` (сколько пакетов можно отправить подряд в одном окне `rate_seconds`) для быстрых отправок без ожидания ACK между пакетами.
 - Настройки: `auto_pacing` (адаптивно) автоподбирает `rate_seconds`/`parallel_sends` по статистике ACK.
+- Действие в контекстном меню контакта: traceroute (Meshtastic `TRACEROUTE_APP`) и вывод результата в диалог.
 
 Изменено
-- В заголовках версий в changelog добавлены даты релизов.
-- В документации добавлены даты обновления ("Updated").
+- Traceroute использует политику повторов/backoff как исходящие отправки и показывает attempts/hops в статусе.
+- Вывод traceroute сопоставляет имена узлов из базы Meshtastic как `LongName [Short] !id` и база периодически обновляется.
+- Traceroute и key exchange пишут подробную диагностику в runtime‑лог (инициатор/причина, повторы, таймауты); строки криптографии подсвечены.
+- Список контактов: замок показывается только при подтвержденном двустороннем обмене и имеет срок валидности 24 часа; уточнены подписи “ключ/в сети”.
 
 ### 0.3.2 (2026-02-10)
 
 Добавлено
-- Шифрование данных профиля на диске (`history.log`, `state.json`, `incoming.json`) через AES-GCM (ключ профиля: `keyRings/storage.key`).
+- Запечатывание данных профиля на диске (`history.log`, `state.json`, `incoming.json`) через AES-GCM (ключ профиля: `keyRings/storage.key`).
 - Внутренние модули `meshtalk/protocol.py` и `meshtalk/storage.py` (и документация) для разделения protocol + storage логики.
 - Лицензирование Apache-2.0 (`LICENSE`, `NOTICE`) + SPDX‑заголовки в Python‑файлах.
 
 Изменено
-- Обмен ключами теперь ждет подтверждения: повторы до `KR2` или появления зашифрованного трафика; в логе появляется `KEYOK` при подтвержденном обмене.
+- Обмен ключами теперь ждет подтверждения: повторы до `KR2` или появления валидированного payload; в логе появляется `KEYOK` при подтвержденном обмене.
 - Выбор сжатия текста полностью автоматический; настройки выбора алгоритма убраны. Добавлены wire-level алиасы `NLTK`/`SPACY`/`TENSORFLOW` поверх встроенных кодеков.
 - Discovery broadcast и `runtime.log` включены по умолчанию; `.gitignore` обновлен, чтобы локальные артефакты (tests, zip, runtime data) не попадали в git.
 
@@ -152,7 +176,7 @@ Removed
 - Более строгий разбор history/incoming и возобновление приема multipart после перезапуска.
 
 Изменено
-- Сжатие выполняется до шифрования и только при выигрыше не меньше `min_gain_bytes`.
+- Сжатие выполняется до запечатывания MT-WIRE и только при выигрыше не меньше `min_gain_bytes`.
 - Статусы пересобираются из метаданных при переключении языка.
 - Оранжевый цвет в ожидании применяется только к статусу/времени.
 - Group send помечается как отправленный только если реально поставлен в очередь хотя бы одному получателю.

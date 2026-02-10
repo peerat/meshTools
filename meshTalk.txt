@@ -1,4 +1,4 @@
-meshTalk v0.3.2
+meshTalk v0.3.3
 Author: Anton Vologzhanin (R3VAF)
 Updated: 2026-02-10
 
@@ -7,8 +7,8 @@ EN
 ========================
 
 Purpose
-- Encrypted P2P messenger over Meshtastic.
-- Focused on reliable delivery, delivery stats, and mesh behavior study.
+- Research prototype for P2P payload exchange over Meshtastic (ACK/retry + cryptographic primitives).
+- Focused on best-effort delivery stats and experimental topology behavior study.
 
 License
 - Apache License 2.0 (`LICENSE`).
@@ -16,7 +16,7 @@ License
 
 Project vision
 - Intended for civilian/hobby/research use.
-- Built for reliability experiments and mesh behavior study.
+- Built for delivery/latency experiments and mesh behavior study.
 - Military use is explicitly prohibited.
 - Any unlawful use (including terrorist, extremist, criminal activity) is explicitly prohibited.
 - Disclaimer: software is provided "AS IS", without warranties of any kind.
@@ -89,9 +89,24 @@ Auto key refresh
 - Auto key request on decrypt failures.
 - Lock indicator removed if key is stale for over 24 hours.
 
+Cryptography (where/when)
+- This project uses cryptographic primitives for payload sealing and local at-rest sealing.
+  It does not claim or guarantee any specific security properties.
+- MT-KEY v1 (KR1/KR2 key exchange frames):
+  - Format: plaintext UTF-8/ASCII with `|` separators.
+  - Public key: X25519 public key (32 raw bytes, base64 in the frame).
+- MT-WIRE v1 (transport container):
+  - AEAD: AES-256-GCM.
+  - Key derivation: X25519 ECDH + HKDF-SHA256 -> 32-byte AES key (see `meshtalk/protocol.py` and `meshtalk/protocol.txt`).
+  - Applied to all MSG/ACK frames sent over the Meshtastic `PRIVATE_APP` port.
+- Local at-rest sealing (per node profile):
+  - AEAD: AES-256-GCM.
+  - Key file: `<node_id>/keyRings/storage.key` (32 bytes, base64; local-only).
+  - Applied to sensitive fields in `history.log`, `state.json`, `incoming.json` (see `meshtalk/storage.py` and `meshtalk/storage.txt`).
+
 Data files (per node)
 - `<node_id>/keyRings/`
-- `<node_id>/keyRings/storage.key` (local at-rest encryption key)
+- `<node_id>/keyRings/storage.key` (local at-rest storage key; cryptographic)
 - `<node_id>/state.json`
 - `<node_id>/history.log`
 - `<node_id>/incoming.json`
@@ -103,11 +118,11 @@ meshTalk related files map (keep updated)
 
 Project files (repository / source-controlled)
 - `meshTalk.py`:
-  - Main app: radio lifecycle, E2EE, queue/retry/ACK, GUI, save/load state/history.
+  - Main app: radio lifecycle, MT-WIRE sealing, queue/retry/ACK, GUI, save/load state/history.
 - `meshtalk/protocol.py`:
   - Wire protocol primitives: pack/unpack, X25519+HKDF key derivation, base64 helpers.
 - `meshtalk/storage.py`:
-  - Storage layer: config/state/history/incoming I/O, at-rest encryption key, file hardening.
+  - Storage layer: config/state/history/incoming I/O, at-rest storage key, file hardening.
 - `meshtalk/pacing.py`:
   - Adaptive sending pace controller: tunes `rate_seconds`/`parallel_sends` from recent ACK stats.
 - `meshtalk_utils.py`:
@@ -135,12 +150,12 @@ Generated during runtime (per profile/node, not source code)
 - `state.json`: outgoing pending queue records (used to restore unsent outgoing messages).
 - `incoming.json`: incoming multipart assembly state.
 - `history.log`: message history and transport events.
-  - Text is stored as `enc1:...` (AES-256-GCM; key in `keyRings/storage.key`).
+  - Text is stored as `enc1:...` (AES-256-GCM AEAD; key in `keyRings/storage.key`).
   - Legacy rows may contain `b64:...` (older versions).
   - Optional per-message metadata is stored as `meta64:...` (base64 JSON) for status restoration.
 - `runtime.log`: technical runtime events.
 - `keyRings/`: local private/public keys and peer public keys.
-  - `storage.key`: 32-byte key used to encrypt message text persisted at rest (`history.log`, sensitive fields in `state.json`/`incoming.json`).
+  - `storage.key`: 32-byte key used to seal persisted payload text at rest (`history.log`, sensitive fields in `state.json`/`incoming.json`).
 
 History/recovery behavior
 - On startup, app restores in this logical order:
@@ -155,8 +170,8 @@ RU
 ========================
 
 Назначение
-- Шифрованный P2P‑мессенджер поверх Meshtastic.
-- Фокус: надежная доставка, статистика доставки и изучение поведения mesh-сети.
+- Исследовательский прототип P2P‑обмена полезной нагрузкой поверх Meshtastic (ACK/повторы + криптографические примитивы).
+- Фокус: best-effort доставка и статистика доставки; изучение поведения mesh‑топологии.
 
 Лицензия
 - Apache License 2.0 (`LICENSE`).
@@ -164,7 +179,7 @@ RU
 
 Видение проекта
 - Для гражданского/любительского/исследовательского использования.
-- Ориентировано на эксперименты по надежности и изучение поведения mesh-сети.
+- Ориентировано на эксперименты по доставке/задержкам и изучение поведения mesh‑топологии.
 - Военное применение прямо запрещено.
 - Любая незаконная деятельность (включая террористическую, экстремистскую и преступную) прямо запрещена.
 - Отказ от ответственности: ПО предоставляется «как есть», без каких-либо гарантий.
@@ -209,6 +224,7 @@ RU
 Контекстное меню контакта
 - Pin/Unpin
 - Add to group
+- Traceroute request
 - Request key
 - Clear history
 - Delete contact
@@ -234,12 +250,26 @@ RU
 
 Автообновление ключей
 - Периодический запрос ключа примерно раз в час (+ джиттер).
-- Автозапрос ключа при ошибках расшифровки.
+- Автозапрос ключа при ошибках обработки криптографического контейнера.
 - Замок убирается, если ключ не обновлялся более 24 часов.
+
+Криптография (где/когда)
+- В проекте используются криптографические примитивы для запечатывания payload и локального запечатывания данных на диске.
+- MT-KEY v1 (обмен ключами, кадры KR1/KR2):
+  - Формат: plaintext UTF-8/ASCII с разделителем `|`.
+  - Публичный ключ: X25519 public key (32 raw bytes, base64 внутри кадра).
+- MT-WIRE v1 (транспортный контейнер):
+  - AEAD: AES-256-GCM.
+  - Вычисление ключа: X25519 ECDH + HKDF-SHA256 -> 32‑байтный AES key (см. `meshtalk/protocol.py` и `meshtalk/protocol.txt`).
+  - Применяется ко всем MSG/ACK кадрам, отправляемым через Meshtastic `PRIVATE_APP`.
+- Локальное запечатывание на диске (профиль ноды):
+  - AEAD: AES-256-GCM.
+  - Файл ключа: `<node_id>/keyRings/storage.key` (32 байта, base64; строго локальный).
+  - Применяется к чувствительным полям `history.log`, `state.json`, `incoming.json` (см. `meshtalk/storage.py` и `meshtalk/storage.txt`).
 
 Файлы данных (на каждую ноду)
 - `<node_id>/keyRings/`
-- `<node_id>/keyRings/storage.key` (локальный ключ шифрования на диске)
+- `<node_id>/keyRings/storage.key` (локальный ключ хранения на диске; криптографический)
 - `<node_id>/state.json`
 - `<node_id>/history.log`
 - `<node_id>/incoming.json`
@@ -251,11 +281,11 @@ RU
 
 Файлы проекта (в репозитории / исходники)
 - `meshTalk.py`:
-  - Основное приложение: жизненный цикл радио, E2EE, очередь/повторы/ACK, GUI, сохранение/загрузка состояния и истории.
+  - Основное приложение: жизненный цикл радио, MT-WIRE запечатывание, очередь/повторы/ACK, GUI, сохранение/загрузка состояния и истории.
 - `meshtalk/protocol.py`:
   - Примитивы wire-протокола: pack/unpack, вычисление ключа X25519+HKDF, base64‑помощники.
 - `meshtalk/storage.py`:
-  - Слой хранения: I/O config/state/history/incoming, ключ шифрования на диске, hardening прав файлов.
+  - Слой хранения: I/O config/state/history/incoming, ключ хранения на диске, hardening прав файлов.
 - `meshtalk/pacing.py`:
   - Автоподбор скорости отправки: подбирает `rate_seconds`/`parallel_sends` по статистике ACK.
 - `meshtalk_utils.py`:
@@ -283,12 +313,12 @@ RU
 - `state.json`: очередь исходящих pending-записей (для восстановления недоотправленных исходящих).
 - `incoming.json`: состояние сборки входящих многопакетных сообщений.
 - `history.log`: история сообщений и транспортные события.
-  - Текст хранится как `enc1:...` (AES-256-GCM; ключ в `keyRings/storage.key`).
+  - Текст хранится как `enc1:...` (AES-256-GCM AEAD; ключ в `keyRings/storage.key`).
   - В старых строках может встречаться `b64:...` (старые версии).
   - Опциональные метаданные сообщения хранятся как `meta64:...` (base64 JSON) для восстановления статусов.
 - `runtime.log`: технические runtime-события.
 - `keyRings/`: локальные приватный/публичный ключи и публичные ключи пиров.
-  - `storage.key`: 32-байтный ключ, которым шифруется текст сообщений при сохранении на диск (`history.log` и чувствительные поля `state.json`/`incoming.json`).
+  - `storage.key`: 32-байтный ключ, которым запечатывается текст полезной нагрузки при сохранении на диск (`history.log` и чувствительные поля `state.json`/`incoming.json`).
 
 Поведение восстановления
 - При старте приложение восстанавливает данные логически в таком порядке:

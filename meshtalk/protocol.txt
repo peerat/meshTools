@@ -8,12 +8,12 @@ EN
 
 Overview
 - This document specifies meshTalk payload formats carried over Meshtastic `PRIVATE_APP` port.
-- It covers key exchange (`KR1`/`KR2`), encrypted container (`MT-WIRE`), message framing (`MT-MSG`),
+- It covers key exchange (`KR1`/`KR2`), cryptographic container (`MT-WIRE`), payload framing (`MT-MSG`),
   ACK format, and compression block (`MT-MC`).
 
 Versioning model
 - MT-KEY v1: plaintext key exchange frames `KR1|...` (request) and `KR2|...` (response).
-- MT-WIRE v1: encrypted container with leading byte `ver=1` (see `meshtalk/protocol.py:PROTO_VERSION`).
+- MT-WIRE v1: cryptographic container with leading byte `ver=1` (see `meshtalk/protocol.py:PROTO_VERSION`).
 - MT-MSG v1: legacy UTF-8 framing starting with `T...`.
 - MT-MSG v2: compact binary framing starting with `M2`.
 - MT-MC v1: compression block starting with `MC`.
@@ -48,7 +48,7 @@ Example
 - ECDH: X25519(priv_self, pub_peer) -> 32-byte shared secret.
 - HKDF: HKDF-SHA256(shared, salt="meshTalk v1", info="meshTalk v1") -> 32-byte AES key.
 
-3) MT-WIRE v1 (encrypted container, AES-256-GCM)
+3) MT-WIRE v1 (cryptographic container, AES-256-GCM AEAD)
 Byte layout:
   offset  size  field
   0       1     ver    (=1)
@@ -118,12 +118,12 @@ RU
 
 Обзор
 - В этом документе описаны форматы payload в meshTalk, которые передаются через Meshtastic `PRIVATE_APP`.
-- Описываются: обмен ключами (`KR1`/`KR2`), зашифрованный контейнер (`MT-WIRE`), фрейминг сообщений (`MT-MSG`),
+- Описываются: обмен ключами (`KR1`/`KR2`), криптографический контейнер (`MT-WIRE`), фрейминг payload (`MT-MSG`),
   формат ACK и блок сжатия (`MT-MC`).
 
 Модель версий
 - MT-KEY v1: plaintext кадры обмена ключами `KR1|...` (запрос) и `KR2|...` (ответ).
-- MT-WIRE v1: зашифрованный контейнер с первым байтом `ver=1` (см. `meshtalk/protocol.py:PROTO_VERSION`).
+- MT-WIRE v1: криптографический контейнер с первым байтом `ver=1` (см. `meshtalk/protocol.py:PROTO_VERSION`).
 - MT-MSG v1: legacy UTF-8 фрейминг, начинается с `T...`.
 - MT-MSG v2: компактный бинарный фрейминг, начинается с `M2`.
 - MT-MC v1: блок сжатия, начинается с `MC`.
@@ -158,7 +158,7 @@ RU
 - ECDH: X25519(priv_self, pub_peer) -> 32‑байтный shared secret.
 - HKDF: HKDF-SHA256(shared, salt="meshTalk v1", info="meshTalk v1") -> 32‑байтный AES key.
 
-3) MT-WIRE v1 (зашифрованный контейнер, AES-256-GCM)
+3) MT-WIRE v1 (криптографический контейнер, AES-256-GCM AEAD)
 Байт-раскладка:
   offset  size  field
   0       1     ver    (=1)

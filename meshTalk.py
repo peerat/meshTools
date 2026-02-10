@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Reliable point-to-point messaging over Meshtastic with end-to-end encryption.
-RU: Надёжная двусторонняя доставка поверх Meshtastic с E2EE.
+Experimental point-to-point payload exchange over Meshtastic with ACK/retry and cryptographic primitives.
+RU: Экспериментальный P2P обмен полезной нагрузкой поверх Meshtastic: ACK/повторы и криптографические примитивы.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ from message_text_compression import (
 )
 
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 DEFAULT_PORTNUM = portnums_pb2.PortNum.PRIVATE_APP
 PAYLOAD_OVERHEAD = 1 + 1 + 8 + 12 + 16  # ver + type + msg_id + nonce + tag
 KEY_REQ_PREFIX = b"KR1|"
@@ -217,6 +217,14 @@ def append_history(
     _STORAGE.append_history(direction, peer_id, msg_id, text, extra=extra, meta_data=meta_data, peer_norm_fn=norm_id_for_filename)
 
 
+def purge_history_peer(peer_id: str) -> None:
+    _STORAGE.purge_history_peer(peer_id, peer_norm_fn=norm_id_for_filename)
+
+
+def rewrite_history_peer_field(old_peer_id: str, new_peer_id: Optional[str]) -> None:
+    _STORAGE.rewrite_history_peer_field(old_peer_id, new_peer_id)
+
+
 def append_runtime_log(line: str) -> None:
     _STORAGE.append_runtime_log(line)
 
@@ -327,7 +335,54 @@ def norm_id_for_filename(node_id: str) -> str:
     nid = node_id.strip()
     if nid.startswith("!"):
         nid = nid[1:]
+    # Canonicalize standard Meshtastic node IDs for stable filenames/dict keys.
+    # Keep non-node identifiers (e.g. "group:...") case-preserving.
+    if re.fullmatch(r"[0-9a-fA-F]{8}", nid):
+        nid = nid.lower()
     return nid
+
+
+def canonicalize_keyring_filenames(keydir: str) -> None:
+    """Best-effort: rename hex keyring filenames to lowercase.
+
+    This avoids subtle bugs on case-sensitive filesystems when peer/self ids
+    appear in mixed case (wire validation is case-insensitive).
+    """
+    if not keydir or not os.path.isdir(keydir):
+        return
+    try:
+        for name in os.listdir(keydir):
+            path = os.path.join(keydir, name)
+            if not os.path.isfile(path):
+                continue
+            stem, ext = os.path.splitext(name)
+            if ext not in (".pub", ".key"):
+                continue
+            if not re.fullmatch(r"[0-9a-fA-F]{8}", stem):
+                continue
+            canon = stem.lower()
+            if canon == stem:
+                continue
+            dst = os.path.join(keydir, canon + ext)
+            if os.path.isfile(dst):
+                # If both exist and are identical, remove the non-canonical duplicate.
+                try:
+                    with open(path, "rb") as f1:
+                        a = f1.read()
+                    with open(dst, "rb") as f2:
+                        b = f2.read()
+                    if a == b:
+                        os.remove(path)
+                except Exception:
+                    pass
+                continue
+            try:
+                os.replace(path, dst)
+                harden_file(dst)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def norm_id_for_wire(node_id: str) -> str:
@@ -382,6 +437,8 @@ class PeerState:
         self.last_decrypt_fail_ts = 0.0
         self.last_key_ok_ts = 0.0
         self.last_key_req_ts = 0.0
+        self.last_key_req_reason = ""
+        self.last_key_req_initiator = ""
         self.next_key_refresh_ts = 0.0
         self.await_key_confirm = False
 
@@ -511,11 +568,20 @@ def main() -> int:
         default=1,
         help="packets per rate window (default: 1). RU: сколько пакетов можно отправить подряд в одном окне rate (по умолчанию: 1).",
     )
-    ap.add_argument(
+    ap_pacing = ap.add_mutually_exclusive_group()
+    ap_pacing.add_argument(
         "--auto-pacing",
+        dest="auto_pacing",
         action="store_true",
-        help="auto tune rate/parallel for better throughput (default: off). RU: автоподбор rate/параллельности (по умолчанию: выкл).",
+        help="auto tune rate/parallel (default: on). RU: автоподбор rate/параллельности (по умолчанию: вкл).",
     )
+    ap_pacing.add_argument(
+        "--no-auto-pacing",
+        dest="auto_pacing",
+        action="store_false",
+        help="disable auto pacing. RU: выключить автоподбор скорости.",
+    )
+    ap.set_defaults(auto_pacing=True)
 
 
     args = ap.parse_args()
@@ -552,7 +618,25 @@ def main() -> int:
     peer_id_norm, peer_path = (None, None)
     known_peers: Dict[str, x25519.X25519PublicKey] = {}
     peer_names: Dict[str, Dict[str, str]] = {}
+    peer_names_lock = threading.Lock()
     incoming_state: Dict[str, Dict[str, object]] = {}
+
+    def _peer_name_parts(peer_id_any: str) -> Tuple[str, str]:
+        """Return (long_name, short_name) from Meshtastic node DB cache.
+
+        peer_id_any can be wire form (!xxxxxxxx) or normalized form (xxxxxxxx).
+        """
+        try:
+            norm_raw = norm_id_for_filename(str(peer_id_any or ""))
+            norm = norm_raw.lower() if re.fullmatch(r"[0-9a-fA-F]{8}", norm_raw) else norm_raw
+        except Exception:
+            norm_raw = str(peer_id_any or "")
+            norm = norm_raw
+        with peer_names_lock:
+            rec = peer_names.get(norm) or peer_names.get(norm_raw) or {}
+            if not isinstance(rec, dict):
+                return ("", "")
+            return (str(rec.get("long", "") or "").strip(), str(rec.get("short", "") or "").strip())
 
     def update_peer_names_from_nodes(peer_norm: Optional[str] = None) -> None:
         try:
@@ -561,23 +645,33 @@ def main() -> int:
             nodes = getattr(interface, "nodes", None)
             if not isinstance(nodes, dict):
                 return
-            for node in nodes.values():
+            want = None
+            if isinstance(peer_norm, str) and peer_norm:
+                want = peer_norm
+                if re.fullmatch(r"[0-9a-fA-F]{8}", want):
+                    want = want.lower()
+            # Copy values to reduce risk of RuntimeError if `nodes` mutates during iteration.
+            node_vals = list(nodes.values())
+            for node in node_vals:
                 if not isinstance(node, dict):
                     continue
                 user = node.get("user") if isinstance(node.get("user"), dict) else {}
                 nid = user.get("id") or node.get("id")
                 if not isinstance(nid, str) or not nid:
                     continue
-                norm = norm_id_for_filename(nid)
-                if peer_norm and norm != peer_norm:
+                norm_raw = norm_id_for_filename(nid)
+                norm = norm_raw.lower() if re.fullmatch(r"[0-9a-fA-F]{8}", norm_raw) else norm_raw
+                if want and norm != want:
                     continue
                 long_name = user.get("longName") or user.get("longname") or node.get("longName")
                 short_name = user.get("shortName") or user.get("shortname") or node.get("shortName")
                 if long_name or short_name:
-                    peer_names[norm] = {
-                        "long": str(long_name or ""),
-                        "short": str(short_name or ""),
-                    }
+                    rec = {"long": str(long_name or ""), "short": str(short_name or "")}
+                    with peer_names_lock:
+                        peer_names[norm] = rec
+                        # Preserve original-case key too (if different), for UI lookups from user input/history.
+                        if norm_raw != norm:
+                            peer_names[norm_raw] = rec
         except Exception:
             return
 
@@ -610,11 +704,23 @@ def main() -> int:
             return (False, "Waiting for radio (no self id)")
         startup_events.append(f"{ts_local()} NODE: self id {self_id_raw}")
         self_id = norm_id_for_filename(self_id_raw)
+        raw_stem = str(self_id_raw or "").strip()
+        if raw_stem.startswith("!"):
+            raw_stem = raw_stem[1:]
         peer_id_norm = self_id
         set_data_dir_for_node(self_id)
+        # Migrate old per-node dir if the radio reports a mixed-case id and we now canonicalize to lowercase.
+        if raw_stem and raw_stem != self_id:
+            migrate_data_dir(os.path.join(BASE_DIR, raw_stem), DATA_DIR)
+            migrate_data_dir(os.path.join(LEGACY_BASE_DIR, raw_stem), DATA_DIR)
         migrate_data_dir(os.path.join(LEGACY_BASE_DIR, self_id), DATA_DIR)
         migrate_data_dir(LEGACY_BASE_DIR, DATA_DIR)
+        canonicalize_keyring_filenames(keydir)
         ensure_storage_key()
+        ui_emit(
+            "log",
+            f"{ts_local()} CRYPTO: mt_key=KR1/KR2 plaintext pub=X25519(32b,b64) kdf=HKDF-SHA256 aead=MT-WIREv1 AES-256-GCM storage=AES-256-GCM(keyRings/storage.key)",
+        )
         priv_path = os.path.join(keydir, f"{self_id}.key")
         pub_path = os.path.join(keydir, f"{self_id}.pub")
         # Ensure key files exist (auto-generate if missing)
@@ -767,6 +873,10 @@ def main() -> int:
         # Validate key bytes before persisting key file.
         x25519.X25519PublicKey.from_public_bytes(pub_raw_bytes)
         peer_id_norm = norm_id_for_filename(peer_id)
+        # Defensive: peer_id is untrusted input from the wire; never allow
+        # path traversal / weird filenames to end up in key storage.
+        if not re.fullmatch(r"[0-9a-fA-F]{8}", peer_id_norm):
+            raise ValueError("invalid peer id")
         path = os.path.join(keydir, f"{peer_id_norm}.pub")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         # TOFU pinning: never silently overwrite an existing peer key.
@@ -849,6 +959,9 @@ def main() -> int:
                     f"{ts_local()} KEY: pinned key mismatch for {peer_id} old={ex.old_fp} new={ex.new_fp}. Use 'Reset key' to accept new.",
                 )
                 return
+            except ValueError:
+                ui_emit("log", f"{ts_local()} KEY: reject invalid key frame from {peer_id}.")
+                return
             except Exception:
                 ui_emit("log", f"{ts_local()} KEY: reject invalid public key from {peer_id}.")
                 return
@@ -884,12 +997,15 @@ def main() -> int:
             if st and st.key_ready and kind == "resp":
                 st.last_key_ok_ts = time.time()
                 st.key_confirmed_ts = st.last_key_ok_ts
-                ui_emit("log", f"{ts_local()} KEYOK: exchange complete with {peer_id}. Confirmed.")
+                ui_emit(
+                    "log",
+                    f"{ts_local()} KEYOK: confirmed_by=resp peer={peer_id} initiator=remote wire=MT-WIREv1 aes-256-gcm",
+                )
                 st.force_key_req = False
                 st.await_key_confirm = False
                 st.next_key_req_ts = float("inf")
             if kind == "req":
-                ui_emit("log", f"{ts_local()} KEY: request from {peer_id}")
+                ui_emit("log", f"{ts_local()} KEY: request from {peer_id} initiator=remote event=req")
                 now = time.time()
                 last_resp = float(key_response_last_ts.get(peer_norm, 0.0) or 0.0)
                 retrying_confirm = bool(st and st.await_key_confirm and not is_broadcast)
@@ -902,7 +1018,7 @@ def main() -> int:
                     left_s = int(max(0.0, min_reply_interval - (now - last_resp)))
                     ui_emit(
                         "log",
-                        f"{ts_local()} KEY: request from {peer_id} suppressed (recent response, wait {left_s}s).",
+                        f"{ts_local()} KEY: response suppressed peer={peer_id} initiator=remote reason=recent_response wait={left_s}s",
                     )
                 else:
                     modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
@@ -933,7 +1049,10 @@ def main() -> int:
                             channelIndex=(args.channel if args.channel is not None else 0),
                         )
                         key_response_last_ts[peer_norm] = now
-                    ui_emit("log", f"{ts_local()} KEY: received request from {peer_id}, sent our public key.")
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} KEY: response sent to {peer_id} initiator=remote event=req_reply retry_confirm={1 if retrying_confirm else 0} frame=KR2 plaintext x25519+hkdf-sha256->aes-256-gcm",
+                    )
                 if st and not is_broadcast:
                     st.await_key_confirm = True
                     st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
@@ -960,7 +1079,7 @@ def main() -> int:
                     st.force_key_req = True
                     now = time.time()
                     if now >= st.next_key_req_ts:
-                        send_key_request(peer_norm)
+                        send_key_request(peer_norm, require_confirm=True, reason="rx_no_key")
                         st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
                         ui_emit("log", f"{ts_local()} KEY: request (no key) -> {from_id}")
                         ui_emit("peer_update", peer_norm)
@@ -977,7 +1096,7 @@ def main() -> int:
             st.last_decrypt_fail_ts = now
             ui_emit(
                 "log",
-                f"{ts_local()} KEY: decrypt failed for {from_id} (possible stale key).",
+                f"{ts_local()} KEY: decrypt failed peer={from_id} count={st.decrypt_fail_count} (possible stale key) initiator=remote event=decrypt_fail wire=MT-WIREv1 aes-256-gcm",
             )
             if peer_norm:
                 st.force_key_req = True
@@ -985,8 +1104,12 @@ def main() -> int:
                     # Suspend old key without deleting; wait for fresh exchange
                     st.aes = None
                     st.next_key_req_ts = 0.0
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} KEY: suspend key peer={from_id} initiator=local reason=decrypt_fail",
+                    )
                 if now >= st.next_key_req_ts:
-                    send_key_request(peer_norm)
+                    send_key_request(peer_norm, require_confirm=True, reason="decrypt_fail")
                     st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
                 ui_emit("peer_update", peer_norm)
             return
@@ -1001,7 +1124,10 @@ def main() -> int:
             st.last_key_ok_ts = time.time()
             st.key_confirmed_ts = st.last_key_ok_ts
             if from_id:
-                ui_emit("log", f"{ts_local()} KEYOK: confirmed by encrypted traffic from {from_id}.")
+                ui_emit(
+                    "log",
+                    f"{ts_local()} KEYOK: confirmed_by=payload peer={from_id} initiator=remote wire=MT-WIREv1 aes-256-gcm",
+                )
 
         def build_ack_text(hops: Optional[int]) -> bytes:
             parts = ["ACK", "mc=1", f"mc_modes={','.join(str(m) for m in COMPRESSION_MODES)}"]
@@ -1061,7 +1187,7 @@ def main() -> int:
                 st.rtt_avg = st.rtt_avg + (rtt - st.rtt_avg) / float(st.rtt_count)
                 ui_emit(
                     "log",
-                    f"{ts_local()} ACK: {msg_hex} rtt={rtt:.2f}s avg={st.rtt_avg:.2f}s attempts={attempts}",
+                    f"{ts_local()} ACK: {msg_hex} rtt={rtt:.2f}s avg={st.rtt_avg:.2f}s attempts={attempts} wire=MT-WIREv1 aes-256-gcm",
                 )
                 try:
                     pacer.observe_ack(rtt_s=rtt, attempts=int(attempts or 1), now=now)
@@ -1228,7 +1354,7 @@ def main() -> int:
                 if compact_wire
                 else rx_compression
             )
-            ui_emit("log", f"{ts_local()} RECV: {msg_hex} cmp={log_cmp}")
+            ui_emit("log", f"{ts_local()} RECV: {msg_hex} cmp={log_cmp} wire=MT-WIREv1 aes-256-gcm")
             if not (total and int(total) > 1):
                 # history is written on assembled message in UI layer
                 pass
@@ -1341,9 +1467,9 @@ def main() -> int:
             st.next_key_req_ts = 0.0
         ui_emit("log", f"{ts_local()} KEY: regenerated, waiting for exchange.")
         for peer_norm in list(tracked_peers):
-            send_key_request(peer_norm)
+            send_key_request(peer_norm, require_confirm=True, reason="regen_keys")
 
-    def send_key_request(peer_norm: str, require_confirm: bool = True) -> None:
+    def send_key_request(peer_norm: str, require_confirm: bool = True, reason: str = "") -> None:
         nonlocal last_activity_ts, last_key_sent_ts
         if not radio_ready or interface is None:
             return
@@ -1352,6 +1478,11 @@ def main() -> int:
         st = get_peer_state(peer_norm)
         now = time.time()
         if st and (now - st.last_key_req_ts) < 5.0:
+            left_s = int(max(0.0, 5.0 - (now - st.last_key_req_ts)))
+            ui_emit(
+                "log",
+                f"{ts_local()} KEY: suppressed (local rate-limit {left_s}s) peer={wire_id_from_norm(peer_norm)} initiator=local reason={reason or '-'}",
+            )
             return
         dest_id = wire_id_from_norm(peer_norm)
         modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
@@ -1388,11 +1519,16 @@ def main() -> int:
         last_key_sent_ts = last_activity_ts
         if st:
             st.last_key_req_ts = last_activity_ts
+            st.last_key_req_reason = str(reason or "")
+            st.last_key_req_initiator = "local"
             st.next_key_refresh_ts = last_activity_ts + 3600.0 + random.uniform(0, 600)
             if require_confirm:
                 st.await_key_confirm = True
                 st.next_key_req_ts = last_activity_ts + max(1.0, float(args.retry_seconds))
-        ui_emit("log", f"{ts_local()} KEY: request sent to {dest_id}")
+        ui_emit(
+            "log",
+            f"{ts_local()} KEY: request sent to {dest_id} initiator=local reason={reason or '-'} confirm={1 if require_confirm else 0} frame=KR1 plaintext x25519+hkdf-sha256->aes-256-gcm",
+        )
 
     def send_discovery_broadcast() -> None:
         if not radio_ready or interface is None:
@@ -1669,7 +1805,7 @@ def main() -> int:
                 if now >= st.next_key_req_ts:
                     if (now - st.last_key_req_ts) >= 5.0:
                         print(f"{ts_local()} KEY: request -> {wire_id_from_norm(peer_norm)}")
-                        send_key_request(peer_norm)
+                        send_key_request(peer_norm, require_confirm=True, reason="await_confirm_retry")
                     st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
                 continue
 
@@ -1804,17 +1940,20 @@ def main() -> int:
                 send_rr_offset = (start + i + 1) % max(1, n_peers)
                 if rec["attempts"] == 1:
                     append_history("send", peer_norm, rec["id"], text, f"attempt={rec['attempts']} cmp={cmp_name}")
-                ui_emit("log", f"{ts_local()} SEND: {rec['id']} attempt={rec['attempts']} cmp={cmp_name} -> {peer_norm}")
+                ui_emit(
+                    "log",
+                    f"{ts_local()} SEND: {rec['id']} attempt={rec['attempts']} cmp={cmp_name} -> {peer_norm} wire=MT-WIREv1 aes-256-gcm",
+                )
                 return
 
     # If we just generated our keys or peer key is missing, request exchange immediately.
-    if peer_id_norm:
-        st = get_peer_state(peer_id_norm)
-        if generated_now or (st is not None and not st.key_ready):
-            print(f"{ts_local()} KEY: startup request to {wire_id_from_norm(peer_id_norm)}")
-            send_key_request(peer_id_norm)
-            if st:
-                st.next_key_req_ts = time.time() + max(1.0, float(args.retry_seconds))
+        if peer_id_norm:
+            st = get_peer_state(peer_id_norm)
+            if generated_now or (st is not None and not st.key_ready):
+                print(f"{ts_local()} KEY: startup request to {wire_id_from_norm(peer_id_norm)}")
+                send_key_request(peer_id_norm, require_confirm=True, reason="startup")
+                if st:
+                    st.next_key_req_ts = time.time() + max(1.0, float(args.retry_seconds))
 
     discovery_state = {"start_ts": time.time(), "next_ts": time.time() + random.uniform(20, 60)}
 
@@ -1826,9 +1965,15 @@ def main() -> int:
     def sender_loop() -> None:
         last_key_refresh_ts = 0.0
         last_health_ts = 0.0
+        last_names_refresh_ts = 0.0
         while True:
             send_due()
             now = time.time()
+            if radio_ready and interface is not None and (now - last_names_refresh_ts) >= 60.0:
+                last_names_refresh_ts = now
+                update_peer_names_from_nodes()
+                # Refresh contact list titles if names have changed.
+                ui_emit("names_update", None)
             if (now - last_key_refresh_ts) >= 5.0:
                 last_key_refresh_ts = now
                 peers, _ = snapshot_runtime_state(peer_states, known_peers, tracked_peers)
@@ -1839,12 +1984,12 @@ def main() -> int:
                     if not st:
                         continue
                     if st.key_ready and st.await_key_confirm and now >= st.next_key_req_ts:
-                        send_key_request(peer_norm, require_confirm=True)
+                        send_key_request(peer_norm, require_confirm=True, reason="await_confirm_retry")
                         continue
                     if st.next_key_refresh_ts <= 0.0:
                         st.next_key_refresh_ts = now + 3600.0 + random.uniform(0, 600)
                     if now >= st.next_key_refresh_ts:
-                        send_key_request(peer_norm, require_confirm=False)
+                        send_key_request(peer_norm, require_confirm=False, reason="refresh_timer")
                 if discovery_send and radio_ready:
                     start_ts = discovery_state["start_ts"]
                     next_discovery_ts = discovery_state["next_ts"]
@@ -1911,8 +2056,8 @@ def main() -> int:
         st = get_peer_state(target_norm)
         if st:
             st.force_key_req = True
-        enc_status = "ACTIVE" if st and st.key_ready else "WAITING KEY"
-        print(f"Encryption: {enc_status}")
+        key_status = "READY" if st and st.key_ready else "WAITING KEY"
+        print(f"Key state: {key_status}")
         if st and st.key_ready:
             print("Type message and press Enter. /keys to rotate keys.")
         else:
@@ -1986,6 +2131,7 @@ def main() -> int:
                 "pinned": "Pinned",
                 "recent": "Contact list",
                 "last_seen": "Last seen",
+                "key_age": "Key",
                 "peer_delete": "Delete contact",
                 "peer_delete_confirm": "Delete contact '{name}'?",
                 "clear_history": "Clear history",
@@ -2014,6 +2160,18 @@ def main() -> int:
                 "full_reset_unavailable": "Full reset is available after node/profile initialization.",
                 "copy_log": "Copy log",
                 "clear_log": "Clear log",
+                "msg_ctx_copy": "Copy",
+                "msg_ctx_route": "Traceroute request",
+                "msg_route_title": "Message route",
+                "msg_route_na": "Route information is not available yet for this message.",
+                "msg_route_hops": "Hops",
+                "msg_route_hops_tb": "Hops (there/back)",
+                "msg_route_attempts": "Attempts (avg)",
+                "msg_route_packets": "Packets",
+                "trace_request": "Trace request",
+                "trace_timeout": "Timed out waiting for traceroute",
+                "trace_towards": "Route traced towards destination:",
+                "trace_back": "Route traced back to us:",
                 "about_author": "Author",
                 "about_callsign": "Callsign",
                 "about_telegram": "Telegram",
@@ -2053,7 +2211,8 @@ def main() -> int:
                 "group_rename_failed": "Группа не найдена.",
                 "pinned": "Закреплённые",
                 "recent": "Список контактов",
-                "last_seen": "Last seen",
+                "last_seen": "В сети",
+                "key_age": "Ключ",
                 "peer_delete": "Удалить собеседника",
                 "peer_delete_confirm": "Удалить собеседника '{name}'?",
                 "clear_history": "Очистить историю",
@@ -2082,6 +2241,18 @@ def main() -> int:
                 "full_reset_unavailable": "Полный сброс доступен после инициализации ноды/профиля.",
                 "copy_log": "Копировать лог",
                 "clear_log": "Очистить лог",
+                "msg_ctx_copy": "Копировать",
+                "msg_ctx_route": "Запрос трассировки",
+                "msg_route_title": "Маршрут сообщения",
+                "msg_route_na": "Информация о маршруте для этого сообщения пока недоступна.",
+                "msg_route_hops": "Хопов",
+                "msg_route_hops_tb": "Хопы туда/обратно",
+                "msg_route_attempts": "Попытки (ср.)",
+                "msg_route_packets": "Пакеты",
+                "trace_request": "Запрос маршрута",
+                "trace_timeout": "Таймаут ожидания трассировки",
+                "trace_towards": "Маршрут до получателя:",
+                "trace_back": "Маршрут обратно:",
                 "about_author": "Автор",
                 "about_callsign": "Позывной",
                 "about_telegram": "Telegram",
@@ -2097,7 +2268,7 @@ def main() -> int:
         current_lang = str(cfg.get("lang", "ru")).lower()
         verbose_log = bool(cfg.get("log_verbose", True))
         runtime_log_file = bool(cfg.get("runtime_log_file", True))
-        auto_pacing = bool(cfg.get("auto_pacing", False))
+        auto_pacing = bool(cfg.get("auto_pacing", True))
         last_pacing_save_ts = 0.0
         pinned_dialogs = set(cfg.get("pinned_dialogs", []))
         hidden_contacts = set(cfg.get("hidden_contacts", []))
@@ -2268,8 +2439,8 @@ def main() -> int:
                     seen_h = int(data.get("seen_h")) if data.get("seen_h") is not None else None
                 except Exception:
                     seen_h = None
-                if lock_state == "ok" and key_h is not None:
-                    lock_text = f"🔒 {key_h} h"
+                if key_h is not None:
+                    lock_text = f"🔒 {key_h} h" if lock_state == "ok" else f"{tr('key_age')}: {key_h} h"
                     painter.drawText(
                         QtCore.QRect(rect.left() + pad, y, rect.width() - pad * 2, line_h),
                         int(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter),
@@ -2316,6 +2487,32 @@ def main() -> int:
             QListWidget::item:selected:!active { background: #ff9800; color: #2b0a22; }
             """
         )
+
+        class _NoCtrlWheelZoom(QtCore.QObject):
+            def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+                try:
+                    if event.type() == QtCore.QEvent.Type.Wheel:
+                        mods = event.modifiers()
+                        if mods & QtCore.Qt.ControlModifier:
+                            # Prevent QTextEdit Ctrl+Wheel zoom. Keep scrolling behavior instead.
+                            try:
+                                sb = obj.verticalScrollBar()  # type: ignore[attr-defined]
+                                dy = int(event.angleDelta().y())  # type: ignore[attr-defined]
+                                if sb is not None and dy:
+                                    sb.setValue(int(sb.value()) - int(dy))
+                            except Exception:
+                                pass
+                            return True
+                except Exception:
+                    pass
+                return False
+
+        _no_ctrl_zoom = _NoCtrlWheelZoom(win)
+        try:
+            chat_text.installEventFilter(_no_ctrl_zoom)
+            chat_text.viewport().installEventFilter(_no_ctrl_zoom)
+        except Exception:
+            pass
 
         header_status = "init"
         errors_need_ack = False
@@ -2405,12 +2602,16 @@ def main() -> int:
                 peer_meta_dirty = True
 
         settings_log_view: Optional["QtWidgets.QTextEdit"] = None
+        settings_rate_edit: Optional["QtWidgets.QLineEdit"] = None
+        settings_parallel_edit: Optional["QtWidgets.QLineEdit"] = None
+        settings_auto_pacing_cb: Optional["QtWidgets.QCheckBox"] = None
 
         def open_settings() -> None:
             nonlocal current_lang
             nonlocal verbose_log
             nonlocal runtime_log_file
             nonlocal auto_pacing
+            nonlocal settings_rate_edit, settings_parallel_edit, settings_auto_pacing_cb
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
             nonlocal errors_need_ack
@@ -2485,6 +2686,9 @@ def main() -> int:
             cb_auto_pacing = QtWidgets.QCheckBox("")
             cb_auto_pacing.setChecked(bool(cfg.get("auto_pacing", auto_pacing)))
             runtime_layout.addRow(tr("auto_pacing"), cb_auto_pacing)
+            settings_rate_edit = rate_edit
+            settings_parallel_edit = parallel_edit
+            settings_auto_pacing_cb = cb_auto_pacing
 
             def sync_auto_pacing_fields() -> None:
                 on = cb_auto_pacing.isChecked()
@@ -2540,6 +2744,11 @@ def main() -> int:
             log_view = QtWidgets.QTextEdit()
             log_view.setReadOnly(True)
             set_mono(log_view, 10)
+            try:
+                log_view.installEventFilter(_no_ctrl_zoom)
+                log_view.viewport().installEventFilter(_no_ctrl_zoom)
+            except Exception:
+                pass
             layout.addWidget(log_view, 2)
             nonlocal settings_log_view
             settings_log_view = log_view
@@ -2682,7 +2891,8 @@ def main() -> int:
                 tracked_peers.clear()
                 known_peers.clear()
                 peer_states.clear()
-                peer_names.clear()
+                with peer_names_lock:
+                    peer_names.clear()
                 dialogs.clear()
                 chat_history.clear()
                 list_index.clear()
@@ -2709,7 +2919,7 @@ def main() -> int:
                     os.makedirs(keydir, exist_ok=True)
                 except Exception:
                     pass
-                # New storage key for encrypted history/state at rest.
+                # New storage key for history/state at rest.
                 _STORAGE.set_paths(
                     config_file=CONFIG_FILE,
                     state_file=STATE_FILE,
@@ -2723,7 +2933,7 @@ def main() -> int:
                 current_lang = "ru"
                 verbose_log = True
                 runtime_log_file = False
-                auto_pacing = False
+                auto_pacing = True
                 discovery_send = False
                 discovery_reply = False
                 clear_pending_on_switch = True
@@ -2734,7 +2944,7 @@ def main() -> int:
                     args.max_bytes = 200
                     args.rate_seconds = 30
                     args.parallel_sends = 1
-                    args.auto_pacing = False
+                    args.auto_pacing = True
                 except Exception:
                     pass
                 # Recreate local keypair for current profile.
@@ -2762,6 +2972,9 @@ def main() -> int:
             btn_full_reset.clicked.connect(on_full_reset)
             dlg.exec()
             settings_log_view = None
+            settings_rate_edit = None
+            settings_parallel_edit = None
+            settings_auto_pacing_cb = None
 
         settings_btn.clicked.connect(open_settings)
         click_state = {"last_ts": 0.0, "count": 0}
@@ -2811,10 +3024,15 @@ def main() -> int:
         chat_label.mousePressEvent = _chat_label_click
 
         def html_escape(s: str) -> str:
+            # Chat entries can contain multi-line text (Shift+Enter, traceroute output).
+            # Preserve line breaks when rendering HTML.
             return (
                 s.replace("&", "&amp;")
                  .replace("<", "&lt;")
                  .replace(">", "&gt;")
+                 .replace("\r\n", "\n")
+                 .replace("\r", "\n")
+                 .replace("\n", "<br>")
             )
 
         def make_avatar_pixmap(seed: str, size: int) -> QtGui.QPixmap:
@@ -2937,6 +3155,10 @@ def main() -> int:
             row_index: int,
             meta: str = "",
         ) -> None:
+            try:
+                msg_href = f"mtmsg:{int(row_index)}"
+            except Exception:
+                msg_href = "mtmsg:0"
             icon = avatar_data_uri(peer_id, 36)
             bg, tx = color_pair_for_message(peer_id)
             if " " in text and len(text) >= 6:
@@ -3002,19 +3224,21 @@ def main() -> int:
             avatar_cell = (
                 f"<td width='46' align='center' valign='top' style='padding:0;' rowspan='2'>"
                 f"<div style='display:flex;flex-direction:column;align-items:center;gap:2px;'>"
+                f"<a href='{msg_href}' style='text-decoration:none;'>"
                 f"<img src='{icon}' width='36' height='36'>"
                 f"<div style='color:{tag_color};font-size:13px;font-weight:600;line-height:1.0;text-align:center;'>{tag_html}</div>"
+                f"</a>"
                 f"</div>"
                 f"</td>"
             )
             msg_text_cell = (
                 f"<td width='100%' align='{msg_align}' valign='top' style='padding:4px 8px 0 4px;color:{text_color};text-align:{msg_align};line-height:1.25;margin:0;height:100%;'>"
-                f"{html_escape(msg)}"
+                f"<a href='{msg_href}' style='text-decoration:none;'><span style='color:{text_color}'>{html_escape(msg)}</span></a>"
                 f"</td>"
             )
             ts_cell = (
                 f"<td width='100%' align='right' valign='bottom' style='padding:0 6px 1px 0;color:{ts_color};font-size:10px;line-height:1.0;margin:0;text-align:right;'>"
-                f"{ts_html}"
+                f"<a href='{msg_href}' style='text-decoration:none;'><span style='color:{ts_color}'>{ts_html}</span></a>"
                 f"</td>"
             )
             bubble_align = "right" if outgoing else "left"
@@ -3039,9 +3263,7 @@ def main() -> int:
             if dialog_id.startswith("group:"):
                 return f"{dialog_id[6:]}"
             wire = norm_id_for_wire(dialog_id)
-            name = peer_names.get(dialog_id, {})
-            long_name = str(name.get("long", "")).strip()
-            short_name = str(name.get("short", "")).strip()
+            long_name, short_name = _peer_name_parts(dialog_id)
             if long_name or short_name:
                 second = long_name
                 if short_name:
@@ -3050,8 +3272,7 @@ def main() -> int:
             return wire
 
         def short_tag(peer_id: str) -> str:
-            name = peer_names.get(peer_id, {})
-            short_name = str(name.get("short", "")).strip()
+            _long_name, short_name = _peer_name_parts(peer_id)
             if short_name:
                 return f"{short_name}"
             return ""
@@ -3060,9 +3281,7 @@ def main() -> int:
             if not radio_ready:
                 return "Waiting for radio..."
             wire = norm_id_for_wire(self_id)
-            name = peer_names.get(self_id, {})
-            long_name = str(name.get("long", "")).strip()
-            short_name = str(name.get("short", "")).strip()
+            long_name, short_name = _peer_name_parts(self_id)
             second = ""
             if long_name or short_name:
                 second = long_name
@@ -3136,6 +3355,135 @@ def main() -> int:
                     line = str(entry)
                     append_html(chat_text, line, "#66d9ef")
 
+        def _mtmsg_index_at_pos(pos: "QtCore.QPoint") -> Optional[int]:
+            try:
+                cursor = chat_text.cursorForPosition(pos)
+            except Exception:
+                cursor = None
+            if cursor is None:
+                return None
+            href = ""
+            try:
+                href = str(cursor.charFormat().anchorHref() or "")
+            except Exception:
+                href = ""
+            if not href:
+                try:
+                    cursor2 = QtGui.QTextCursor(cursor)
+                    cursor2.movePosition(QtGui.QTextCursor.Left, QtGui.QTextCursor.MoveAnchor, 1)
+                    href = str(cursor2.charFormat().anchorHref() or "")
+                except Exception:
+                    href = ""
+            if not href.startswith("mtmsg:"):
+                return None
+            try:
+                return int(href.split(":", 1)[1])
+            except Exception:
+                return None
+
+        def _fmt_ctx_num(value: object) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                f = float(value)
+            except Exception:
+                return None
+            if f < 0.0:
+                f = 0.0
+            if abs(f - round(f)) < 0.05:
+                return str(int(round(f)))
+            return "{:.1f}".format(f)
+
+        def _copy_text_to_clipboard(text: str) -> None:
+            try:
+                cb = QtWidgets.QApplication.clipboard()
+                if cb is None:
+                    return
+                cb.setText(text, QtGui.QClipboard.Clipboard)
+                try:
+                    cb.setText(text, QtGui.QClipboard.Selection)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        def _copy_message_entry(entry: Dict[str, object]) -> None:
+            try:
+                raw = str(entry.get("text", "") or "")
+                msg = raw[6:] if (len(raw) >= 6 and raw[5] == " ") else raw
+                if msg:
+                    _copy_text_to_clipboard(msg)
+            except Exception:
+                pass
+
+        def _show_message_route(entry: Dict[str, object]) -> None:
+            meta_data = entry.get("meta_data")
+            if not isinstance(meta_data, dict):
+                QtWidgets.QMessageBox.information(win, "meshTalk", tr("msg_route_na"))
+                return
+            forward_hops = _fmt_ctx_num(meta_data.get("forward_hops"))
+            ack_hops = _fmt_ctx_num(meta_data.get("ack_hops"))
+            attempts = _fmt_ctx_num(meta_data.get("attempts"))
+            packets_line = None
+            packets_raw = meta_data.get("packets")
+            if isinstance(packets_raw, (tuple, list)) and len(packets_raw) >= 2:
+                try:
+                    packets_line = f"{int(packets_raw[0])}/{int(packets_raw[1])}"
+                except Exception:
+                    packets_line = None
+            lines: list[str] = []
+            if forward_hops is not None and ack_hops is not None:
+                lines.append(f"{tr('msg_route_hops_tb')}: {forward_hops} / {ack_hops}")
+            elif forward_hops is not None:
+                lines.append(f"{tr('msg_route_hops')}: {forward_hops}")
+            if attempts is not None:
+                lines.append(f"{tr('msg_route_attempts')}: {attempts}")
+            if packets_line:
+                lines.append(f"{tr('msg_route_packets')}: {packets_line}")
+            if not lines:
+                body = tr("msg_route_na")
+            else:
+                body = "\n".join(lines)
+            QtWidgets.QMessageBox.information(win, tr("msg_route_title"), body)
+
+        def _show_chat_default_menu(pos: "QtCore.QPoint") -> None:
+            try:
+                menu = chat_text.createStandardContextMenu()
+                if menu is None:
+                    return
+                menu.exec(chat_text.viewport().mapToGlobal(pos))
+            except Exception:
+                pass
+
+        def _on_chat_context_menu(pos: "QtCore.QPoint") -> None:
+            idx = _mtmsg_index_at_pos(pos)
+            dialog_id = current_dialog
+            if idx is None or not dialog_id:
+                _show_chat_default_menu(pos)
+                return
+            entries = chat_history.get(dialog_id, [])
+            if idx < 0 or idx >= len(entries) or not isinstance(entries[idx], dict):
+                _show_chat_default_menu(pos)
+                return
+            entry = entries[idx]
+            menu = QtWidgets.QMenu(win)
+            act_copy = menu.addAction(tr("msg_ctx_copy"))
+            picked = menu.exec(chat_text.viewport().mapToGlobal(pos))
+            if picked == act_copy:
+                _copy_message_entry(entry)
+
+        def _on_chat_context_menu_widget(pos: "QtCore.QPoint") -> None:
+            try:
+                vp_pos = chat_text.viewport().mapFrom(chat_text, pos)
+            except Exception:
+                vp_pos = pos
+            _on_chat_context_menu(vp_pos)
+
+        chat_text.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        chat_text.customContextMenuRequested.connect(_on_chat_context_menu_widget)
+        chat_text.viewport().setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        chat_text.viewport().customContextMenuRequested.connect(_on_chat_context_menu)
+
         def select_dialog(dialog_id: Optional[str]) -> None:
             nonlocal current_dialog
             current_dialog = dialog_id
@@ -3154,6 +3502,7 @@ def main() -> int:
         def refresh_list() -> None:
             items_list.clear()
             now_ts = time.time()
+            KEY_VALID_SECONDS = 24.0 * 3600.0
             ordered = sorted(
                 dialogs.items(),
                 key=lambda kv: float(kv[1].get("last_rx_ts", kv[1].get("last_ts", 0.0))),
@@ -3202,7 +3551,8 @@ def main() -> int:
                 # Show lock only after confirmed two-way exchange.
                 if bool(getattr(st, "await_key_confirm", False)):
                     return None
-                if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) > 0.0:
+                key_ts = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0)
+                if key_ts > 0.0 and (float(now_ts) - key_ts) <= float(KEY_VALID_SECONDS):
                     return "ok"
                 return None
 
@@ -3219,6 +3569,11 @@ def main() -> int:
                     font.setBold(True)
                     item.setFont(font)
                 bg_hex, tx_hex = color_pair_for_id(item_id)
+                if current_dialog and item_id == current_dialog:
+                    try:
+                        bg_hex = QtGui.QColor(bg_hex).darker(135).name()
+                    except Exception:
+                        pass
                 item.setBackground(QtGui.QColor(bg_hex))
                 item.setForeground(QtGui.QColor(tx_hex))
                 item.setIcon(make_avatar(item_id))
@@ -3235,13 +3590,12 @@ def main() -> int:
                             seen_ts = 0.0
                         if seen_ts > 0.0:
                             seen_h = int(max(0.0, (float(now_ts) - float(seen_ts)) // 3600.0))
-                        if lock_state == "ok":
-                            try:
-                                key_ts = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0)
-                            except Exception:
-                                key_ts = 0.0
-                            if key_ts > 0.0:
-                                key_h = int(max(0.0, (float(now_ts) - float(key_ts)) // 3600.0))
+                        try:
+                            key_ts = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0)
+                        except Exception:
+                            key_ts = 0.0
+                        if key_ts > 0.0:
+                            key_h = int(max(0.0, (float(now_ts) - float(key_ts)) // 3600.0))
                 item.setData(
                     QtCore.Qt.UserRole,
                     {
@@ -3319,7 +3673,7 @@ def main() -> int:
             if peer_norm != self_id and st and not st.key_ready:
                 st.force_key_req = True
                 st.next_key_req_ts = 0.0
-                send_key_request(peer_norm)
+                send_key_request(peer_norm, require_confirm=True, reason="dialog_open")
             refresh_list()
             if peer_norm in list_index:
                 items_list.setCurrentRow(list_index.index(peer_norm))
@@ -3396,32 +3750,10 @@ def main() -> int:
         def rewrite_history_dialog_entries(old_dialog_id: str, new_dialog_id: Optional[str] = None) -> None:
             if not old_dialog_id:
                 return
-            if not os.path.isfile(HISTORY_FILE):
-                return
-            try:
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-            except Exception:
-                return
-            out: list[str] = []
-            for line in lines:
-                raw = line.rstrip("\n")
-                parts = raw.split(" | ", 3)
-                if len(parts) < 4:
-                    out.append(line)
-                    continue
-                ts_part, direction, peer_raw, rest = parts
-                if peer_raw != old_dialog_id:
-                    out.append(line)
-                    continue
-                if new_dialog_id is None:
-                    continue
-                out.append(f"{ts_part} | {direction} | {new_dialog_id} | {rest}\n")
-            try:
-                with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                    f.writelines(out)
-            except Exception:
-                return
+            if new_dialog_id is None:
+                purge_history_peer(old_dialog_id)
+            else:
+                rewrite_history_peer_field(old_dialog_id, new_dialog_id)
 
         def rename_group(group_id: str) -> None:
             old_name = group_id[6:]
@@ -3466,32 +3798,6 @@ def main() -> int:
             refresh_list()
 
         def delete_peer(peer_id: str) -> None:
-            # Purge history file lines for this peer
-            def purge_history(peer_norm: str) -> None:
-                if not os.path.isfile(HISTORY_FILE):
-                    return
-                try:
-                    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                except Exception:
-                    return
-                keep: list[str] = []
-                for line in lines:
-                    parts = line.rstrip("\n").split(" | ")
-                    if len(parts) < 5:
-                        keep.append(line)
-                        continue
-                    peer_raw = parts[2]
-                    peer_norm_line = norm_id_for_filename(peer_raw)
-                    if peer_norm_line == peer_norm:
-                        continue
-                    keep.append(line)
-                try:
-                    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                        f.writelines(keep)
-                except Exception:
-                    pass
-
             # Remove from groups
             for gname, members in list(groups.items()):
                 if peer_id in members:
@@ -3506,7 +3812,7 @@ def main() -> int:
             with pending_lock:
                 pending_by_peer.pop(peer_id, None)
                 save_state(pending_by_peer)
-            purge_history(peer_id)
+            purge_history_peer(peer_id)
             # Remove peer keys
             peer_key = os.path.join(keydir, f"{peer_id}.pub")
             try:
@@ -3530,7 +3836,7 @@ def main() -> int:
             if st:
                 st.force_key_req = True
                 st.next_key_req_ts = 0.0
-            send_key_request(peer_id)
+            send_key_request(peer_id, require_confirm=True, reason="manual_request_key")
 
         def reset_peer_key(peer_id: str) -> None:
             if not peer_id or peer_id.startswith("group:"):
@@ -3550,8 +3856,317 @@ def main() -> int:
                 st.aes = None
                 st.force_key_req = True
                 st.next_key_req_ts = 0.0
-            send_key_request(peer_id)
+            send_key_request(peer_id, require_confirm=True, reason="reset_key")
             log_line(f"{ts_local()} KEY: reset for {peer_id}", "warn")
+
+        trace_inflight: set[str] = set()
+        trace_lock = threading.Lock()
+
+        def trace_route(peer_id: str) -> None:
+            if not peer_id or peer_id.startswith("group:"):
+                return
+            if not re.fullmatch(r"[0-9a-fA-F]{8}", peer_id):
+                log_line(f"TRACE: invalid peer id '{peer_id}'", "warn")
+                return
+            if peer_id == self_id:
+                return
+            if not radio_ready or interface is None:
+                log_line(f"{ts_local()} TRACE: radio not connected", "warn")
+                return
+            with trace_lock:
+                if peer_id in trace_inflight:
+                    log_line(f"{ts_local()} TRACE: already running for {peer_id}", "warn")
+                    return
+                trace_inflight.add(peer_id)
+
+            trace_id = f"trace:{peer_id}:{os.urandom(4).hex()}"
+            sent_at_ts = time.time()
+            meta_data_out: Dict[str, object] = {
+                "delivery": None,
+                "attempts": 0.0,
+                "forward_hops": None,
+                "ack_hops": None,
+                "incoming": False,
+                "done": False,
+                "sent_at_ts": sent_at_ts,
+            }
+            chat_line(
+                peer_id,
+                tr("trace_request"),
+                "#fd971f",
+                outgoing=True,
+                msg_id=trace_id,
+                meta=format_meta(None, 0.0, None, None, None, sent_at_ts=sent_at_ts),
+                meta_data=meta_data_out,
+            )
+
+            def _worker(peer_norm: str) -> None:
+                try:
+                    iface = interface
+                    if not radio_ready or iface is None:
+                        delivered_at_ts = time.time()
+                        ui_emit("log", f"{ts_local()} TRACE: start {peer_norm} (radio not connected)")
+                        ui_emit(
+                            "trace_done",
+                            (
+                                peer_norm,
+                                trace_id,
+                                {
+                                    **meta_data_out,
+                                    "delivery": max(0.0, float(delivered_at_ts - sent_at_ts)),
+                                    "attempts": float(meta_data_out.get("attempts", 0.0) or 0.0),
+                                    "status": "timeout",
+                                    "done": False,
+                                },
+                                "",
+                            ),
+                        )
+                        return
+                    from meshtastic import mesh_pb2
+
+                    # Refresh name cache from Meshtastic node DB (best-effort).
+                    update_peer_names_from_nodes()
+
+                    dest = wire_id_from_norm(peer_norm)
+                    hop_limit = 8
+                    ui_emit("log", f"{ts_local()} TRACE: start {peer_norm} dest={dest} hop_limit={hop_limit}")
+                    done = threading.Event()  # global traceroute completion
+                    result: Dict[str, object] = {"text": "", "forward_hops": None, "ack_hops": None, "status": None}
+                    result_lock = threading.Lock()
+
+                    def _node_label(node_num: object, is_dest: bool) -> str:
+                        try:
+                            n = int(node_num)
+                        except Exception:
+                            return str(node_num)
+                        try:
+                            s = iface._nodeNumToId(n, is_dest)  # type: ignore[attr-defined]
+                        except Exception:
+                            s = None
+                        node_id = str(s) if s else f"!{n:08x}"
+                        try:
+                            if (not node_id.startswith("!")) and re.fullmatch(r"[0-9a-fA-F]{8}", node_id):
+                                node_id = f"!{node_id.lower()}"
+                        except Exception:
+                            pass
+                        name = ""
+                        try:
+                            long_name, short_name = _peer_name_parts(node_id)
+                            if long_name and short_name:
+                                name = f"{long_name} [{short_name}]"
+                            elif long_name:
+                                name = long_name
+                            elif short_name:
+                                name = f"[{short_name}]"
+                        except Exception:
+                            name = ""
+                        if name:
+                            # Keep node id outside parentheses to avoid nested parens with SNR output.
+                            return f"{name} {node_id}"
+                        return node_id
+
+                    def _snr_str(raw_val: object) -> str:
+                        try:
+                            v = int(raw_val)
+                        except Exception:
+                            return "?"
+                        if v == -128:
+                            return "?"
+                        try:
+                            return str(float(v) / 4.0)
+                        except Exception:
+                            return "?"
+
+                    def _format_traceroute_response(p: Dict[str, object]) -> Tuple[str, Optional[int], Optional[int]]:
+                        decoded = p.get("decoded") if isinstance(p, dict) else None
+                        decoded = decoded if isinstance(decoded, dict) else {}
+                        payload = decoded.get("payload")
+                        if not isinstance(payload, (bytes, bytearray)):
+                            return (tr("trace_timeout"), None, None)
+                        rd = mesh_pb2.RouteDiscovery()
+                        rd.ParseFromString(bytes(payload))
+                        lines: list[str] = []
+                        lines.append(tr("trace_towards"))
+                        to_num = p.get("to")
+                        from_num = p.get("from")
+                        route_str = _node_label(to_num, False)
+                        snr_towards = list(getattr(rd, "snr_towards", []))
+                        route = list(getattr(rd, "route", []))
+                        fwd_hops = len(route) + 1
+                        snr_valid = len(snr_towards) == (len(route) + 1)
+                        for idx, node_num in enumerate(route):
+                            snr = _snr_str(snr_towards[idx]) if snr_valid else "?"
+                            route_str += f" --> {_node_label(node_num, False)} ({snr}dB)"
+                        snr_last = _snr_str(snr_towards[-1]) if snr_valid and snr_towards else "?"
+                        route_str += f" --> {_node_label(from_num, False)} ({snr_last}dB)"
+                        lines.append(route_str)
+
+                        route_back = list(getattr(rd, "route_back", []))
+                        snr_back = list(getattr(rd, "snr_back", []))
+                        back_valid = ("hopStart" in p) and (len(snr_back) == (len(route_back) + 1))
+                        ack_hops = None
+                        if back_valid:
+                            ack_hops = len(route_back) + 1
+                            lines.append(tr("trace_back"))
+                            route_str = _node_label(from_num, False)
+                            for idx, node_num in enumerate(route_back):
+                                snr = _snr_str(snr_back[idx]) if snr_back else "?"
+                                route_str += f" --> {_node_label(node_num, False)} ({snr}dB)"
+                            snr_last = _snr_str(snr_back[-1]) if snr_back else "?"
+                            route_str += f" --> {_node_label(to_num, False)} ({snr_last}dB)"
+                            lines.append(route_str)
+                        return ("\n".join(lines), fwd_hops, ack_hops)
+
+                    def _on_resp(p: Dict[str, object]) -> None:
+                        with result_lock:
+                            if done.is_set():
+                                return
+                            try:
+                                text, fwd_hops, ack_hops = _format_traceroute_response(p)
+                                result["text"] = text
+                                result["forward_hops"] = float(fwd_hops) if fwd_hops is not None else None
+                                result["ack_hops"] = float(ack_hops) if ack_hops is not None else None
+                                result["status"] = None
+                                ui_emit(
+                                    "log",
+                                    f"{ts_local()} TRACE: response {peer_norm} hops={fwd_hops if fwd_hops is not None else '?'} back={ack_hops if ack_hops is not None else '?'}",
+                                )
+                                # Log the full traceroute output lines (diagnostic).
+                                try:
+                                    for ln in str(text or "").splitlines():
+                                        if ln.strip():
+                                            ui_emit("log", f"{ts_local()} TRACE: {peer_norm} {ln}")
+                                except Exception:
+                                    pass
+                            except Exception:
+                                result["text"] = tr("trace_timeout")
+                                result["status"] = "timeout"
+                            finally:
+                                done.set()
+
+                    nodes_obj = getattr(iface, "nodes", None)
+                    try:
+                        nodes_len = len(nodes_obj) if nodes_obj else 0
+                    except Exception:
+                        nodes_len = 0
+                    wait_factor = min(max(0, int(nodes_len) - 1), int(hop_limit))
+                    try:
+                        base_timeout = float(getattr(getattr(iface, "_timeout", None), "expireTimeout", 20) or 20)
+                    except Exception:
+                        base_timeout = 20.0
+                    # Defensive: Meshtastic timeout values can vary wildly depending on platform/build.
+                    # Traceroute is a diagnostic; keep per-attempt waits bounded so we can retry/finish
+                    # within the overall max_total_s window without stalling the worker thread.
+                    base_timeout = max(5.0, min(60.0, float(base_timeout)))
+                    timeout_s = base_timeout * float(max(1, wait_factor))
+                    try:
+                        max_total_s = float(getattr(args, "max_seconds", 600) or 600)
+                    except Exception:
+                        max_total_s = 600.0
+                    # Traceroute is a diagnostic tool; cap retry window to avoid generating excessive traffic.
+                    max_total_s = min(600.0, max(10.0, float(max_total_s)))
+                    # Ensure one attempt doesn't block longer than the overall retry window.
+                    timeout_s = max(2.0, min(float(timeout_s), float(max_total_s), 60.0))
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} TRACE: params {peer_norm} timeout_s={timeout_s:.1f} max_total_s={max_total_s:.1f} base_timeout={base_timeout:.1f} nodes={nodes_len}",
+                    )
+
+                    attempt = 0
+                    next_retry_at = sent_at_ts
+                    while not done.is_set():
+                        now = time.time()
+                        if (now - sent_at_ts) >= max_total_s:
+                            break
+                        if now < next_retry_at:
+                            done.wait(timeout=min(0.2, max(0.0, next_retry_at - now)))
+                            continue
+                        attempt += 1
+                        ui_emit("trace_update", (peer_norm, trace_id, float(attempt)))
+                        ui_emit("log", f"{ts_local()} TRACE: attempt={attempt} {peer_norm}")
+                        req = mesh_pb2.RouteDiscovery()
+                        send_err: list[BaseException] = []
+                        send_done = threading.Event()
+
+                        def _send_req() -> None:
+                            try:
+                                iface.sendData(
+                                    req,
+                                    destinationId=dest,
+                                    portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                    wantResponse=True,
+                                    onResponse=_on_resp,
+                                    channelIndex=(args.channel if args.channel is not None else 0),
+                                    hopLimit=hop_limit,
+                                )
+                            except BaseException as ex:
+                                send_err.append(ex)
+                            finally:
+                                send_done.set()
+
+                        t0 = time.time()
+                        threading.Thread(target=_send_req, daemon=True).start()
+                        if not send_done.wait(timeout=5.0):
+                            # If Meshtastic sendData blocks, avoid spinning retries; mark trace as failed.
+                            ui_emit("log", f"{ts_local()} TRACE: sendData blocked >5s, abort {peer_norm}")
+                            with result_lock:
+                                result["status"] = "send_blocked"
+                                result["text"] = ""
+                            done.set()
+                            break
+                        if send_err:
+                            ui_emit("log", f"{ts_local()} TRACE: send failed ({type(send_err[0]).__name__}), retry later {peer_norm}")
+                            next_retry_at = time.time() + retry_delay_seconds(float(args.retry_seconds), int(attempt))
+                            continue
+                        ui_emit("log", f"{ts_local()} TRACE: send ok dt={(time.time() - t0):.2f}s {peer_norm}")
+                        done.wait(timeout=timeout_s)
+                        if done.is_set():
+                            break
+                        next_retry_at = time.time() + retry_delay_seconds(float(args.retry_seconds), int(attempt))
+                        ui_emit(
+                            "log",
+                            f"{ts_local()} TRACE: no response, schedule retry in {max(0.0, next_retry_at - time.time()):.1f}s {peer_norm}",
+                        )
+                    delivered_at_ts = time.time()
+                    attempts_val = float(attempt)
+                    text = str(result.get("text", "") or "")
+                    status = None
+                    with result_lock:
+                        status_raw = result.get("status")
+                        status = str(status_raw).strip() if status_raw is not None else None
+                    if not done.is_set():
+                        status = "timeout"
+                    if status and not text:
+                        text = tr("trace_timeout")
+                    if status:
+                        ui_emit("log", f"{ts_local()} TRACE: done {peer_norm} status={status} attempts={attempt}")
+                    else:
+                        fwd = result.get("forward_hops")
+                        back = result.get("ack_hops")
+                        ui_emit(
+                            "log",
+                            f"{ts_local()} TRACE: done {peer_norm} ok attempts={attempt} hops={fwd if fwd is not None else '?'} back={back if back is not None else '?'}",
+                        )
+                    meta_data_final: Dict[str, object] = {
+                        **meta_data_out,
+                        "delivery": max(0.0, float(delivered_at_ts - sent_at_ts)),
+                        "attempts": attempts_val,
+                        "forward_hops": result.get("forward_hops"),
+                        "ack_hops": result.get("ack_hops"),
+                    }
+                    if status:
+                        meta_data_final["status"] = status
+                        meta_data_final["done"] = False
+                    else:
+                        meta_data_final["delivered_at_ts"] = delivered_at_ts
+                        meta_data_final["done"] = True
+                    resp_text = text if not status else ""
+                    ui_emit("trace_done", (peer_norm, trace_id, meta_data_final, resp_text))
+                finally:
+                    with trace_lock:
+                        trace_inflight.discard(peer_norm)
+
+            threading.Thread(target=_worker, args=(peer_id,), daemon=True).start()
 
         def chat_line(
             dialog_id: str,
@@ -3562,6 +4177,7 @@ def main() -> int:
             meta: str = "",
             meta_data: Optional[Dict[str, object]] = None,
             replace_msg_id: Optional[str] = None,
+            keep_ts_on_replace: bool = False,
         ) -> None:
             ts = time.strftime("%H:%M", time.localtime())
             line = f"{ts} {text}"
@@ -3570,6 +4186,13 @@ def main() -> int:
                 for i in range(len(history) - 1, -1, -1):
                     entry = history[i]
                     if isinstance(entry, dict) and entry.get("msg_id") == replace_msg_id:
+                        if keep_ts_on_replace:
+                            try:
+                                old_text = str(entry.get("text", "") or "")
+                                if len(old_text) >= 6 and old_text[2] == ":" and old_text[5] == " ":
+                                    line = f"{old_text[:5]} {text}"
+                            except Exception:
+                                pass
                         entry["text"] = line
                         if meta:
                             entry["meta"] = meta
@@ -3891,9 +4514,12 @@ def main() -> int:
             if level == "error":
                 color = "#f92672"
             elif level == "keyok":
-                color = "#ad7fa8"
+                color = "#ffd75f"
             elif level == "key":
-                color = "#6fdc6f"
+                # Crypto request/response events (key exchange) are highlighted.
+                color = "#ffd75f"
+            elif level == "trace":
+                color = "#66d9ef"
             elif level == "warn":
                 color = "#fd971f"
             else:
@@ -3921,6 +4547,9 @@ def main() -> int:
             lvl = str(level or "info").strip().lower()
             low = text.lower()
             if lvl == "info":
+                # TRACE logs (diagnostics) get their own color in the UI.
+                if "trace:" in low and "traceback" not in low:
+                    lvl = "trace"
                 if ("pinned key mismatch" in low) or ("reject invalid public key" in low):
                     lvl = "error"
                 elif ("error" in low) or ("exception" in low) or ("traceback" in low):
@@ -4344,6 +4973,8 @@ def main() -> int:
                     evt, payload = ui_events.get_nowait()
                 except queue.Empty:
                     break
+                if evt == "names_update":
+                    refresh_list()
                 if evt == "peer_update":
                     update_peer_meta(str(payload) if isinstance(payload, str) else None)
                     refresh_list()
@@ -4457,12 +5088,203 @@ def main() -> int:
                             new_parallel = max(1, int(payload[1]))
                             cfg["rate_seconds"] = new_rate
                             cfg["parallel_sends"] = new_parallel
+                            # If Settings dialog is open, reflect the tuned values live.
+                            try:
+                                if (
+                                    settings_rate_edit is not None
+                                    and settings_parallel_edit is not None
+                                    and (settings_auto_pacing_cb is None or settings_auto_pacing_cb.isChecked())
+                                ):
+                                    settings_rate_edit.setText(str(new_rate))
+                                    settings_parallel_edit.setText(str(new_parallel))
+                            except Exception:
+                                pass
                             now_save = time.time()
                             if auto_pacing and ((now_save - last_pacing_save_ts) >= 60.0):
                                 last_pacing_save_ts = now_save
                                 save_gui_config()
                         except Exception:
                             pass
+                elif evt == "trace_update":
+                    if isinstance(payload, (tuple, list)) and len(payload) >= 3:
+                        peer_norm = str(payload[0] or "")
+                        trace_id = str(payload[1] or "")
+                        try:
+                            attempts_val = float(payload[2])
+                        except Exception:
+                            attempts_val = 0.0
+                        if not peer_norm or not trace_id:
+                            continue
+                        # Update the outgoing "Trace request" status line with current attempt count.
+                        sent_at_ts = None
+                        old_meta_data = None
+                        entries = chat_history.get(peer_norm, [])
+                        for entry in reversed(entries):
+                            if isinstance(entry, dict) and entry.get("msg_id") == trace_id:
+                                old_meta_data = entry.get("meta_data")
+                                break
+                        if isinstance(old_meta_data, dict):
+                            try:
+                                raw_sent = float(old_meta_data.get("sent_at_ts", 0.0) or 0.0)
+                            except Exception:
+                                raw_sent = 0.0
+                            if raw_sent > 0.0:
+                                sent_at_ts = raw_sent
+                        new_meta_data: Dict[str, object] = {
+                            "delivery": None,
+                            "attempts": float(max(0.0, attempts_val)),
+                            "forward_hops": None,
+                            "ack_hops": None,
+                            "incoming": False,
+                            "done": False,
+                        }
+                        if sent_at_ts is not None:
+                            new_meta_data["sent_at_ts"] = sent_at_ts
+                        meta = format_meta(
+                            None,
+                            float(max(0.0, attempts_val)),
+                            None,
+                            None,
+                            None,
+                            sent_at_ts=sent_at_ts,
+                        )
+                        chat_line(
+                            peer_norm,
+                            tr("trace_request"),
+                            "#fd971f",
+                            outgoing=True,
+                            msg_id=trace_id,
+                            meta=meta,
+                            meta_data=new_meta_data,
+                            replace_msg_id=trace_id,
+                            keep_ts_on_replace=True,
+                        )
+                elif evt == "trace_done":
+                    if isinstance(payload, (tuple, list)) and len(payload) >= 4:
+                        peer_norm = str(payload[0] or "")
+                        trace_id = str(payload[1] or "")
+                        meta_data = payload[2] if isinstance(payload[2], dict) else None
+                        resp_text = str(payload[3] or "")
+                        if not peer_norm or not trace_id:
+                            continue
+
+                        def as_float(val: object) -> Optional[float]:
+                            if val is None:
+                                return None
+                            try:
+                                return float(val)
+                            except Exception:
+                                return None
+
+                        meta = ""
+                        if isinstance(meta_data, dict):
+                            status_raw = meta_data.get("status")
+                            status = str(status_raw).strip() if status_raw is not None else None
+                            done_raw = meta_data.get("done")
+                            done = bool(done_raw) if done_raw is not None else None
+                            meta = format_meta(
+                                as_float(meta_data.get("delivery")),
+                                as_float(meta_data.get("attempts")),
+                                as_float(meta_data.get("forward_hops")),
+                                as_float(meta_data.get("ack_hops")),
+                                None,
+                                status=status or None,
+                                delivered_at_ts=as_float(meta_data.get("delivered_at_ts")),
+                                incoming=False,
+                                done=done,
+                                sent_at_ts=as_float(meta_data.get("sent_at_ts")),
+                            )
+                        # Finalize outgoing request bubble (keep text as "Trace request").
+                        chat_line(
+                            peer_norm,
+                            tr("trace_request"),
+                            "#fd971f",
+                            outgoing=True,
+                            msg_id=trace_id,
+                            meta=meta,
+                            meta_data=meta_data,
+                            replace_msg_id=trace_id,
+                            keep_ts_on_replace=True,
+                        )
+                        # Keep traceroute request in persistent chat history.
+                        # We log it only once, on completion, so it includes final status/attempts/hops.
+                        try:
+                            entries = chat_history.get(peer_norm, [])
+                            for entry in reversed(entries):
+                                if isinstance(entry, dict) and entry.get("msg_id") == trace_id:
+                                    if not entry.get("logged"):
+                                        append_history(
+                                            "sent",
+                                            peer_norm,
+                                            trace_id,
+                                            tr("trace_request"),
+                                            meta_data=(dict(meta_data) if isinstance(meta_data, dict) else None),
+                                        )
+                                        entry["logged"] = True
+                                    break
+                        except Exception:
+                            pass
+                        if resp_text:
+                            # Add incoming response bubble with traceroute output + node names/ids.
+                            resp_id = f"{trace_id}:resp"
+                            if not history_has_msg(peer_norm, resp_id):
+                                received_at_ts = as_float(meta_data.get("delivered_at_ts")) if isinstance(meta_data, dict) else None
+                                if received_at_ts is None:
+                                    received_at_ts = time.time()
+                                forward_hops = as_float(meta_data.get("forward_hops")) if isinstance(meta_data, dict) else None
+                                ack_hops = as_float(meta_data.get("ack_hops")) if isinstance(meta_data, dict) else None
+                                resp_meta_data: Dict[str, object] = {
+                                    "delivery": None,
+                                    "attempts": None,
+                                    "forward_hops": forward_hops,
+                                    "ack_hops": ack_hops,
+                                    "incoming": True,
+                                    "done": True,
+                                    "received_at_ts": received_at_ts,
+                                }
+                                meta_resp = format_meta(
+                                    None,
+                                    None,
+                                    forward_hops,
+                                    ack_hops,
+                                    None,
+                                    incoming=True,
+                                    done=True,
+                                    received_at_ts=received_at_ts,
+                                )
+                                chat_line(
+                                    peer_norm,
+                                    resp_text,
+                                    "#66d9ef",
+                                    outgoing=False,
+                                    msg_id=resp_id,
+                                    meta=meta_resp,
+                                    meta_data=resp_meta_data,
+                                )
+                                # Keep traceroute output in persistent chat history.
+                                try:
+                                    entries = chat_history.get(peer_norm, [])
+                                    for entry in reversed(entries):
+                                        if isinstance(entry, dict) and entry.get("msg_id") == resp_id:
+                                            if not entry.get("logged"):
+                                                append_history(
+                                                    "recv",
+                                                    peer_norm,
+                                                    resp_id,
+                                                    resp_text,
+                                                    meta_data=resp_meta_data,
+                                                )
+                                                entry["logged"] = True
+                                            break
+                                except Exception:
+                                    pass
+                elif evt == "trace_result":
+                    # Legacy event shape (older builds); keep best-effort behavior.
+                    if isinstance(payload, (tuple, list)) and len(payload) >= 2:
+                        peer_norm = str(payload[0] or "")
+                        text = str(payload[1] or "")
+                        if peer_norm and text:
+                            chat_line(peer_norm, text, "#66d9ef", outgoing=False)
                 elif evt == "recv":
                     from_id = ""
                     text = ""
@@ -4764,7 +5586,8 @@ def main() -> int:
                     args.port = initial_port_arg
                     known_peers.clear()
                     peer_states.clear()
-                    peer_names.clear()
+                    with peer_names_lock:
+                        peer_names.clear()
                     key_response_last_ts.clear()
                     incoming_state.clear()
                     with pending_lock:
@@ -4852,6 +5675,7 @@ def main() -> int:
                         if ok and gname:
                             add_peers_to_group_by_name([current_id], str(gname))
                     add_action(tr("group_add"), add_to_group)
+                add_action(tr("msg_ctx_route"), lambda: trace_route(current_id))
                 add_action(tr("key_request"), lambda: request_key(current_id))
                 add_action(tr("clear_history"), lambda: clear_history(current_id))
                 add_action(tr("peer_delete"), lambda: delete_peer(current_id))

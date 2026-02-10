@@ -27,7 +27,8 @@ class DropSample:
 class AdaptivePacer:
     """Adaptive pacing for meshTalk sender loop.
 
-    Goal: maximize delivery throughput while staying conservative when the mesh becomes lossy.
+    Goal: reduce parasitic traffic (retries/timeouts) and keep the mesh stable.
+    Throughput is a secondary goal.
 
     The app has two knobs:
     - rate_seconds: window length (seconds)
@@ -43,13 +44,14 @@ class AdaptivePacer:
         parallel_sends: int,
         enabled: bool = False,
         *,
-        min_rate_seconds: int = 3,
-        max_rate_seconds: int = 60,
+        # Conservative limits to avoid "flooding" the mesh.
+        min_rate_seconds: int = 5,
+        max_rate_seconds: int = 120,
         min_parallel: int = 1,
-        max_parallel: int = 6,
+        max_parallel: int = 3,
         adjust_interval_seconds: float = 30.0,
         stats_window_seconds: float = 120.0,
-        parallel_penalty: float = 0.03,
+        parallel_penalty: float = 0.06,
     ) -> None:
         self._lock = threading.Lock()
         self.enabled = bool(enabled)
@@ -137,19 +139,30 @@ class AdaptivePacer:
             desired = cur_score
             why = ""
 
+            # Targets: keep almost everything delivered on the first attempt.
+            # This minimizes retransmits, which reduces overall mesh airtime usage.
             if timeout_drops > 0:
-                desired = cur_score * 0.5
+                desired = cur_score * 0.40
                 why = f"timeout_drops={timeout_drops}"
-            elif attempts_avg >= 1.60 or retries_ratio >= 0.25:
-                desired = cur_score * 0.70
-                why = f"attempts_avg={attempts_avg:.2f} retries_ratio={retries_ratio:.2f}"
-            elif attempts_avg <= 1.05 and retries_ratio <= 0.05:
-                factor = 1.10
-                if pend >= 50:
-                    factor = 1.25
-                elif pend >= 10:
-                    factor = 1.15
-                desired = cur_score * factor
+            elif attempts_avg >= 1.30 or retries_ratio >= 0.20:
+                desired = cur_score * 0.60
+                why = f"bad attempts_avg={attempts_avg:.2f} retries_ratio={retries_ratio:.2f}"
+            elif attempts_avg >= 1.15 or retries_ratio >= 0.10:
+                desired = cur_score * 0.80
+                why = f"warn attempts_avg={attempts_avg:.2f} retries_ratio={retries_ratio:.2f}"
+            elif rtt_p50 >= 12.0:
+                # Even with few retries, high RTT usually means the mesh is busy.
+                desired = cur_score * 0.85
+                why = f"high_rtt_p50={rtt_p50:.1f}s"
+            elif (
+                attempts_avg <= 1.02
+                and retries_ratio <= 0.02
+                and rtt_p50 > 0.0
+                and rtt_p50 <= 6.0
+                and pend >= 20
+            ):
+                # Scale up only when we have backlog AND delivery is clean AND RTT is low.
+                desired = cur_score * 1.05
                 why = f"good attempts_avg={attempts_avg:.2f}"
             else:
                 return None

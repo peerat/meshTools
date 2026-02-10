@@ -556,7 +556,7 @@ def _encrypt_history_token(plaintext: bytes, aad: bytes) -> str:
 
     key = _HISTORY_ENC_KEY
     if not key:
-        raise ValueError("history encryption key not configured")
+        raise ValueError("history storage key not configured")
     nonce = os.urandom(12)
     ct = AESGCM(key).encrypt(nonce, plaintext, aad)
     return HISTORY_TEXT_ENC_PREFIX + base64.b64encode(nonce + ct).decode("ascii")

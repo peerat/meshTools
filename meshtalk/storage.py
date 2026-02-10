@@ -299,6 +299,92 @@ class Storage:
                 f.write(line + "\n")
         harden_file(self.history_file)
 
+    def purge_history_peer(
+        self,
+        peer_id: str,
+        peer_norm_fn=None,
+    ) -> None:
+        """Remove history lines for a given peer id.
+
+        This is protected by the same history lock as append_history() to avoid
+        concurrent read/modify/write races that could drop recent appends.
+        """
+        if not peer_id:
+            return
+        if peer_norm_fn:
+            target = peer_norm_fn(peer_id)
+        else:
+            target = str(peer_id or "")
+        if not target:
+            return
+        if not os.path.isfile(self.history_file):
+            return
+        try:
+            with self._history_lock:
+                try:
+                    with open(self.history_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                except Exception:
+                    return
+                keep: list[str] = []
+                for line in lines:
+                    parts = line.rstrip("\n").split(" | ")
+                    if len(parts) < 3:
+                        keep.append(line)
+                        continue
+                    peer_raw = parts[2]
+                    peer_norm_line = peer_norm_fn(peer_raw) if peer_norm_fn else str(peer_raw or "")
+                    if peer_norm_line == target:
+                        continue
+                    keep.append(line)
+                tmp = self.history_file + ".tmp"
+                harden_dir(os.path.dirname(self.history_file) or ".")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(keep)
+                os.replace(tmp, self.history_file)
+            harden_file(self.history_file)
+        except Exception:
+            pass
+
+    def rewrite_history_peer_field(self, old_peer_id: str, new_peer_id: Optional[str]) -> None:
+        """Rewrite the peer_id field in history.log (exact match).
+
+        Used for renaming group dialogs. When new_peer_id is None, matching lines are removed.
+        """
+        if not old_peer_id:
+            return
+        if not os.path.isfile(self.history_file):
+            return
+        try:
+            with self._history_lock:
+                try:
+                    with open(self.history_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                except Exception:
+                    return
+                out: list[str] = []
+                for line in lines:
+                    raw = line.rstrip("\n")
+                    parts = raw.split(" | ", 3)
+                    if len(parts) < 4:
+                        out.append(line)
+                        continue
+                    ts_part, direction, peer_raw, rest = parts
+                    if peer_raw != old_peer_id:
+                        out.append(line)
+                        continue
+                    if new_peer_id is None:
+                        continue
+                    out.append(f"{ts_part} | {direction} | {new_peer_id} | {rest}\n")
+                tmp = self.history_file + ".tmp"
+                harden_dir(os.path.dirname(self.history_file) or ".")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(out)
+                os.replace(tmp, self.history_file)
+            harden_file(self.history_file)
+        except Exception:
+            pass
+
     def load_config(self) -> Dict[str, object]:
         if not os.path.isfile(self.config_file):
             return {}

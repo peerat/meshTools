@@ -15,7 +15,7 @@ License
 - Keep attribution notices from `NOTICE` when redistributing.
 
 Scope
-- Message payload compression/decompression wrappers for encrypted blobs.
+- Payload compression/decompression wrappers for cryptographically sealed blobs.
 - Legacy/compact wire payload builders and parsers.
 - Key-frame receive policy and capability parsing.
 - History text codec (`b64:`), parsing helpers, and multipart assembly.
@@ -42,7 +42,7 @@ RU
 - При распространении сохраняйте атрибуцию из `NOTICE`.
 
 Область ответственности
-- Обертки сжатия/распаковки payload для шифрованных блоков.
+- Обертки сжатия/распаковки payload для криптографически запечатанных блоков.
 - Сборка и разбор legacy/compact wire payload.
 - Политика приема key-frame и парсинг capabilities.
 - Кодек текста истории (`b64:`), парсеры и сборка multipart.

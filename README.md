@@ -1,14 +1,14 @@
 # meshTools
 
 Author: Anton Vologzhanin (R3VAF)
-Current version: 0.3.2
+Current version: 0.3.3
 
 Small utilities around Meshtastic.
 
 ## Project Vision
 
-- Purpose: civilian/hobby/geek use and study of message delivery in mesh networks.
-- The project is aimed at experimentation, reliability analysis, and protocol behavior learning.
+- Purpose: civilian/hobby/geek use and study of data-packet delivery in mesh topologies.
+- The project is aimed at experimentation, delivery/latency analysis, and protocol behavior learning.
 - Military use is explicitly prohibited.
 - Any unlawful use (including terrorist, extremist, criminal activity) is explicitly prohibited.
 - Disclaimer: software is provided "AS IS", without warranties of any kind.
@@ -26,7 +26,7 @@ Small utilities around Meshtastic.
 - `meshLogger.py` also writes an SQLite DB (`meshLogger.db`) once per hour using `meshtastic --nodes`.
 - `nodeDbUpdater.py` is legacy (text DB); keep only if you still need `nodeDb.txt`.
 - `graphGen.py` builds Graphviz (DOT/SVG) and D3.js (HTML/JSON) graphs from logs and node DB in `graphGen/` (SQLite preferred, `nodeDb.txt` fallback).
-- `meshTalk.py` provides encrypted, ACK-based point-to-point messaging over Meshtastic (Python API).
+- `meshTalk.py` is a research prototype: ACK-based, best-effort P2P payload exchange over Meshtastic (Python API) with cryptographic primitives.
 - meshTalk UI: unread indicator (orange dot) in contact list.
 - Per-file references:
   - `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
@@ -102,7 +102,7 @@ Generate graph from recent logs (Graphviz + D3.js):
 python graphGen.py --root .
 ```
 
-Reliable P2P messaging (E2EE + ACK):
+Best-effort P2P payload exchange (cryptographic primitives + ACK):
 
 Qt GUI app:
 
@@ -117,16 +117,30 @@ In the GUI, use the search box to type a node id (e.g. `02e591e0` or `!02e591e0`
 
 Keys are stored in `keyRings/` as `<id>.key` and `<id>.pub` (leading `!` is stripped).
 If `keyRings/<id>.key` / `keyRings/<id>.pub` are missing, they are generated automatically.
-At-rest encryption key is stored in `keyRings/storage.key` (32 bytes, base64; created automatically).
+Local at-rest storage key is stored in `keyRings/storage.key` (32 bytes, base64; created automatically).
+
+## Cryptography (where/when)
+
+This project uses cryptographic primitives for payload sealing and local at-rest sealing. It does not claim or guarantee any specific security properties.
+
+- Key exchange frames (MT-KEY v1): `KR1|...` / `KR2|...`
+  - Format: plaintext UTF-8/ASCII with `|` separators.
+  - Public key: X25519 public key (32 raw bytes, base64 in the frame).
+- Transport container (MT-WIRE v1): AES-256-GCM (AEAD)
+  - Key derivation: X25519 ECDH + HKDF-SHA256 -> 32-byte AES key (see `meshtalk/protocol.py` and `meshtalk/protocol.txt`).
+  - Applied: to all MSG/ACK frames on the Meshtastic `PRIVATE_APP` port.
+- Local at-rest sealing (per node profile): AES-256-GCM (AEAD)
+  - Key file: `<node_id>/keyRings/storage.key` (32 bytes, base64; local-only).
+  - Applied: `history.log`, `state.json`, `incoming.json` sensitive fields (see `meshtalk/storage.py` and `meshtalk/storage.txt`).
 The script detects your node id from the radio automatically.
 If a peer key is missing, a key exchange is requested automatically.
 Outgoing messages are stored per node profile in `<node_id>/state.json` and `<node_id>/history.log`.
-Message text persisted on disk is stored encrypted as `enc1:...` (AES-256-GCM; key in `keyRings/storage.key`).
+Payload text persisted on disk is stored as `enc1:...` (AES-256-GCM AEAD; key in `keyRings/storage.key`).
 Type `/keys` to rotate your keys (they will be regenerated and exchanged again).
 
 ### Text Compression (Optional)
 
-Compression is applied to message payload before encryption and only when it gives size gain.
+Compression is applied to payload bytes before MT-WIRE sealing and only when it gives size gain.
 
 - Compression settings are hidden from UI and work automatically.
 - Decision rule: all supported modes are compared; compression is used only when the best mode is smaller than plain UTF-8.
@@ -186,10 +200,10 @@ Output: `dist\meshTalk.exe`
 - `meshLogger.py` — traceroute/logger utility.
 - `nodeDbUpdater.py` — legacy text DB updater.
 - `graphGen.py` — Graphviz + D3 generator.
-- `meshTalk.py` — encrypted messenger.
+- `meshTalk.py` — research prototype GUI for best-effort P2P payload exchange (ACK/retry + cryptographic primitives).
 - `meshtalk/` — internal meshTalk modules:
-  - `meshtalk/protocol.py` — wire protocol + E2EE helpers.
-  - `meshtalk/storage.py` — config/state/history/incoming storage + at-rest encryption.
+  - `meshtalk/protocol.py` — wire protocol + cryptographic primitives.
+  - `meshtalk/storage.py` — config/state/history/incoming storage + at-rest sealing/hardening.
 - `meshtalk_utils.py` — shared helpers/parsers/formatters.
 - `message_text_compression.py` — text compression modes/codecs.
 - `requirements.txt` — Python dependencies.
@@ -233,8 +247,8 @@ Output: `dist\meshTalk.exe`
 
 ## Видение проекта
 
-- Назначение: гражданское/любительское/гиковское использование и изучение прохождения сообщений в mesh-сетях.
-- Проект ориентирован на эксперименты, анализ надежности и изучение поведения протокола.
+- Назначение: гражданское/любительское/гиковское использование и изучение доставки пакетов данных в mesh-сетях.
+- Проект ориентирован на эксперименты, анализ доставки/задержек и изучение поведения протокола.
 - Военное применение прямо запрещено.
 - Любая незаконная деятельность (включая террористическую, экстремистскую и преступную) прямо запрещена.
 - Отказ от ответственности: ПО предоставляется «как есть», без каких-либо гарантий.
@@ -252,7 +266,7 @@ Output: `dist\meshTalk.exe`
 - `meshLogger.py` также пишет SQLite-базу (`meshLogger.db`) раз в час через `meshtastic --nodes`.
 - `nodeDbUpdater.py` — устаревший (текстовый) вариант; нужен только если нужен `nodeDb.txt`.
 - `graphGen.py` строит графы Graphviz (DOT/SVG) и D3.js (HTML/JSON) из логов и базы узлов в `graphGen/` (предпочитает SQLite, fallback — `nodeDb.txt`).
-- `meshTalk.py` — шифрованный P2P-обмен с ACK поверх Meshtastic (Python API).
+- `meshTalk.py` — исследовательский прототип: best-effort P2P-обмен полезной нагрузкой с ACK поверх Meshtastic (Python API) с криптографическими примитивами.
 - Текстовые справки по каждому Python-файлу:
   - `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
 
@@ -326,7 +340,7 @@ python meshLogger.py --db-schema
 python graphGen.py --root .
 ```
 
-Надежный P2P-обмен (E2EE + ACK):
+Best-effort P2P-обмен полезной нагрузкой (криптографические примитивы + ACK):
 
 Qt GUI app:
 
@@ -339,16 +353,30 @@ python meshTalk.py
 
 Ключи хранятся в `keyRings/` как `<id>.key` и `<id>.pub` (ведущий `!` убирается).
 Если `keyRings/<id>.key` / `keyRings/<id>.pub` отсутствуют, они создаются автоматически.
-Ключ шифрования на диске хранится в `keyRings/storage.key` (32 байта, base64; создается автоматически).
+Локальный ключ хранения на диске хранится в `keyRings/storage.key` (32 байта, base64; создается автоматически).
 Скрипт автоматически определяет id узла из радио.
 Если ключ собеседника отсутствует, автоматически запрашивается обмен ключами.
-Исходящие сообщения сохраняются в профиле узла: `<node_id>/state.json` и `<node_id>/history.log`.
-Текст сообщений при сохранении на диск хранится в зашифрованном виде `enc1:...` (AES-256-GCM; ключ в `keyRings/storage.key`).
+Исходящая полезная нагрузка сохраняется в профиле узла: `<node_id>/state.json` и `<node_id>/history.log`.
+Текст полезной нагрузки при сохранении на диск хранится как `enc1:...` (AES-256-GCM AEAD; ключ в `keyRings/storage.key`).
 Команда `/keys` пересоздаёт ваши ключи и запускает новый обмен.
+
+## Криптография (где/когда)
+
+В проекте используются криптографические примитивы для запечатывания payload и локального запечатывания данных на диске. Проект не обещает и не гарантирует каких-либо конкретных свойств безопасности.
+
+- Обмен ключами (MT-KEY v1): кадры `KR1|...` / `KR2|...`
+  - Формат: plaintext UTF-8/ASCII с разделителем `|`.
+  - Публичный ключ: X25519 public key (32 raw bytes, base64 внутри кадра).
+- Транспортный контейнер (MT-WIRE v1): AES-256-GCM (AEAD)
+  - Вычисление ключа: X25519 ECDH + HKDF-SHA256 -> 32-байтный AES key (см. `meshtalk/protocol.py` и `meshtalk/protocol.txt`).
+  - Применяется: ко всем MSG/ACK кадрам на порту Meshtastic `PRIVATE_APP`.
+- Локальное запечатывание на диске (профиль ноды): AES-256-GCM (AEAD)
+  - Файл ключа: `<node_id>/keyRings/storage.key` (32 байта, base64; строго локальный).
+  - Применяется: к чувствительным полям в `history.log`, `state.json`, `incoming.json` (см. `meshtalk/storage.py` и `meshtalk/storage.txt`).
 
 ### Сжатие текста (опционально)
 
-Сжатие применяется к payload сообщения до шифрования и только если есть выигрыш по размеру.
+Сжатие применяется к байтам payload до запечатывания MT-WIRE и только если есть выигрыш по размеру.
 
 - Настройки сжатия скрыты из UI и работают автоматически.
 - Правило выбора: сравниваются все поддерживаемые режимы; сжатие включается только если лучший режим меньше обычного UTF-8.
@@ -408,10 +436,10 @@ build_meshTalk.bat
 - `meshLogger.py` — утилита traceroute/logger.
 - `nodeDbUpdater.py` — legacy-обновление текстовой БД.
 - `graphGen.py` — генерация Graphviz + D3.
-- `meshTalk.py` — шифрованный мессенджер.
+- `meshTalk.py` — research prototype GUI для best-effort P2P-обмена полезной нагрузкой (ACK/повторы + криптографические примитивы).
 - `meshtalk/` — внутренние модули meshTalk:
-  - `meshtalk/protocol.py` — wire-протокол + E2EE-хелперы.
-  - `meshtalk/storage.py` — хранение config/state/history/incoming + шифрование на диске.
+  - `meshtalk/protocol.py` — wire-протокол + криптографические примитивы.
+  - `meshtalk/storage.py` — хранение config/state/history/incoming + запечатывание на диске.
 - `meshtalk_utils.py` — общие утилиты/парсеры/форматтеры.
 - `message_text_compression.py` — режимы/кодеки сжатия текста.
 - `requirements.txt` — Python-зависимости.
