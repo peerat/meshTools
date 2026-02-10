@@ -377,7 +377,18 @@ def parse_key_exchange_frame(
     key_req_prefix: bytes,
     key_resp_prefix: bytes,
     supported_modes: Set[int],
-) -> Optional[Tuple[str, str, bytes, Optional[Set[int]], Optional[Set[str]]]]:
+) -> Optional[
+    Tuple[
+        str,
+        str,
+        bytes,
+        Optional[Set[int]],
+        Optional[Set[str]],
+        Optional[Set[int]],
+        Optional[Set[int]],
+        Optional[Set[int]],
+    ]
+]:
     if not isinstance(payload, (bytes, bytearray)):
         return None
     raw = bytes(payload)
@@ -401,30 +412,65 @@ def parse_key_exchange_frame(
             return None
         peer_modes: Optional[Set[int]] = None
         peer_caps: Optional[Set[str]] = None
+        peer_wire: Optional[Set[int]] = None
+        peer_msg: Optional[Set[int]] = None
+        peer_mc: Optional[Set[int]] = None
         for extra_raw in parts[2:]:
             try:
                 extra = extra_raw.decode("utf-8", errors="ignore").strip()
             except Exception:
                 continue
-            if not extra.startswith("mc_modes="):
-                if extra.startswith("mt_caps="):
-                    caps_raw = extra[len("mt_caps="):]
-                    parsed_caps = {c.strip() for c in caps_raw.split(",") if c.strip()}
-                    if parsed_caps:
-                        peer_caps = set(parsed_caps)
+            if extra.startswith("mt_caps="):
+                caps_raw = extra[len("mt_caps="):]
+                parsed_caps = {c.strip() for c in caps_raw.split(",") if c.strip()}
+                if parsed_caps:
+                    peer_caps = set(parsed_caps)
                 continue
-            try:
-                parsed = {
-                    int(item)
-                    for item in extra[len("mc_modes="):].split(",")
-                    if item != ""
-                }
-            except Exception:
-                parsed = set()
-            parsed = {m for m in parsed if m in supported_modes}
-            if parsed:
-                peer_modes = set(parsed)
-        return (kind, peer_id, pub_raw, peer_modes, peer_caps)
+
+            def parse_int_csv(raw_text: str) -> Set[int]:
+                out: Set[int] = set()
+                for item in raw_text.split(","):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    try:
+                        out.add(int(item))
+                    except Exception:
+                        continue
+                return out
+
+            if extra.startswith("mt_wire="):
+                parsed = parse_int_csv(extra[len("mt_wire="):])
+                if parsed:
+                    peer_wire = set(parsed)
+                continue
+
+            if extra.startswith("mt_msg="):
+                parsed = parse_int_csv(extra[len("mt_msg="):])
+                if parsed:
+                    peer_msg = set(parsed)
+                continue
+
+            if extra.startswith("mt_mc="):
+                parsed = parse_int_csv(extra[len("mt_mc="):])
+                if parsed:
+                    peer_mc = set(parsed)
+                continue
+
+            if extra.startswith("mc_modes="):
+                try:
+                    parsed = {
+                        int(item)
+                        for item in extra[len("mc_modes="):].split(",")
+                        if item != ""
+                    }
+                except Exception:
+                    parsed = set()
+                parsed = {m for m in parsed if m in supported_modes}
+                if parsed:
+                    peer_modes = set(parsed)
+                continue
+        return (kind, peer_id, pub_raw, peer_modes, peer_caps, peer_wire, peer_msg, peer_mc)
     except Exception:
         return None
 

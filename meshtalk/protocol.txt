@@ -1,57 +1,223 @@
-meshtalk/protocol.py reference
+meshtalk Wire Protocol Specification (MT-WIRE)
 Author: Anton Vologzhanin (R3VAF)
+Updated: 2026-02-10
 
 ========================
 EN
 ========================
 
-Purpose
-- Internal wire-protocol helpers extracted from `meshTalk.py`.
-- Keeps crypto primitives and framing logic in a focused, testable module.
+Overview
+- This document specifies meshTalk payload formats carried over Meshtastic `PRIVATE_APP` port.
+- It covers key exchange (`KR1`/`KR2`), encrypted container (`MT-WIRE`), message framing (`MT-MSG`),
+  ACK format, and compression block (`MT-MC`).
 
-License
-- Apache License 2.0 (`LICENSE`).
-- Keep attribution notices from `NOTICE` when redistributing.
+Versioning model
+- MT-KEY v1: plaintext key exchange frames `KR1|...` (request) and `KR2|...` (response).
+- MT-WIRE v1: encrypted container with leading byte `ver=1` (see `meshtalk/protocol.py:PROTO_VERSION`).
+- MT-MSG v1: legacy UTF-8 framing starting with `T...`.
+- MT-MSG v2: compact binary framing starting with `M2`.
+- MT-MC v1: compression block starting with `MC`.
 
-Scope
-- Protocol constants: `PROTO_VERSION`, `TYPE_MSG`, `TYPE_ACK`.
-- Key derivation: X25519 (ECDH) + HKDF-SHA256.
-- Payload framing: `pack_message()` / `try_unpack_message()` using AES-256-GCM.
-- Best-effort payload compression before encryption (labels: `none|zlib|bz2|lzma`).
-- Public key fingerprint helper for UI/logs.
-- `PeerKeyPinnedError` for TOFU key pinning mismatches.
+Compatibility policy
+- KR1/KR2: receivers MUST ignore unknown `key=value` tokens to stay forward-compatible.
+- MT-WIRE: if `ver` is unknown, drop the frame.
+- MT-MSG: clients should keep decoding v1 and v2.
+- MT-MC: if MC decoding fails or `ver/dict_id` is unsupported, treat it as decode error.
 
-Used by
-- Imported by `meshTalk.py`.
+Negotiation / advertisement (in KR1/KR2 extra tokens)
+- `mc_modes=<csv>`: supported MC mode IDs (integers).
+- `mt_caps=<csv>`: capabilities (strings). Current: `aad_type`.
+- `mt_wire=<csv>`: supported MT-WIRE versions. Current: `1`.
+- `mt_msg=<csv>`: supported MT-MSG versions. Current: `1,2`.
+- `mt_mc=<csv>`: supported MT-MC versions. Current: `1`.
 
-Security notes
-- AES-GCM uses random 12-byte nonces per message.
-- AAD can optionally include message type (`bind_aad_type`) to reduce malleability across types.
+1) MT-KEY v1 (plaintext key exchange)
+Frame shapes (UTF-8/ASCII, `|` separator):
+- `KR1|<sender_id>|<sender_pub_b64>|...`
+- `KR2|<sender_id>|<sender_pub_b64>|...`
+
+Fields
+- `sender_id`: UTF-8 string. Must match Meshtastic `fromId` (case-insensitive).
+- `sender_pub_b64`: base64 of 32 raw bytes (X25519 public key).
+- Extra tokens: optional `key=value` segments separated by `|`.
+
+Example
+- `KR1|!11223344|<b64>|mc_modes=2,3,4,5|mt_wire=1|mt_msg=1,2|mt_mc=1|mt_caps=aad_type`
+
+2) Key derivation
+- ECDH: X25519(priv_self, pub_peer) -> 32-byte shared secret.
+- HKDF: HKDF-SHA256(shared, salt="meshTalk v1", info="meshTalk v1") -> 32-byte AES key.
+
+3) MT-WIRE v1 (encrypted container, AES-256-GCM)
+Byte layout:
+  offset  size  field
+  0       1     ver    (=1)
+  1       1     type   (1=MSG, 2=ACK)
+  2       8     msg_id (8 random bytes)
+  10      12    nonce  (12 random bytes)
+  22      N     ct||tag (ciphertext + 16-byte GCM tag)
+
+AEAD notes
+- Nonce: random 12 bytes per frame.
+- AAD:
+  - legacy: `msg_id`
+  - `aad_type` capability: `ver||type||msg_id`
+
+4) MT-MSG plaintext (inside MT-WIRE type=MSG)
+Two framing formats exist.
+
+4.1) MT-MSG v2 (compact binary, prefix `M2`)
+Header (big-endian):
+  offset  size  field
+  0       2     prefix "M2"
+  2       4     created_s (u32, unix seconds)
+  6       4     group_raw (4 bytes)
+  10      2     part (u16, 1..)
+  12      2     total (u16)
+  14      1     attempt (u8)
+  15      1     meta (u8; bit0 = compression flag)
+  16      N     chunk bytes
+
+Notes
+- `group_raw` is always 4 bytes. If source group id is not a 4-byte hex, it is hashed to 4 bytes.
+- `meta` bit0=1 indicates the assembled message body is an MT-MC block.
+
+4.2) MT-MSG v1 (legacy UTF-8, prefix `T`)
+- `T<created_s>|<group_id>|<part>/<total>|<attempt>|<chunk_text>`
+
+5) MT-ACK plaintext (inside MT-WIRE type=ACK)
+UTF-8:
+- `ACK|mc=1|mc_modes=<csv>|hops=<n>`
+- `hops=<n>` is optional.
+
+6) MT-MC v1 (compression block)
+Binary layout:
+  offset  size  field
+  0       2     magic "MC"
+  2       1     ver (=1)
+  3       1     mode
+  4       1     dict_id (=2)
+  5       1     flags
+  6       N     data
+  end-1   1     crc8 (over header+data)
+
+Mode IDs
+- 0: `mc_byte_dict`
+- 1: `mc_fixed_bits`
+- 2: `mc_deflate` (zlib raw, wbits=-15)
+- 3: `mc_zlib`
+- 4: `mc_bz2`
+- 5: `mc_lzma`
+- 6: `mc_nltk` (wire-level alias of deflate)
+- 7: `mc_spacy` (wire-level alias of zlib)
+- 8: `mc_tensorflow` (wire-level alias of lzma)
 
 ========================
 RU
 ========================
 
-Назначение
-- Внутренний модуль helpers wire-протокола, вынесенный из `meshTalk.py`.
-- Держит криптопримитивы и сборку/разбор фреймов в отдельном, тестируемом файле.
+Обзор
+- В этом документе описаны форматы payload в meshTalk, которые передаются через Meshtastic `PRIVATE_APP`.
+- Описываются: обмен ключами (`KR1`/`KR2`), зашифрованный контейнер (`MT-WIRE`), фрейминг сообщений (`MT-MSG`),
+  формат ACK и блок сжатия (`MT-MC`).
 
-Лицензия
-- Apache License 2.0 (`LICENSE`).
-- При распространении сохраняйте атрибуцию из `NOTICE`.
+Модель версий
+- MT-KEY v1: plaintext кадры обмена ключами `KR1|...` (запрос) и `KR2|...` (ответ).
+- MT-WIRE v1: зашифрованный контейнер с первым байтом `ver=1` (см. `meshtalk/protocol.py:PROTO_VERSION`).
+- MT-MSG v1: legacy UTF-8 фрейминг, начинается с `T...`.
+- MT-MSG v2: компактный бинарный фрейминг, начинается с `M2`.
+- MT-MC v1: блок сжатия, начинается с `MC`.
 
-Область ответственности
-- Константы протокола: `PROTO_VERSION`, `TYPE_MSG`, `TYPE_ACK`.
-- Вычисление ключа: X25519 (ECDH) + HKDF-SHA256.
-- Фрейминг payload: `pack_message()` / `try_unpack_message()` на AES-256-GCM.
-- Best-effort сжатие перед шифрованием (labels: `none|zlib|bz2|lzma`).
-- Хелпер fingerprint публичного ключа для UI/логов.
-- `PeerKeyPinnedError` для несоответствия закрепленного (pinned) ключа (TOFU).
+Политика совместимости
+- KR1/KR2: приемник ДОЛЖЕН игнорировать неизвестные `key=value` токены (forward-compat).
+- MT-WIRE: если `ver` неизвестен, кадр отбрасывается.
+- MT-MSG: рекомендуется сохранять декодирование v1 и v2.
+- MT-MC: если декодирование MC не удалось или `ver/dict_id` не поддерживаются, считать это decode error.
 
-Используется
-- Импортируется из `meshTalk.py`.
+Переговоры / объявление возможностей (extra токены в KR1/KR2)
+- `mc_modes=<csv>`: поддерживаемые ID режимов MC (целые числа).
+- `mt_caps=<csv>`: capabilities (строки). Сейчас: `aad_type`.
+- `mt_wire=<csv>`: поддерживаемые версии MT-WIRE. Сейчас: `1`.
+- `mt_msg=<csv>`: поддерживаемые версии MT-MSG. Сейчас: `1,2`.
+- `mt_mc=<csv>`: поддерживаемые версии MT-MC. Сейчас: `1`.
 
-Заметки по безопасности
-- AES-GCM использует случайные nonce 12 байт на каждое сообщение.
-- AAD опционально включает тип сообщения (`bind_aad_type`) для усиления связывания контекста.
+1) MT-KEY v1 (plaintext обмен ключами)
+Формат (UTF-8/ASCII, разделитель `|`):
+- `KR1|<sender_id>|<sender_pub_b64>|...`
+- `KR2|<sender_id>|<sender_pub_b64>|...`
 
+Поля
+- `sender_id`: строка UTF-8. Должна совпадать с Meshtastic `fromId` (регистронезависимо).
+- `sender_pub_b64`: base64 от 32 байт (публичный ключ X25519).
+- Extra токены: опциональные сегменты `key=value`, разделенные `|`.
+
+Пример
+- `KR1|!11223344|<b64>|mc_modes=2,3,4,5|mt_wire=1|mt_msg=1,2|mt_mc=1|mt_caps=aad_type`
+
+2) Вычисление ключа
+- ECDH: X25519(priv_self, pub_peer) -> 32‑байтный shared secret.
+- HKDF: HKDF-SHA256(shared, salt="meshTalk v1", info="meshTalk v1") -> 32‑байтный AES key.
+
+3) MT-WIRE v1 (зашифрованный контейнер, AES-256-GCM)
+Байт-раскладка:
+  offset  size  field
+  0       1     ver    (=1)
+  1       1     type   (1=MSG, 2=ACK)
+  2       8     msg_id (8 случайных байт)
+  10      12    nonce  (12 случайных байт)
+  22      N     ct||tag (ciphertext + 16‑байтный GCM tag)
+
+Заметки AEAD
+- Nonce: случайные 12 байт на каждый кадр.
+- AAD:
+  - legacy: `msg_id`
+  - capability `aad_type`: `ver||type||msg_id`
+
+4) MT-MSG plaintext (внутри MT-WIRE type=MSG)
+Есть два формата фрейминга.
+
+4.1) MT-MSG v2 (компактный бинарный, префикс `M2`)
+Заголовок (big-endian):
+  offset  size  field
+  0       2     prefix "M2"
+  2       4     created_s (u32, unix seconds)
+  6       4     group_raw (4 байта)
+  10      2     part (u16, 1..)
+  12      2     total (u16)
+  14      1     attempt (u8)
+  15      1     meta (u8; bit0 = compression flag)
+  16      N     chunk bytes
+
+Заметки
+- `group_raw` всегда 4 байта. Если исходный group id не 4‑байтный hex, он хэшируется до 4 байт.
+- `meta` bit0=1 означает, что собранное сообщение является MT‑MC блоком.
+
+4.2) MT-MSG v1 (legacy UTF-8, префикс `T`)
+- `T<created_s>|<group_id>|<part>/<total>|<attempt>|<chunk_text>`
+
+5) MT-ACK plaintext (внутри MT-WIRE type=ACK)
+UTF-8:
+- `ACK|mc=1|mc_modes=<csv>|hops=<n>`
+- `hops=<n>` опционально.
+
+6) MT-MC v1 (блок сжатия)
+Бинарная раскладка:
+  offset  size  field
+  0       2     magic "MC"
+  2       1     ver (=1)
+  3       1     mode
+  4       1     dict_id (=2)
+  5       1     flags
+  6       N     data
+  end-1   1     crc8 (по header+data)
+
+Mode IDs
+- 0: `mc_byte_dict`
+- 1: `mc_fixed_bits`
+- 2: `mc_deflate` (zlib raw, wbits=-15)
+- 3: `mc_zlib`
+- 4: `mc_bz2`
+- 5: `mc_lzma`
+- 6: `mc_nltk` (wire-level алиас deflate)
+- 7: `mc_spacy` (wire-level алиас zlib)
+- 8: `mc_tensorflow` (wire-level алиас lzma)

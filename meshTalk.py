@@ -366,6 +366,11 @@ class PeerState:
         self.compression_capable = False
         self.compression_modes = set(LEGACY_COMPRESSION_MODES)
         self.aad_type_bound = False
+        # Peer-advertised protocol versions (from KR1/KR2 frames).
+        # Defaults keep backwards compatibility with legacy clients that do not advertise these fields.
+        self.peer_wire_versions = {int(PROTO_VERSION)}
+        self.peer_msg_versions = {1}  # legacy "T..." framing
+        self.peer_mc_versions = {1}   # MC block VERSION
         self.pending: Dict[str, Dict[str, object]] = {}
         self.last_send_ts = 0.0
         self.next_key_req_ts = 0.0
@@ -401,7 +406,20 @@ def peer_request_id(args_user: Optional[str]) -> Optional[str]:
     return args_user
 
 
-def parse_key_frame(payload: bytes) -> Optional[Tuple[str, str, bytes, Optional[set[int]], Optional[set[str]]]]:
+def parse_key_frame(
+    payload: bytes,
+) -> Optional[
+    Tuple[
+        str,
+        str,
+        bytes,
+        Optional[set[int]],
+        Optional[set[str]],
+        Optional[set[int]],
+        Optional[set[int]],
+        Optional[set[int]],
+    ]
+]:
     parsed = parse_key_exchange_frame(
         payload=payload,
         key_req_prefix=KEY_REQ_PREFIX,
@@ -410,13 +428,16 @@ def parse_key_frame(payload: bytes) -> Optional[Tuple[str, str, bytes, Optional[
     )
     if parsed is None:
         return None
-    kind, peer_id, pub_raw, peer_modes, peer_caps = parsed
+    kind, peer_id, pub_raw, peer_modes, peer_caps, peer_wire, peer_msg, peer_mc = parsed
     return (
         kind,
         peer_id,
         pub_raw,
         set(peer_modes) if peer_modes else None,
         set(peer_caps) if peer_caps else None,
+        set(peer_wire) if peer_wire else None,
+        set(peer_msg) if peer_msg else None,
+        set(peer_mc) if peer_mc else None,
     )
 
 
@@ -776,7 +797,7 @@ def main() -> int:
         # Key exchange frames are plaintext
         key_frame = parse_key_frame(payload)
         if key_frame:
-            kind, peer_id, pub_raw, peer_modes, peer_caps = key_frame
+            kind, peer_id, pub_raw, peer_modes, peer_caps, peer_wire, peer_msg, peer_mc = key_frame
             from_id_raw = packet.get("fromId")
             to_id = packet.get("toId") or packet.get("to")
             accepted_frame, trusted_capabilities, reject_reason, is_broadcast, from_id = key_frame_receive_policy(
@@ -825,6 +846,23 @@ def main() -> int:
                     st.compression_capable = False
                     st.compression_modes = set(LEGACY_COMPRESSION_MODES)
                 st.aad_type_bound = bool(peer_caps and ("aad_type" in peer_caps))
+                if peer_wire:
+                    st.peer_wire_versions = set(peer_wire)
+                else:
+                    st.peer_wire_versions = {int(PROTO_VERSION)}
+                if peer_msg:
+                    st.peer_msg_versions = set(peer_msg)
+                else:
+                    st.peer_msg_versions = {1}
+                if peer_mc:
+                    st.peer_mc_versions = set(peer_mc)
+                else:
+                    st.peer_mc_versions = {1}
+                if peer_wire and int(PROTO_VERSION) not in st.peer_wire_versions:
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} WARN: peer {peer_id} advertises mt_wire={sorted(st.peer_wire_versions)}, local={int(PROTO_VERSION)}.",
+                    )
             if st and st.key_ready and kind == "resp":
                 st.last_key_ok_ts = time.time()
                 st.key_confirmed_ts = st.last_key_ok_ts
@@ -850,6 +888,9 @@ def main() -> int:
                     )
                 else:
                     modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+                    wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
+                    msg_bytes = b"1,2"
+                    mc_bytes = b"1"
                     resp = (
                         KEY_RESP_PREFIX
                         + self_id.encode("utf-8")
@@ -857,6 +898,12 @@ def main() -> int:
                         + b64e(pub_self_raw).encode("ascii")
                         + b"|mc_modes="
                         + modes_bytes
+                        + b"|mt_wire="
+                        + wire_bytes
+                        + b"|mt_msg="
+                        + msg_bytes
+                        + b"|mt_mc="
+                        + mc_bytes
                         + b"|mt_caps=aad_type"
                     )
                     if from_id:
@@ -1283,6 +1330,9 @@ def main() -> int:
             return
         dest_id = wire_id_from_norm(peer_norm)
         modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+        wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
+        msg_bytes = b"1,2"
+        mc_bytes = b"1"
         req = (
             KEY_REQ_PREFIX
             + self_id.encode("utf-8")
@@ -1290,6 +1340,12 @@ def main() -> int:
             + b64e(pub_self_raw).encode("ascii")
             + b"|mc_modes="
             + modes_bytes
+            + b"|mt_wire="
+            + wire_bytes
+            + b"|mt_msg="
+            + msg_bytes
+            + b"|mt_mc="
+            + mc_bytes
             + b"|mt_caps=aad_type"
         )
         try:
@@ -1317,6 +1373,9 @@ def main() -> int:
         if not radio_ready or interface is None:
             return
         modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+        wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
+        msg_bytes = b"1,2"
+        mc_bytes = b"1"
         req = (
             KEY_REQ_PREFIX
             + self_id.encode("utf-8")
@@ -1324,6 +1383,12 @@ def main() -> int:
             + b64e(pub_self_raw).encode("ascii")
             + b"|mc_modes="
             + modes_bytes
+            + b"|mt_wire="
+            + wire_bytes
+            + b"|mt_msg="
+            + msg_bytes
+            + b"|mt_mc="
+            + mc_bytes
             + b"|mt_caps=aad_type"
         )
         try:
@@ -1411,6 +1476,10 @@ def main() -> int:
         cmp_label = "none"
         cmp_eff_pct: Optional[float] = None
         peer_supports_mc = bool(st.compression_capable)
+        peer_supports_msg_v2 = bool(
+            (getattr(st, "peer_msg_versions", None) is None)
+            or (2 in set(getattr(st, "peer_msg_versions", {1})))
+        )
         peer_supported_modes = sorted(
             {int(m) for m in getattr(st, "compression_modes", set()) if int(m) in COMPRESSION_MODES}
         )
@@ -1428,7 +1497,7 @@ def main() -> int:
         ) <= max_plain
         chunks_bytes: list[bytes] = []
         chunks_text: list[str] = []
-        if peer_supports_mc and (not plain_fits_one_packet):
+        if peer_supports_mc and peer_supports_msg_v2 and (not plain_fits_one_packet):
             best_blob: Optional[bytes] = None
             best_mode: Optional[int] = None
             mode_order = list(peer_supported_modes)

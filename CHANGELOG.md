@@ -4,9 +4,15 @@
 
 ### Unreleased
 
-- No changes yet.
+Added
+- Wire protocol version advertisement in key-exchange frames (`mt_wire`, `mt_msg`, `mt_mc`) for forward/backward compatibility tracking.
+- Extended wire protocol specification in docs (with explicit versioning).
 
-### 0.3.2
+Changed
+- Changelog entries now include release dates in headings.
+- Documentation files include "Updated" dates.
+
+### 0.3.2 (2026-02-10)
 
 Added
 - Encrypted at-rest storage for profile data (`history.log`, `state.json`, `incoming.json`) using AES-GCM (per-profile key in `keyRings/storage.key`).
@@ -21,7 +27,7 @@ Changed
 Removed
 - Compression preference controls from Settings.
 
-### 0.3.1
+### 0.3.1 (2026-02-08)
 
 Added
 - Key-frame receive policy helper with dedicated tests for unicast/broadcast validation paths.
@@ -33,7 +39,7 @@ Changed
 - Public key is validated (`32` bytes, X25519 parse) before writing to keyring.
 - Documentation synchronized with implementation: compression modes `0..5`, `DICT_ID=2`, discovery send/reply toggles.
 
-### 0.3.0
+### 0.3.0 (2026-02-08)
 
 Added
 - Optional message-payload compression block (`MC`) with CRC8 validation.
@@ -55,7 +61,7 @@ Removed
 - Legacy status wording with `avg/ср`.
 - Old legal-policy wording from docs and settings UI (replaced by project vision text).
 
-### 0.2.2 alfa
+### 0.2.2 alfa (2026-02-06)
 
 Added
 - Exponential retry backoff with jitter.
@@ -73,7 +79,7 @@ Changed
 Removed
 - Duplicate history records from repeated reload paths.
 
-### 0.2.1 alfa
+### 0.2.1 alfa (2026-02-06)
 
 Added
 - GUI startup without radio with auto-reconnect and waiting state.
@@ -95,9 +101,15 @@ Removed
 
 ### Unreleased
 
-- Пока без изменений.
+Добавлено
+- Объявление версий wire-протокола в key‑exchange кадрах (`mt_wire`, `mt_msg`, `mt_mc`) для отслеживания совместимости.
+- Расширенная спецификация wire‑протокола в документации (с явным версионированием).
 
-### 0.3.2
+Изменено
+- В заголовках версий в changelog добавлены даты релизов.
+- В документации добавлены даты обновления ("Updated").
+
+### 0.3.2 (2026-02-10)
 
 Добавлено
 - Шифрование данных профиля на диске (`history.log`, `state.json`, `incoming.json`) через AES-GCM (ключ профиля: `keyRings/storage.key`).
@@ -112,7 +124,7 @@ Removed
 Удалено
 - Элементы настроек приоритета сжатия из окна Settings.
 
-### 0.3.1
+### 0.3.1 (2026-02-08)
 
 Добавлено
 - Вынесена отдельная политика приема key-frame с отдельными тестами для unicast/broadcast веток.
@@ -124,7 +136,7 @@ Removed
 - Публичный ключ валидируется (`32` байта, X25519 parse) до записи в keyring.
 - Документация синхронизирована с реализацией: режимы сжатия `0..5`, `DICT_ID=2`, раздельные галки discovery send/reply.
 
-### 0.3.0
+### 0.3.0 (2026-02-08)
 
 Добавлено
 - Опциональное сжатие payload сообщений блоком `MC` с проверкой CRC8.
@@ -146,7 +158,7 @@ Removed
 - Старые формулировки статусов с `avg/ср`.
 - Старые юридические формулировки из документации и окна настроек (заменены на текст о назначении проекта).
 
-### 0.2.2 alfa
+### 0.2.2 alfa (2026-02-06)
 
 Добавлено
 - Экспоненциальный retry backoff с jitter.
@@ -164,7 +176,7 @@ Removed
 Удалено
 - Дубли записей истории при повторной загрузке.
 
-### 0.2.1 alfa
+### 0.2.1 alfa (2026-02-06)
 
 Добавлено
 - Запуск GUI без радио с авто‑переподключением и состоянием ожидания.
