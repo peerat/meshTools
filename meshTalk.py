@@ -62,6 +62,8 @@ from meshtalk.protocol import (
     pub_fingerprint,
     try_unpack_message,
 )
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from meshtalk.storage import (
     Storage,
     decode_history_meta_token,
@@ -99,6 +101,15 @@ RETRY_BACKOFF_MAX_SECONDS = 300.0
 RETRY_JITTER_RATIO = 0.25
 KEY_RESPONSE_MIN_INTERVAL_SECONDS = 300.0
 KEY_RESPONSE_RETRY_INTERVAL_SECONDS = 5.0
+REKEY_CTRL_PREFIX1 = b"RK1"
+REKEY_CTRL_PREFIX2 = b"RK2"
+REKEY_CTRL_PREFIX3 = b"RK3"
+# Enabled by default: low-noise, infrequent rekey only when peers are active and confirmed.
+REKEY_MAX_ATTEMPTS = 3
+REKEY_RETRY_BASE_SECONDS = 30.0
+REKEY_PREV_KEY_GRACE_SECONDS = 300.0
+REKEY_MIN_INTERVAL_SECONDS = 6 * 3600.0
+REKEY_MIN_MESSAGES = 50
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_BASE_DIR = "meshTalk"
 DATA_DIR = BASE_DIR
@@ -416,6 +427,21 @@ class PeerState:
     def __init__(self, peer_id_norm: str, aes: Optional[AESGCM] = None) -> None:
         self.peer_id_norm = peer_id_norm
         self.aes = aes
+        # Rekey (session) state: encrypted control messages upgrade `aes` without changing pinned peer pubkey.
+        self.rekey_inflight = False
+        self.rekey_id = b""
+        self.rekey_priv: Optional[x25519.X25519PrivateKey] = None
+        self.rekey_started_ts = 0.0
+        self.rekey_next_retry_ts = 0.0
+        self.rekey_attempts = 0
+        self.rekey_candidate_id = b""
+        self.rekey_candidate_aes: Optional[AESGCM] = None
+        self.rekey_candidate_pub = b""
+        self.rekey_candidate_ts = 0.0
+        self.prev_aes: Optional[AESGCM] = None
+        self.prev_aes_until_ts = 0.0
+        self.last_rekey_ts = 0.0
+        self.rekey_sent_msgs = 0
         self.last_seen_ts = 0.0
         # Set only after confirmed two-way key exchange (peer has our pub and we have peer pub).
         self.key_confirmed_ts = 0.0
@@ -738,6 +764,17 @@ def main() -> int:
             "log",
             f"{ts_local()} CRYPTO: mt_key=KR1/KR2 plaintext pub=X25519(32b,b64) kdf=HKDF-SHA256 aead=MT-WIREv1 AES-256-GCM storage=AES-256-GCM(keyRings/storage.key)",
         )
+        try:
+            max_payload = int(getattr(args, "max_bytes", 200) or 200)
+        except Exception:
+            max_payload = 200
+        wire_overhead = int(PAYLOAD_OVERHEAD)
+        max_plain = max(0, max_payload - wire_overhead)
+        max_m2_chunk = max(1, max_plain - int(MSG_V2_HEADER_LEN))
+        ui_emit(
+            "log",
+            f"{ts_local()} LIMITS: max_bytes={max_payload} wire_overhead={wire_overhead} max_plain={max_plain} m2_header={int(MSG_V2_HEADER_LEN)} max_m2_chunk={max_m2_chunk}",
+        )
         priv_path = os.path.join(keydir, f"{self_id}.key")
         pub_path = os.path.join(keydir, f"{self_id}.pub")
         # Ensure key files exist (auto-generate if missing)
@@ -811,6 +848,8 @@ def main() -> int:
     last_key_sent_ts = 0.0
     # Security policy (TOFU key rotation). Must be visible to on_receive().
     security_policy = "auto"  # auto|strict|always
+    # Session rekey (ephemeral X25519) to reduce impact of long-term key compromise.
+    session_rekey_enabled = True
 
     def ui_emit(evt: str, payload: object) -> None:
         if gui_enabled:
@@ -962,6 +1001,99 @@ def main() -> int:
         if key_conf <= 0.0:
             return True, "policy=auto reason=unconfirmed_old_key"
         return False, "policy=auto reason=confirmed_old_key action=reset_key_required"
+
+    def _rekey_derive_aes(peer_norm: str, eph_shared: bytes) -> Optional[AESGCM]:
+        """Derive a new session AES key from (static X25519 shared || ephemeral X25519 shared)."""
+        try:
+            if not re.fullmatch(r"[0-9a-fA-F]{8}", peer_norm or ""):
+                return None
+            peer_pub = known_peers.get(peer_norm)
+            if peer_pub is None or priv is None:
+                return None
+            base_shared = priv.exchange(peer_pub)
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b"meshTalk rekey v1",
+                info=b"meshTalk rekey v1",
+            )
+            key = hkdf.derive(bytes(base_shared) + bytes(eph_shared))
+            return AESGCM(key)
+        except Exception:
+            return None
+
+    def _rekey_should_start(st: PeerState, now: float) -> bool:
+        if not st or not st.key_ready:
+            return False
+        if not bool(getattr(st, "key_confirmed_ts", 0.0) or 0.0):
+            return False
+        if bool(getattr(st, "pinned_mismatch", False)):
+            return False
+        if bool(getattr(st, "rekey_inflight", False)):
+            return False
+        if (now - float(getattr(st, "last_rekey_ts", 0.0) or 0.0)) < float(REKEY_MIN_INTERVAL_SECONDS):
+            return False
+        if int(getattr(st, "rekey_sent_msgs", 0) or 0) < int(REKEY_MIN_MESSAGES):
+            return False
+        return True
+
+    def _send_control(peer_norm: str, pt: bytes, aes: AESGCM, label: str) -> bool:
+        """Send encrypted control message (not stored in history)."""
+        nonlocal last_activity_ts
+        if not radio_ready or interface is None:
+            return False
+        if not peer_norm or peer_norm.startswith("group:"):
+            return False
+        if not re.fullmatch(r"[0-9a-fA-F]{8}", peer_norm):
+            return False
+        try:
+            msg_id = os.urandom(8)
+            payload, _cmp = pack_message(
+                TYPE_MSG,
+                msg_id,
+                aes,
+                pt,
+                allow_payload_compress=False,
+                bind_aad_type=True,
+            )
+            if len(payload) > int(getattr(args, "max_bytes", 200) or 200):
+                return False
+            interface.sendData(
+                payload,
+                destinationId=wire_id_from_norm(peer_norm),
+                wantAck=False,
+                portNum=DEFAULT_PORTNUM,
+                channelIndex=(args.channel if args.channel is not None else 0),
+            )
+            last_activity_ts = time.time()
+            ui_emit("log", f"{ts_local()} KEY: rekey {label} -> {peer_norm} wire=MT-WIREv1 aes-256-gcm")
+            return True
+        except Exception:
+            return False
+
+    def _rekey_send_rk1(peer_norm: str, st: PeerState, now: float) -> None:
+        try:
+            if not st.aes:
+                return
+            st.rekey_inflight = True
+            st.rekey_started_ts = now
+            st.rekey_attempts = int(getattr(st, "rekey_attempts", 0) or 0) + 1
+            if not st.rekey_id or len(st.rekey_id) != 4:
+                st.rekey_id = os.urandom(4)
+            if st.rekey_priv is None:
+                st.rekey_priv = x25519.X25519PrivateKey.generate()
+            epub = st.rekey_priv.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            pt = REKEY_CTRL_PREFIX1 + st.rekey_id + epub
+            ok = _send_control(peer_norm, pt, st.aes, f"rk1 attempt={st.rekey_attempts}")
+            st.rekey_next_retry_ts = now + retry_delay_seconds(float(REKEY_RETRY_BASE_SECONDS), st.rekey_attempts)
+            if not ok:
+                # Don't spin.
+                st.rekey_inflight = False
+        except Exception:
+            st.rekey_inflight = False
 
     def on_receive(packet, interface=None):
         nonlocal last_activity_ts
@@ -1230,9 +1362,36 @@ def main() -> int:
                         ui_emit("peer_update", peer_norm)
             return
 
+        # Rekey can temporarily accept multiple keys to avoid network churn during switch.
+        aes_used = st.aes
         status, msg_type, msg_id, pt, rx_compression = try_unpack_message(
             payload, st.aes, bind_aad_type=bool(getattr(st, "aad_type_bound", False))
         )
+        if status == "decrypt_fail":
+            now_try = time.time()
+            alt_keys: list[AESGCM] = []
+            try:
+                if st.rekey_candidate_aes is not None:
+                    alt_keys.append(st.rekey_candidate_aes)
+            except Exception:
+                pass
+            try:
+                if st.prev_aes is not None and now_try <= float(getattr(st, "prev_aes_until_ts", 0.0) or 0.0):
+                    alt_keys.append(st.prev_aes)
+            except Exception:
+                pass
+            for alt in alt_keys:
+                if alt is None:
+                    continue
+                if alt is st.aes:
+                    continue
+                status2, msg_type2, msg_id2, pt2, rx_cmp2 = try_unpack_message(
+                    payload, alt, bind_aad_type=bool(getattr(st, "aad_type_bound", False))
+                )
+                if status2 == "ok" and msg_type2 is not None and msg_id2 is not None:
+                    status, msg_type, msg_id, pt, rx_compression = status2, msg_type2, msg_id2, pt2, rx_cmp2
+                    aes_used = alt
+                    break
         if status == "decrypt_fail":
             now = time.time()
             if (st.last_decrypt_fail_ts <= 0.0) or ((now - st.last_decrypt_fail_ts) > 30.0):
@@ -1266,6 +1425,25 @@ def main() -> int:
             return
         if status != "ok" or msg_type is None or msg_id is None:
             return
+        # If peer already started using the candidate session key, switch implicitly to avoid churn.
+        try:
+            if (
+                st.rekey_candidate_aes is not None
+                and aes_used is st.rekey_candidate_aes
+                and st.aes is not aes_used
+            ):
+                st.prev_aes = st.aes
+                st.prev_aes_until_ts = time.time() + float(REKEY_PREV_KEY_GRACE_SECONDS)
+                st.aes = aes_used
+                st.last_rekey_ts = time.time()
+                st.rekey_sent_msgs = 0
+                st.rekey_candidate_aes = None
+                st.rekey_candidate_id = b""
+                st.rekey_candidate_pub = b""
+                st.rekey_candidate_ts = 0.0
+                ui_emit("log", f"{ts_local()} KEY: rekey switched (implicit) peer={peer_norm}")
+        except Exception:
+            pass
         msg_hex = msg_id.hex()
         st.decrypt_fail_count = 0
         if st.await_key_confirm:
@@ -1371,7 +1549,7 @@ def main() -> int:
                         ack_payload, _ack_cmp = pack_message(
                             TYPE_ACK,
                             msg_id,
-                            st.aes,
+                            aes_used,
                             build_ack_text(hops),
                             bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
                         )
@@ -1388,6 +1566,135 @@ def main() -> int:
                             return
                     return
                 seen_msgs[msg_key] = now
+
+            # Rekey control messages (binary, internal).
+            try:
+                raw_pt = bytes(pt) if isinstance(pt, (bytes, bytearray)) else b""
+            except Exception:
+                raw_pt = b""
+            if raw_pt.startswith(REKEY_CTRL_PREFIX1) and len(raw_pt) == (3 + 4 + 32) and peer_norm and from_id:
+                rid = raw_pt[3:7]
+                peer_epub_raw = raw_pt[7:39]
+                # If we already computed a candidate for this rid, just re-send RK2 (idempotent).
+                if st.rekey_candidate_id == rid and st.rekey_candidate_pub and st.rekey_candidate_aes is not None:
+                    _send_control(peer_norm, REKEY_CTRL_PREFIX2 + rid + st.rekey_candidate_pub, aes_used, "rk2 resend")
+                else:
+                    try:
+                        peer_epub = x25519.X25519PublicKey.from_public_bytes(peer_epub_raw)
+                        rpriv = x25519.X25519PrivateKey.generate()
+                        repub_raw = rpriv.public_key().public_bytes(
+                            encoding=serialization.Encoding.Raw,
+                            format=serialization.PublicFormat.Raw,
+                        )
+                        eph_shared = rpriv.exchange(peer_epub)
+                        new_aes = _rekey_derive_aes(peer_norm, eph_shared)
+                        if new_aes is not None:
+                            st.rekey_candidate_id = rid
+                            st.rekey_candidate_pub = repub_raw
+                            st.rekey_candidate_aes = new_aes
+                            st.rekey_candidate_ts = time.time()
+                            _send_control(peer_norm, REKEY_CTRL_PREFIX2 + rid + repub_raw, aes_used, "rk2")
+                            ui_emit("log", f"{ts_local()} KEY: rekey candidate ready peer={peer_norm} id={rid.hex()}")
+                    except Exception:
+                        pass
+                # ACK with the key that decrypted RK1.
+                try:
+                    ack_payload, _ack_cmp = pack_message(
+                        TYPE_ACK,
+                        msg_id,
+                        aes_used,
+                        build_ack_text(None),
+                        bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
+                    )
+                    interface.sendData(
+                        ack_payload,
+                        destinationId=from_id,
+                        wantAck=False,
+                        portNum=DEFAULT_PORTNUM,
+                        channelIndex=(args.channel if args.channel is not None else 0),
+                    )
+                except Exception:
+                    ui_emit("radio_lost", None)
+                return
+
+            if raw_pt.startswith(REKEY_CTRL_PREFIX2) and len(raw_pt) == (3 + 4 + 32) and peer_norm and from_id:
+                rid = raw_pt[3:7]
+                peer_repub_raw = raw_pt[7:39]
+                if bool(getattr(st, "rekey_inflight", False)) and st.rekey_id == rid and st.rekey_priv is not None:
+                    try:
+                        peer_repub = x25519.X25519PublicKey.from_public_bytes(peer_repub_raw)
+                        eph_shared = st.rekey_priv.exchange(peer_repub)
+                        new_aes = _rekey_derive_aes(peer_norm, eph_shared)
+                        if new_aes is not None:
+                            # Send RK3 under the new key to confirm and then switch locally.
+                            _send_control(peer_norm, REKEY_CTRL_PREFIX3 + rid, new_aes, "rk3")
+                            st.prev_aes = st.aes
+                            st.prev_aes_until_ts = time.time() + float(REKEY_PREV_KEY_GRACE_SECONDS)
+                            st.aes = new_aes
+                            st.last_rekey_ts = time.time()
+                            st.rekey_sent_msgs = 0
+                            st.rekey_inflight = False
+                            st.rekey_priv = None
+                            st.rekey_id = b""
+                            st.rekey_attempts = 0
+                            st.rekey_next_retry_ts = 0.0
+                            ui_emit("log", f"{ts_local()} KEY: rekey switched (initiator) peer={peer_norm} id={rid.hex()}")
+                    except Exception:
+                        pass
+                # ACK RK2 with the key that decrypted it (old).
+                try:
+                    ack_payload, _ack_cmp = pack_message(
+                        TYPE_ACK,
+                        msg_id,
+                        aes_used,
+                        build_ack_text(None),
+                        bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
+                    )
+                    interface.sendData(
+                        ack_payload,
+                        destinationId=from_id,
+                        wantAck=False,
+                        portNum=DEFAULT_PORTNUM,
+                        channelIndex=(args.channel if args.channel is not None else 0),
+                    )
+                except Exception:
+                    ui_emit("radio_lost", None)
+                return
+
+            if raw_pt.startswith(REKEY_CTRL_PREFIX3) and len(raw_pt) == (3 + 4) and peer_norm and from_id:
+                rid = raw_pt[3:7]
+                # Switch to candidate key if it matches.
+                if st.rekey_candidate_aes is not None and st.rekey_candidate_id == rid:
+                    st.prev_aes = st.aes
+                    st.prev_aes_until_ts = time.time() + float(REKEY_PREV_KEY_GRACE_SECONDS)
+                    st.aes = st.rekey_candidate_aes
+                    st.last_rekey_ts = time.time()
+                    st.rekey_sent_msgs = 0
+                    st.rekey_candidate_aes = None
+                    st.rekey_candidate_id = b""
+                    st.rekey_candidate_pub = b""
+                    st.rekey_candidate_ts = 0.0
+                    ui_emit("log", f"{ts_local()} KEY: rekey switched (responder) peer={peer_norm} id={rid.hex()}")
+                # ACK RK3 with the key that decrypted it (new).
+                try:
+                    ack_payload, _ack_cmp = pack_message(
+                        TYPE_ACK,
+                        msg_id,
+                        aes_used,
+                        build_ack_text(None),
+                        bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
+                    )
+                    interface.sendData(
+                        ack_payload,
+                        destinationId=from_id,
+                        wantAck=False,
+                        portNum=DEFAULT_PORTNUM,
+                        channelIndex=(args.channel if args.channel is not None else 0),
+                    )
+                except Exception:
+                    ui_emit("radio_lost", None)
+                return
+
             delivery = None
             group_id = None
             part = 1
@@ -1476,7 +1783,7 @@ def main() -> int:
                             ack_payload, _ack_cmp = pack_message(
                                 TYPE_ACK,
                                 msg_id,
-                                st.aes,
+                                aes_used,
                                 build_ack_text(hops),
                                 bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
                             )
@@ -1545,7 +1852,7 @@ def main() -> int:
                 ack_payload, _ack_cmp = pack_message(
                     TYPE_ACK,
                     msg_id,
-                    st.aes,
+                    aes_used,
                     build_ack_text(hops),
                     bind_aad_type=bool(getattr(st, "aad_type_bound", False)),
                 )
@@ -2090,6 +2397,10 @@ def main() -> int:
                 except Exception:
                     ui_emit("radio_lost", None)
                     return
+                try:
+                    st.rekey_sent_msgs = int(getattr(st, "rekey_sent_msgs", 0) or 0) + 1
+                except Exception:
+                    pass
                 rec["attempts"] = attempts_next
                 rec["last_send"] = now
                 rec["next_retry_at"] = now + retry_delay_seconds(float(args.retry_seconds), attempts_next)
@@ -2126,6 +2437,7 @@ def main() -> int:
         last_key_refresh_ts = 0.0
         last_health_ts = 0.0
         last_names_refresh_ts = 0.0
+        last_rekey_tick_ts = 0.0
         while True:
             send_due()
             now = time.time()
@@ -2150,6 +2462,46 @@ def main() -> int:
                         st.next_key_refresh_ts = now + 3600.0 + random.uniform(0, 600)
                     if now >= st.next_key_refresh_ts:
                         send_key_request(peer_norm, require_confirm=False, reason="refresh_timer")
+                # Session rekey: low-noise, only for active peers with confirmed keys.
+                if bool(session_rekey_enabled) and (now - last_rekey_tick_ts) >= 5.0:
+                    last_rekey_tick_ts = now
+                    for peer_norm in peers:
+                        if not peer_norm or peer_norm == self_id or peer_norm.startswith("group:"):
+                            continue
+                        st = get_peer_state(peer_norm)
+                        if not st or not st.key_ready:
+                            continue
+                        # Expire candidate if it was never confirmed and no peer traffic used it.
+                        if (
+                            st.rekey_candidate_aes is not None
+                            and st.rekey_candidate_ts > 0.0
+                            and (now - st.rekey_candidate_ts) > 600.0
+                        ):
+                            st.rekey_candidate_aes = None
+                            st.rekey_candidate_id = b""
+                            st.rekey_candidate_pub = b""
+                            st.rekey_candidate_ts = 0.0
+                        if bool(getattr(st, "rekey_inflight", False)):
+                            # Retry RK1 if no RK2 arrived yet.
+                            if st.rekey_attempts >= int(REKEY_MAX_ATTEMPTS) or (now - float(st.rekey_started_ts or 0.0)) > 600.0:
+                                st.rekey_inflight = False
+                                st.rekey_id = b""
+                                st.rekey_priv = None
+                                st.rekey_attempts = 0
+                                st.rekey_next_retry_ts = 0.0
+                                ui_emit("log", f"{ts_local()} KEY: rekey aborted peer={peer_norm}")
+                                continue
+                            if now >= float(st.rekey_next_retry_ts or 0.0):
+                                _rekey_send_rk1(peer_norm, st, now)
+                            continue
+                        if not _rekey_should_start(st, now):
+                            continue
+                        # Only when there is active outbound traffic for this peer.
+                        with pending_lock:
+                            has_pending = bool(pending_by_peer.get(peer_norm))
+                        if not has_pending:
+                            continue
+                        _rekey_send_rk1(peer_norm, st, now)
                 if discovery_send and radio_ready:
                     start_ts = discovery_state["start_ts"]
                     next_discovery_ts = discovery_state["next_ts"]
@@ -2246,7 +2598,7 @@ def main() -> int:
         except Exception:
             return -1
 
-        nonlocal security_policy
+        nonlocal security_policy, session_rekey_enabled
         app = QtWidgets.QApplication(sys.argv)
         win = QtWidgets.QWidget()
         win.setWindowTitle(f"meshTalk v{VERSION}")
@@ -2321,6 +2673,8 @@ def main() -> int:
                 "security_policy_strict": "STRICT",
                 "security_policy_always": "ALWAYS ACCEPT",
                 "security_policy_hint": "Controls what happens when a peer key changes (TOFU).",
+                "session_rekey": "Session rekey (ephemeral)",
+                "session_rekey_hint": "When enabled, periodically refreshes the session key using ephemeral X25519 inside the encrypted channel. This reduces impact of long-term key compromise, but increases control traffic slightly.",
                 "security_auto_stale_hours": "Auto accept if key age, h",
                 "security_auto_seen_minutes": "Auto accept if seen within, min",
                 "security_auto_mode": "Auto rule",
@@ -2414,6 +2768,8 @@ def main() -> int:
                 "security_policy_strict": "STRICT",
                 "security_policy_always": "ALWAYS ACCEPT",
                 "security_policy_hint": "Определяет поведение при смене публичного ключа пира (TOFU).",
+                "session_rekey": "Rekey сессии (ephemeral)",
+                "session_rekey_hint": "Если включено, периодически обновляет ключ сессии через ephemeral X25519 внутри зашифрованного канала. Это снижает эффект компрометации долгоживущего ключа, но чуть увеличивает служебный трафик.",
                 "security_auto_stale_hours": "Автопринять если ключ старше, ч",
                 "security_auto_seen_minutes": "Автопринять если был в сети, мин",
                 "security_auto_mode": "Правило AUTO",
@@ -2454,6 +2810,7 @@ def main() -> int:
         verbose_log = bool(cfg.get("log_verbose", True))
         runtime_log_file = bool(cfg.get("runtime_log_file", True))
         auto_pacing = bool(cfg.get("auto_pacing", True))
+        session_rekey_enabled = bool(cfg.get("session_rekey", session_rekey_enabled))
         security_policy = str(cfg.get("security_key_rotation_policy", security_policy) or "auto").strip().lower()
         if security_policy not in ("auto", "strict", "always"):
             security_policy = "auto"
@@ -2803,6 +3160,7 @@ def main() -> int:
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
             nonlocal security_policy
+            nonlocal session_rekey_enabled
             nonlocal errors_need_ack
             errors_need_ack = False
             update_status()
@@ -2948,12 +3306,20 @@ def main() -> int:
                 pass
             compact_field(sec_policy, width=240)
             sec_layout.addRow(tr("security_policy"), sec_policy)
+            cb_rekey = QtWidgets.QCheckBox(tr("session_rekey"))
+            cb_rekey.setChecked(bool(session_rekey_enabled))
+            cb_rekey.setToolTip(tr("session_rekey_hint"))
+            sec_layout.addRow("", cb_rekey)
 
             right_panel.addWidget(sec_group)
             sec_hint = QtWidgets.QLabel(tr("security_auto_hint"))
             sec_hint.setObjectName("hint")
             sec_hint.setWordWrap(True)
             right_panel.addWidget(sec_hint)
+            rekey_hint = QtWidgets.QLabel(tr("session_rekey_hint"))
+            rekey_hint.setObjectName("hint")
+            rekey_hint.setWordWrap(True)
+            right_panel.addWidget(rekey_hint)
 
             top_row.addLayout(left_panel, 1)
             top_row.addLayout(right_panel, 1)
@@ -3016,6 +3382,7 @@ def main() -> int:
 
             def apply_settings(close_dialog: bool) -> None:
                 nonlocal verbose_log, runtime_log_file, auto_pacing, discovery_send, discovery_reply, clear_pending_on_switch
+                nonlocal security_policy, session_rekey_enabled
                 verbose_log = cb_verbose.isChecked()
                 runtime_log_file = cb_runtime_log.isChecked()
                 auto_pacing = cb_auto_pacing.isChecked()
@@ -3041,6 +3408,8 @@ def main() -> int:
                 if security_policy not in ("auto", "strict", "always"):
                     security_policy = "auto"
                 cfg["security_key_rotation_policy"] = security_policy
+                session_rekey_enabled = bool(cb_rekey.isChecked())
+                cfg["session_rekey"] = bool(session_rekey_enabled)
                 try:
                     args.auto_pacing = bool(auto_pacing)
                 except Exception:
@@ -5179,6 +5548,7 @@ def main() -> int:
             nonlocal init_step, last_init_label_ts, initializing
             nonlocal current_lang, verbose_log, runtime_log_file, auto_pacing, last_pacing_save_ts, pinned_dialogs, hidden_contacts, groups
             nonlocal security_policy
+            nonlocal session_rekey_enabled
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
             nonlocal incoming_state
@@ -5219,6 +5589,7 @@ def main() -> int:
                         args.auto_pacing = bool(auto_pacing)
                     except Exception:
                         pass
+                    session_rekey_enabled = bool(cfg.get("session_rekey", session_rekey_enabled))
                     security_policy = str(cfg.get("security_key_rotation_policy", security_policy) or "auto").strip().lower()
                     if security_policy not in ("auto", "strict", "always"):
                         security_policy = "auto"

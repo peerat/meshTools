@@ -18,6 +18,7 @@ Added
 - Settings: `parallel_sends` (packets per `rate_seconds` window) to allow short send bursts without waiting for ACK between packets.
 - Settings: `auto_pacing` (adaptive) to auto-tune `rate_seconds`/`parallel_sends` from recent ACK stats.
 - Settings: key rotation policy (`security_key_rotation_policy`) with AUTO/STRICT/ALWAYS and explicit TOFU key-mismatch handling.
+- Session rekey (ephemeral X25519) inside the encrypted channel (`session_rekey`, enabled by default) to refresh per-peer session keys with low additional control traffic.
 - Contact context action: traceroute (Meshtastic `TRACEROUTE_APP`) and post output into dialog.
 
 Changed
@@ -131,6 +132,7 @@ Removed
 - Настройки: `parallel_sends` (сколько пакетов можно отправить подряд в одном окне `rate_seconds`) для быстрых отправок без ожидания ACK между пакетами.
 - Настройки: `auto_pacing` (адаптивно) автоподбирает `rate_seconds`/`parallel_sends` по статистике ACK.
 - Настройки: политика смены ключа (`security_key_rotation_policy`) с AUTO/STRICT/ALWAYS и явной обработкой TOFU key-mismatch.
+- Rekey сессии (ephemeral X25519) внутри зашифрованного канала (`session_rekey`, по умолчанию включено) для периодического обновления session key с небольшим служебным трафиком.
 - Действие в контекстном меню контакта: traceroute (Meshtastic `TRACEROUTE_APP`) и вывод результата в диалог.
 
 Изменено
