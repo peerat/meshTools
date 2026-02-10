@@ -3190,7 +3190,9 @@ def main() -> int:
             update_status()
             dlg = QtWidgets.QDialog(win)
             dlg.setWindowTitle(tr("settings_title"))
-            dlg.resize(700, 560)
+            dlg.resize(820, 600)
+            # Prevent too small window size that would clip numeric fields.
+            dlg.setMinimumSize(760, 560)
             layout = QtWidgets.QVBoxLayout(dlg)
             top_row = QtWidgets.QHBoxLayout()
             top_row.setContentsMargins(0, 0, 0, 0)
@@ -3210,12 +3212,13 @@ def main() -> int:
             runtime_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
             runtime_layout.setFormAlignment(QtCore.Qt.AlignTop)
             runtime_layout.setVerticalSpacing(8)
-            runtime_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+            runtime_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
 
             def compact_field(widget, width: int = 240):
-                widget.setMinimumWidth(150)
-                widget.setMaximumWidth(width)
-                widget.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+                widget.setMinimumWidth(180)
+                # Let fields grow with dialog width; clipping is worse than extra whitespace.
+                widget.setMaximumWidth(16777215)
+                widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
                 return widget
 
             def int_text(value, fallback: int) -> str:
@@ -3377,7 +3380,9 @@ def main() -> int:
             except Exception:
                 pass
             compact_field(sec_policy, width=240)
-            sec_layout.addRow(tr("security_policy"), sec_policy)
+            sec_policy_label = QtWidgets.QLabel(tr("security_policy"))
+            sec_policy_label.setWordWrap(True)
+            sec_layout.addRow(sec_policy_label, sec_policy)
             sec_policy_hint = QtWidgets.QLabel(tr("security_auto_hint"))
             sec_policy_hint.setObjectName("hint")
             sec_policy_hint.setWordWrap(True)
@@ -3393,7 +3398,8 @@ def main() -> int:
 
             right_panel.addWidget(sec_group)
 
-            top_row.addLayout(left_panel, 1)
+            # Give runtime params more space than toggles on small widths.
+            top_row.addLayout(left_panel, 2)
             top_row.addLayout(right_panel, 1)
             layout.addLayout(top_row)
             log_view = QtWidgets.QTextEdit()
@@ -3424,6 +3430,7 @@ def main() -> int:
                 f"{tr('about_author_position')}\n"
                 f"{tr('about_disclaimer')}"
             )
+            set_mono(author_label, 9)
             author_label.setObjectName("muted")
             layout.addWidget(author_label)
             danger_row = QtWidgets.QHBoxLayout()
