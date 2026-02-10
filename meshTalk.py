@@ -71,6 +71,7 @@ from meshtalk.storage import (
     maybe_set_private_umask,
     parse_history_record_line,
 )
+from meshtalk.pacing import AdaptivePacer
 from message_text_compression import (
     MODE_BZ2,
     MODE_DEFLATE,
@@ -510,10 +511,21 @@ def main() -> int:
         default=1,
         help="packets per rate window (default: 1). RU: сколько пакетов можно отправить подряд в одном окне rate (по умолчанию: 1).",
     )
+    ap.add_argument(
+        "--auto-pacing",
+        action="store_true",
+        help="auto tune rate/parallel for better throughput (default: off). RU: автоподбор rate/параллельности (по умолчанию: выкл).",
+    )
 
 
     args = ap.parse_args()
     initial_port_arg = args.port
+
+    pacer = AdaptivePacer(
+        rate_seconds=int(getattr(args, "rate_seconds", 30) or 30),
+        parallel_sends=int(getattr(args, "parallel_sends", 1) or 1),
+        enabled=bool(getattr(args, "auto_pacing", False)),
+    )
 
     if args.help:
         ap.print_help()
@@ -1051,6 +1063,10 @@ def main() -> int:
                     "log",
                     f"{ts_local()} ACK: {msg_hex} rtt={rtt:.2f}s avg={st.rtt_avg:.2f}s attempts={attempts}",
                 )
+                try:
+                    pacer.observe_ack(rtt_s=rtt, attempts=int(attempts or 1), now=now)
+                except Exception:
+                    pass
                 if peer_norm:
                     hop_start = packet.get("hopStart")
                     hop_limit = packet.get("hopLimit")
@@ -1675,6 +1691,10 @@ def main() -> int:
                         save_state(pending_by_peer)
                     print(f"DROP: {rec['id']} timeout")
                     append_history("drop", peer_norm, rec["id"], str(rec.get("text", "")), "timeout")
+                    try:
+                        pacer.observe_drop("timeout", now=now)
+                    except Exception:
+                        pass
                     ui_emit("log", f"{ts_local()} DROP: {rec['id']} timeout for {peer_norm}")
                     ui_emit("failed", (peer_norm, str(rec.get("group") or rec.get("id") or rec["id"]), "timeout", int(rec.get("attempts", 0)), int(rec.get("total", 1) or 1)))
                     continue
@@ -1842,6 +1862,28 @@ def main() -> int:
                         elif not idle and now >= next_discovery_ts:
                             ui_emit("log", f"{ts_local()} DISCOVERY: silent (activity)")
                             discovery_state["next_ts"] = now + random.uniform(1800, 3600)
+                try:
+                    pacing_enabled = bool(getattr(args, "auto_pacing", False))
+                    pacer.set_enabled(pacing_enabled)
+                    pacer.set_current(
+                        rate_seconds=int(getattr(args, "rate_seconds", 30) or 30),
+                        parallel_sends=int(getattr(args, "parallel_sends", 1) or 1),
+                    )
+                    if pacing_enabled and radio_ready:
+                        with pending_lock:
+                            pending_count = sum(len(v) for v in pending_by_peer.values())
+                        suggested = pacer.suggest(pending_count=pending_count, now=now)
+                        if suggested is not None:
+                            new_rate, new_parallel, reason = suggested
+                            args.rate_seconds = int(new_rate)
+                            args.parallel_sends = int(new_parallel)
+                            ui_emit("pacing_update", (int(new_rate), int(new_parallel)))
+                            ui_emit(
+                                "log",
+                                f"{ts_local()} PACE: rate={int(new_rate)}s parallel={int(new_parallel)} ({reason})",
+                            )
+                except Exception:
+                    pass
             if radio_ready and (now - last_health_ts) >= 300.0:
                 last_health_ts = now
                 with pending_lock:
@@ -1961,6 +2003,7 @@ def main() -> int:
                 "max_bytes": "Max bytes",
                 "rate": "Rate seconds",
                 "parallel_sends": "Parallel packets",
+                "auto_pacing": "Auto pacing",
                 "discovery": "Discovery",
                 "discovery_send": "Send broadcast discovery",
                 "discovery_reply": "Reply to broadcast discovery",
@@ -2028,6 +2071,7 @@ def main() -> int:
                 "max_bytes": "Макс байт",
                 "rate": "Мин интервал, сек",
                 "parallel_sends": "Параллельно, пакетов",
+                "auto_pacing": "Автоподбор скорости",
                 "discovery": "Обнаружение",
                 "discovery_send": "Отправлять broadcast discovery",
                 "discovery_reply": "Отвечать на broadcast discovery",
@@ -2053,6 +2097,8 @@ def main() -> int:
         current_lang = str(cfg.get("lang", "ru")).lower()
         verbose_log = bool(cfg.get("log_verbose", True))
         runtime_log_file = bool(cfg.get("runtime_log_file", True))
+        auto_pacing = bool(cfg.get("auto_pacing", False))
+        last_pacing_save_ts = 0.0
         pinned_dialogs = set(cfg.get("pinned_dialogs", []))
         hidden_contacts = set(cfg.get("hidden_contacts", []))
         groups_cfg = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
@@ -2307,6 +2353,7 @@ def main() -> int:
                     "lang": current_lang,
                     "log_verbose": verbose_log,
                     "runtime_log_file": runtime_log_file,
+                    "auto_pacing": auto_pacing,
                     "pinned_dialogs": sorted(pinned_dialogs),
                     "hidden_contacts": sorted(hidden_contacts),
                     "groups": {k: sorted(list(v)) for k, v in groups.items()},
@@ -2363,6 +2410,7 @@ def main() -> int:
             nonlocal current_lang
             nonlocal verbose_log
             nonlocal runtime_log_file
+            nonlocal auto_pacing
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
             nonlocal errors_need_ack
@@ -2434,6 +2482,17 @@ def main() -> int:
             runtime_layout.addRow(tr("max_bytes"), maxbytes_edit)
             runtime_layout.addRow(tr("rate"), rate_edit)
             runtime_layout.addRow(tr("parallel_sends"), parallel_edit)
+            cb_auto_pacing = QtWidgets.QCheckBox("")
+            cb_auto_pacing.setChecked(bool(cfg.get("auto_pacing", auto_pacing)))
+            runtime_layout.addRow(tr("auto_pacing"), cb_auto_pacing)
+
+            def sync_auto_pacing_fields() -> None:
+                on = cb_auto_pacing.isChecked()
+                rate_edit.setEnabled(not on)
+                parallel_edit.setEnabled(not on)
+
+            sync_auto_pacing_fields()
+            cb_auto_pacing.toggled.connect(lambda _checked: sync_auto_pacing_fields())
             left_panel.addWidget(runtime_group)
             restart_label = QtWidgets.QLabel(tr("settings_restart"))
             restart_label.setObjectName("hint")
@@ -2530,9 +2589,10 @@ def main() -> int:
                     return int(default)
 
             def apply_settings(close_dialog: bool) -> None:
-                nonlocal verbose_log, runtime_log_file, discovery_send, discovery_reply, clear_pending_on_switch
+                nonlocal verbose_log, runtime_log_file, auto_pacing, discovery_send, discovery_reply, clear_pending_on_switch
                 verbose_log = cb_verbose.isChecked()
                 runtime_log_file = cb_runtime_log.isChecked()
+                auto_pacing = cb_auto_pacing.isChecked()
                 _STORAGE.set_runtime_log_enabled(runtime_log_file)
                 prev_send = discovery_send
                 discovery_send = cb_discovery_send.isChecked()
@@ -2545,11 +2605,16 @@ def main() -> int:
                 cfg["max_bytes"] = parse_int_field(maxbytes_edit, 200)
                 cfg["rate_seconds"] = parse_int_field(rate_edit, 30)
                 cfg["parallel_sends"] = max(1, parse_int_field(parallel_edit, 1))
+                cfg["auto_pacing"] = bool(auto_pacing)
                 cfg["discovery_enabled"] = bool(discovery_send and discovery_reply)
                 cfg["discovery_send"] = discovery_send
                 cfg["discovery_reply"] = discovery_reply
                 cfg["runtime_log_file"] = runtime_log_file
                 cfg["clear_pending_on_switch"] = clear_pending_on_switch
+                try:
+                    args.auto_pacing = bool(auto_pacing)
+                except Exception:
+                    pass
                 save_gui_config()
                 if discovery_send and not prev_send:
                     reset_discovery_schedule()
@@ -2658,6 +2723,7 @@ def main() -> int:
                 current_lang = "ru"
                 verbose_log = True
                 runtime_log_file = False
+                auto_pacing = False
                 discovery_send = False
                 discovery_reply = False
                 clear_pending_on_switch = True
@@ -2668,6 +2734,7 @@ def main() -> int:
                     args.max_bytes = 200
                     args.rate_seconds = 30
                     args.parallel_sends = 1
+                    args.auto_pacing = False
                 except Exception:
                     pass
                 # Recreate local keypair for current profile.
@@ -4257,7 +4324,7 @@ def main() -> int:
 
         def process_ui_events() -> None:
             nonlocal init_step, last_init_label_ts, initializing
-            nonlocal current_lang, verbose_log, runtime_log_file, pinned_dialogs, hidden_contacts, groups
+            nonlocal current_lang, verbose_log, runtime_log_file, auto_pacing, last_pacing_save_ts, pinned_dialogs, hidden_contacts, groups
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
             nonlocal incoming_state
@@ -4291,6 +4358,11 @@ def main() -> int:
                     verbose_log = bool(cfg.get("log_verbose", verbose_log))
                     runtime_log_file = bool(cfg.get("runtime_log_file", runtime_log_file))
                     _STORAGE.set_runtime_log_enabled(runtime_log_file)
+                    auto_pacing = bool(cfg.get("auto_pacing", auto_pacing))
+                    try:
+                        args.auto_pacing = bool(auto_pacing)
+                    except Exception:
+                        pass
                     legacy_discovery = cfg.get("discovery_enabled", None)
                     if "discovery_send" in cfg:
                         discovery_send = bool(cfg.get("discovery_send"))
@@ -4378,6 +4450,19 @@ def main() -> int:
                     apply_language()
                     refresh_list()
                     render_chat(current_dialog)
+                elif evt == "pacing_update":
+                    if isinstance(payload, (tuple, list)) and len(payload) >= 2:
+                        try:
+                            new_rate = max(1, int(payload[0]))
+                            new_parallel = max(1, int(payload[1]))
+                            cfg["rate_seconds"] = new_rate
+                            cfg["parallel_sends"] = new_parallel
+                            now_save = time.time()
+                            if auto_pacing and ((now_save - last_pacing_save_ts) >= 60.0):
+                                last_pacing_save_ts = now_save
+                                save_gui_config()
+                        except Exception:
+                            pass
                 elif evt == "recv":
                     from_id = ""
                     text = ""

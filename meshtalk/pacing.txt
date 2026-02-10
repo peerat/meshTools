@@ -1,0 +1,34 @@
+meshtalk/pacing.py reference
+Author: Anton Vologzhanin (R3VAF)
+Updated: 2026-02-10
+
+========================
+EN
+========================
+
+Purpose
+- Adaptive pacing helper for meshTalk sender loop.
+- Uses recent ACK metrics (attempts, timeouts, RTT) to tune:
+  - `rate_seconds` (send window length)
+  - `parallel_sends` (packets per window)
+
+Notes
+- Effective average send rate ~= `parallel_sends / rate_seconds`.
+- The algorithm is conservative: it backs off quickly on timeouts/retries and ramps up slowly on clean delivery.
+- Intended to improve throughput for multipart messages while avoiding mesh congestion.
+
+========================
+RU
+========================
+
+Назначение
+- Хелпер автоподбора скорости отправки для sender loop в meshTalk.
+- По статистике ACK (попытки, таймауты, RTT) подбирает:
+  - `rate_seconds` (длина окна отправки)
+  - `parallel_sends` (сколько пакетов можно отправить в одном окне)
+
+Заметки
+- Средняя скорость ~= `parallel_sends / rate_seconds`.
+- Алгоритм консервативный: быстро снижает скорость при таймаутах/повторах и медленно повышает при “чистой” доставке.
+- Нужно для повышения throughput многопакетных сообщений без сильного “забивания” mesh сети.
+

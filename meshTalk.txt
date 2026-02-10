@@ -72,6 +72,7 @@ Contact list indicators
 
 Settings
 - Port, retry interval, max wait, max bytes, rate, parallel packets (how many packets can be sent within one rate window).
+- Auto pacing (optional): tunes `rate`/`parallel` automatically from ACK attempts/timeouts when backlog exists.
 - Discovery: two checkboxes (`Send broadcast discovery`, `Reply to broadcast discovery`).
 - Default on first start: both ON.
 - Clear pending on profile switch.
@@ -107,6 +108,8 @@ Project files (repository / source-controlled)
   - Wire protocol primitives: pack/unpack, X25519+HKDF key derivation, base64 helpers.
 - `meshtalk/storage.py`:
   - Storage layer: config/state/history/incoming I/O, at-rest encryption key, file hardening.
+- `meshtalk/pacing.py`:
+  - Adaptive sending pace controller: tunes `rate_seconds`/`parallel_sends` from recent ACK stats.
 - `meshtalk_utils.py`:
   - Shared helpers: history encode/decode, parsers, metadata formatting, wire payload assembly.
 - `message_text_compression.py`:
@@ -124,6 +127,7 @@ Project files (repository / source-controlled)
 - `message_text_compression.txt`: focused text-compression module reference.
 - `meshtalk/protocol.txt`: focused protocol module reference.
 - `meshtalk/storage.txt`: focused storage module reference.
+- `meshtalk/pacing.txt`: focused pacing module reference.
 - `CHANGELOG.md`: changes between versions.
 
 Generated during runtime (per profile/node, not source code)
@@ -216,6 +220,7 @@ RU
 
 Настройки
 - Порт, повтор, макс ожидание, макс байт, минимальный интервал, параллельно (сколько пакетов можно отправить подряд в одном окне rate).
+- Автоподбор скорости (опционально): автоматически подбирает `интервал/параллельно` по попыткам ACK/таймаутам при наличии очереди.
 - Discovery: две галки (`Отправлять broadcast discovery`, `Отвечать на broadcast discovery`).
 - По умолчанию при первом запуске: обе ВКЛ.
 - Очистка очереди при смене профиля.
@@ -251,6 +256,8 @@ RU
   - Примитивы wire-протокола: pack/unpack, вычисление ключа X25519+HKDF, base64‑помощники.
 - `meshtalk/storage.py`:
   - Слой хранения: I/O config/state/history/incoming, ключ шифрования на диске, hardening прав файлов.
+- `meshtalk/pacing.py`:
+  - Автоподбор скорости отправки: подбирает `rate_seconds`/`parallel_sends` по статистике ACK.
 - `meshtalk_utils.py`:
   - Общие утилиты: кодирование/декодирование истории, парсеры, форматирование метаданных, сборка wire-пакетов.
 - `message_text_compression.py`:
@@ -268,6 +275,7 @@ RU
 - `message_text_compression.txt`: целевая справка по модулю сжатия текста.
 - `meshtalk/protocol.txt`: целевая справка по модулю протокола.
 - `meshtalk/storage.txt`: целевая справка по модулю хранения.
+- `meshtalk/pacing.txt`: целевая справка по модулю автоскорости.
 - `CHANGELOG.md`: изменения между версиями.
 
 Генерируется во время работы (на профиль/ноду, не исходники)
