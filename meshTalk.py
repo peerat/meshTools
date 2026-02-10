@@ -811,9 +811,6 @@ def main() -> int:
     last_key_sent_ts = 0.0
     # Security policy (TOFU key rotation). Must be visible to on_receive().
     security_policy = "auto"  # auto|strict|always
-    security_auto_stale_hours = 24
-    security_auto_seen_minutes = 120
-    security_auto_mode = "or"  # or|and
 
     def ui_emit(evt: str, payload: object) -> None:
         if gui_enabled:
@@ -950,44 +947,21 @@ def main() -> int:
 
     def should_auto_accept_peer_key_rotation(peer_norm: str, st: Optional[PeerState]) -> tuple[bool, str]:
         pol = str(security_policy or "auto").strip().lower()
-        now = time.time()
         try:
             key_conf = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) if st else 0.0
         except Exception:
             key_conf = 0.0
-        try:
-            last_seen = float(getattr(st, "last_seen_ts", 0.0) or 0.0) if st else 0.0
-        except Exception:
-            last_seen = 0.0
-        key_age_h: Optional[int] = None
-        seen_age_m: Optional[int] = None
-        if key_conf > 0.0:
-            key_age_h = int(max(0.0, (now - key_conf) / 3600.0))
-        if last_seen > 0.0:
-            seen_age_m = int(max(0.0, (now - last_seen) / 60.0))
 
         if pol == "always":
-            return True, f"policy=always key_age_h={key_age_h} seen_age_m={seen_age_m}"
+            return True, f"policy=always key_confirmed={1 if key_conf > 0.0 else 0}"
         if pol == "strict":
-            return False, f"policy=strict key_age_h={key_age_h} seen_age_m={seen_age_m}"
+            return False, f"policy=strict key_confirmed={1 if key_conf > 0.0 else 0}"
 
-        stale_h = int(security_auto_stale_hours or 24)
-        seen_m = int(security_auto_seen_minutes or 0)
-        mode = str(security_auto_mode or "or").strip().lower()
-        if mode not in ("or", "and"):
-            mode = "or"
-
-        # Guard: if we recently confirmed the existing key, do NOT auto-accept rotation.
-        if key_conf > 0.0 and (now - key_conf) < float(stale_h) * 3600.0:
-            return False, f"policy=auto guard=recent_confirm key_age_h={key_age_h} < {stale_h}h seen_age_m={seen_age_m}"
-
-        stale_ok = bool(key_conf > 0.0 and (now - key_conf) >= float(stale_h) * 3600.0)
-        seen_ok = bool(seen_m > 0 and last_seen > 0.0 and (now - last_seen) <= float(seen_m) * 60.0)
-        ok = (stale_ok and seen_ok) if mode == "and" else (stale_ok or seen_ok)
-        return (
-            bool(ok),
-            f"policy=auto mode={mode} stale_ok={1 if stale_ok else 0} seen_ok={1 if seen_ok else 0} key_age_h={key_age_h} stale_h={stale_h} seen_age_m={seen_age_m} seen_m={seen_m}",
-        )
+        # AUTO (without time heuristics): accept rotation only if the previous pinned key was never confirmed.
+        # Once a key was confirmed, require explicit user action (Reset key) to accept a new key.
+        if key_conf <= 0.0:
+            return True, "policy=auto reason=unconfirmed_old_key"
+        return False, "policy=auto reason=confirmed_old_key action=reset_key_required"
 
     def on_receive(packet, interface=None):
         nonlocal last_activity_ts
@@ -2272,7 +2246,7 @@ def main() -> int:
         except Exception:
             return -1
 
-        nonlocal security_policy, security_auto_stale_hours, security_auto_seen_minutes, security_auto_mode
+        nonlocal security_policy
         app = QtWidgets.QApplication(sys.argv)
         win = QtWidgets.QWidget()
         win.setWindowTitle(f"meshTalk v{VERSION}")
@@ -2352,7 +2326,7 @@ def main() -> int:
                 "security_auto_mode": "Auto rule",
                 "security_auto_mode_or": "OR (either is enough)",
                 "security_auto_mode_and": "AND (both required)",
-                "security_auto_hint": "AUTO accepts new peer key only when it looks like a normal rotation. STRICT always requires manual reset. ALWAYS ACCEPT is most convenient but weakest against key substitution.",
+                "security_auto_hint": "AUTO accepts a changed peer key only if the previously pinned key was never confirmed. If a key was confirmed before, manual reset is required. STRICT always requires manual reset. ALWAYS ACCEPT is most convenient but weakest against key substitution.",
                 "full_reset": "Full reset",
                 "full_reset_confirm": "Delete all profile settings, history, pending state and keys for '{name}'?\n\nThis action cannot be undone.",
                 "full_reset_done": "Profile data and keys were reset.",
@@ -2445,7 +2419,7 @@ def main() -> int:
                 "security_auto_mode": "Правило AUTO",
                 "security_auto_mode_or": "ИЛИ (достаточно одного)",
                 "security_auto_mode_and": "И (нужно оба условия)",
-                "security_auto_hint": "AUTO принимает новый ключ только когда это похоже на штатную ротацию. STRICT всегда требует ручной сброс. ALWAYS ACCEPT удобнее всего, но слабее к подмене ключа.",
+                "security_auto_hint": "AUTO принимает смену ключа только если старый закрепленный ключ никогда не был подтвержден. Если ключ уже подтверждался, нужен ручной сброс. STRICT всегда требует ручной сброс. ALWAYS ACCEPT удобнее всего, но слабее к подмене ключа.",
                 "full_reset": "Полный сброс",
                 "full_reset_confirm": "Удалить все настройки профиля, историю, очередь и ключи для '{name}'?\n\nДействие необратимо.",
                 "full_reset_done": "Данные профиля и ключи сброшены.",
@@ -2483,21 +2457,6 @@ def main() -> int:
         security_policy = str(cfg.get("security_key_rotation_policy", security_policy) or "auto").strip().lower()
         if security_policy not in ("auto", "strict", "always"):
             security_policy = "auto"
-        security_auto_stale_hours = _int_cfg(
-            cfg.get("security_auto_accept_stale_hours", security_auto_stale_hours),
-            24,
-            1,
-            24 * 30,
-        )
-        security_auto_seen_minutes = _int_cfg(
-            cfg.get("security_auto_accept_seen_minutes", security_auto_seen_minutes),
-            120,
-            0,
-            24 * 60,
-        )
-        security_auto_mode = str(cfg.get("security_auto_accept_mode", security_auto_mode) or "or").strip().lower()
-        if security_auto_mode not in ("or", "and"):
-            security_auto_mode = "or"
         last_pacing_save_ts = 0.0
         pinned_dialogs = set(cfg.get("pinned_dialogs", []))
         hidden_contacts = set(cfg.get("hidden_contacts", []))
@@ -2843,7 +2802,7 @@ def main() -> int:
             nonlocal settings_rate_edit, settings_parallel_edit, settings_auto_pacing_cb
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
-            nonlocal security_policy, security_auto_stale_hours, security_auto_seen_minutes, security_auto_mode
+            nonlocal security_policy
             nonlocal errors_need_ack
             errors_need_ack = False
             update_status()
@@ -2990,44 +2949,11 @@ def main() -> int:
             compact_field(sec_policy, width=240)
             sec_layout.addRow(tr("security_policy"), sec_policy)
 
-            sec_auto_mode = QtWidgets.QComboBox()
-            sec_auto_mode.addItem(tr("security_auto_mode_or"), "or")
-            sec_auto_mode.addItem(tr("security_auto_mode_and"), "and")
-            try:
-                idx = sec_auto_mode.findData(security_auto_mode)
-                sec_auto_mode.setCurrentIndex(idx if idx >= 0 else 0)
-            except Exception:
-                pass
-            compact_field(sec_auto_mode, width=240)
-            sec_layout.addRow(tr("security_auto_mode"), sec_auto_mode)
-
-            sec_stale = QtWidgets.QSpinBox()
-            sec_stale.setRange(1, 24 * 30)
-            sec_stale.setValue(int(security_auto_stale_hours))
-            compact_field(sec_stale, width=120)
-            sec_layout.addRow(tr("security_auto_stale_hours"), sec_stale)
-
-            sec_seen = QtWidgets.QSpinBox()
-            sec_seen.setRange(0, 24 * 60)
-            sec_seen.setValue(int(security_auto_seen_minutes))
-            compact_field(sec_seen, width=120)
-            sec_layout.addRow(tr("security_auto_seen_minutes"), sec_seen)
-
             right_panel.addWidget(sec_group)
             sec_hint = QtWidgets.QLabel(tr("security_auto_hint"))
             sec_hint.setObjectName("hint")
             sec_hint.setWordWrap(True)
             right_panel.addWidget(sec_hint)
-
-            def sync_security_fields() -> None:
-                pol = str(sec_policy.currentData() or "auto")
-                auto = pol == "auto"
-                sec_auto_mode.setEnabled(auto)
-                sec_stale.setEnabled(auto)
-                sec_seen.setEnabled(auto)
-
-            sync_security_fields()
-            sec_policy.currentIndexChanged.connect(lambda _i: sync_security_fields())
 
             top_row.addLayout(left_panel, 1)
             top_row.addLayout(right_panel, 1)
@@ -3114,15 +3040,7 @@ def main() -> int:
                 security_policy = str(sec_policy.currentData() or "auto").strip().lower()
                 if security_policy not in ("auto", "strict", "always"):
                     security_policy = "auto"
-                security_auto_mode = str(sec_auto_mode.currentData() or "or").strip().lower()
-                if security_auto_mode not in ("or", "and"):
-                    security_auto_mode = "or"
-                security_auto_stale_hours = int(sec_stale.value())
-                security_auto_seen_minutes = int(sec_seen.value())
                 cfg["security_key_rotation_policy"] = security_policy
-                cfg["security_auto_accept_stale_hours"] = int(security_auto_stale_hours)
-                cfg["security_auto_accept_seen_minutes"] = int(security_auto_seen_minutes)
-                cfg["security_auto_accept_mode"] = security_auto_mode
                 try:
                     args.auto_pacing = bool(auto_pacing)
                 except Exception:
@@ -5260,7 +5178,7 @@ def main() -> int:
         def process_ui_events() -> None:
             nonlocal init_step, last_init_label_ts, initializing
             nonlocal current_lang, verbose_log, runtime_log_file, auto_pacing, last_pacing_save_ts, pinned_dialogs, hidden_contacts, groups
-            nonlocal security_policy, security_auto_stale_hours, security_auto_seen_minutes, security_auto_mode
+            nonlocal security_policy
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
             nonlocal incoming_state
@@ -5304,11 +5222,6 @@ def main() -> int:
                     security_policy = str(cfg.get("security_key_rotation_policy", security_policy) or "auto").strip().lower()
                     if security_policy not in ("auto", "strict", "always"):
                         security_policy = "auto"
-                    security_auto_stale_hours = _int_cfg(cfg.get("security_auto_accept_stale_hours", security_auto_stale_hours), 24, 1, 24 * 30)
-                    security_auto_seen_minutes = _int_cfg(cfg.get("security_auto_accept_seen_minutes", security_auto_seen_minutes), 120, 0, 24 * 60)
-                    security_auto_mode = str(cfg.get("security_auto_accept_mode", security_auto_mode) or "or").strip().lower()
-                    if security_auto_mode not in ("or", "and"):
-                        security_auto_mode = "or"
                     legacy_discovery = cfg.get("discovery_enabled", None)
                     if "discovery_send" in cfg:
                         discovery_send = bool(cfg.get("discovery_send"))
