@@ -2663,10 +2663,22 @@ def main() -> int:
                 "rate": "Rate seconds",
                 "parallel_sends": "Parallel packets",
                 "auto_pacing": "Auto pacing",
+                "hint_port": "Serial port path or 'auto' to scan USB ports.",
+                "hint_retry": "Base retry interval used for resend/backoff.",
+                "hint_max_seconds": "Drop a pending packet after this many seconds without ACK.",
+                "hint_max_bytes": "Max Meshtastic payload bytes per packet (includes encryption overhead).",
+                "hint_rate": "Minimum delay between send windows (used when Auto pacing is off).",
+                "hint_parallel": "How many packets can be sent per send window.",
+                "hint_auto_pacing": "Auto tunes rate/parallel based on recent ACK stats.",
                 "discovery": "Discovery",
                 "discovery_send": "Send broadcast discovery",
                 "discovery_reply": "Reply to broadcast discovery",
                 "clear_pending_on_switch": "Clear pending when profile switches",
+                "hint_verbose": "Show more internal events in the GUI log.",
+                "hint_runtime_log_file": "Write runtime events to runtime.log on disk.",
+                "hint_discovery_send": "Sends discovery broadcasts (extra traffic).",
+                "hint_discovery_reply": "Replies to discovery broadcasts (extra traffic).",
+                "hint_clear_pending": "Clears pending queue when switching profile/dialog.",
                 "security": "Security",
                 "security_policy": "Key rotation policy",
                 "security_policy_auto": "AUTO (recommended)",
@@ -2758,10 +2770,22 @@ def main() -> int:
                 "rate": "Мин интервал, сек",
                 "parallel_sends": "Параллельно, пакетов",
                 "auto_pacing": "Автоподбор скорости",
+                "hint_port": "Серийный порт или 'auto' для поиска по USB.",
+                "hint_retry": "Базовый интервал повторов (resend/backoff).",
+                "hint_max_seconds": "Сбросить пакет из очереди после этого времени без ACK.",
+                "hint_max_bytes": "Макс. размер payload Meshtastic на пакет (включая оверхед шифрования).",
+                "hint_rate": "Минимальная пауза между окнами отправки (когда автоподбор выключен).",
+                "hint_parallel": "Сколько пакетов можно отправить подряд в одном окне.",
+                "hint_auto_pacing": "Автоподбор rate/параллельности по статистике ACK.",
                 "discovery": "Обнаружение",
                 "discovery_send": "Отправлять broadcast discovery",
                 "discovery_reply": "Отвечать на broadcast discovery",
                 "clear_pending_on_switch": "Очищать очередь при смене профиля",
+                "hint_verbose": "Показывать больше внутренних событий в GUI-логе.",
+                "hint_runtime_log_file": "Писать runtime события в runtime.log на диск.",
+                "hint_discovery_send": "Отправляет discovery broadcasts (доп. трафик).",
+                "hint_discovery_reply": "Отвечает на discovery broadcasts (доп. трафик).",
+                "hint_clear_pending": "Очищает очередь при переключении профиля/диалога.",
                 "security": "Безопасность",
                 "security_policy": "Политика смены ключа",
                 "security_policy_auto": "AUTO (рекомендуется)",
@@ -3225,14 +3249,42 @@ def main() -> int:
             rate_edit.setValidator(int_validator)
             parallel_edit.setValidator(parallel_validator)
             runtime_layout.addRow(tr("port"), port_edit)
+            port_hint = QtWidgets.QLabel(tr("hint_port"))
+            port_hint.setObjectName("hint")
+            port_hint.setWordWrap(True)
+            runtime_layout.addRow("", port_hint)
             runtime_layout.addRow(tr("retry"), retry_edit)
+            retry_hint = QtWidgets.QLabel(tr("hint_retry"))
+            retry_hint.setObjectName("hint")
+            retry_hint.setWordWrap(True)
+            runtime_layout.addRow("", retry_hint)
             runtime_layout.addRow(tr("max_seconds"), maxsec_edit)
+            maxsec_hint = QtWidgets.QLabel(tr("hint_max_seconds"))
+            maxsec_hint.setObjectName("hint")
+            maxsec_hint.setWordWrap(True)
+            runtime_layout.addRow("", maxsec_hint)
             runtime_layout.addRow(tr("max_bytes"), maxbytes_edit)
+            maxbytes_hint = QtWidgets.QLabel(tr("hint_max_bytes"))
+            maxbytes_hint.setObjectName("hint")
+            maxbytes_hint.setWordWrap(True)
+            runtime_layout.addRow("", maxbytes_hint)
             runtime_layout.addRow(tr("rate"), rate_edit)
+            rate_hint = QtWidgets.QLabel(tr("hint_rate"))
+            rate_hint.setObjectName("hint")
+            rate_hint.setWordWrap(True)
+            runtime_layout.addRow("", rate_hint)
             runtime_layout.addRow(tr("parallel_sends"), parallel_edit)
+            parallel_hint = QtWidgets.QLabel(tr("hint_parallel"))
+            parallel_hint.setObjectName("hint")
+            parallel_hint.setWordWrap(True)
+            runtime_layout.addRow("", parallel_hint)
             cb_auto_pacing = QtWidgets.QCheckBox("")
             cb_auto_pacing.setChecked(bool(cfg.get("auto_pacing", auto_pacing)))
             runtime_layout.addRow(tr("auto_pacing"), cb_auto_pacing)
+            auto_pacing_hint = QtWidgets.QLabel(tr("hint_auto_pacing"))
+            auto_pacing_hint.setObjectName("hint")
+            auto_pacing_hint.setWordWrap(True)
+            runtime_layout.addRow("", auto_pacing_hint)
             settings_rate_edit = rate_edit
             settings_parallel_edit = parallel_edit
             settings_auto_pacing_cb = cb_auto_pacing
@@ -3269,21 +3321,41 @@ def main() -> int:
             cb_verbose = QtWidgets.QCheckBox(tr("verbose_events"))
             cb_verbose.setChecked(verbose_log)
             right_panel.addWidget(cb_verbose)
+            verbose_hint = QtWidgets.QLabel(tr("hint_verbose"))
+            verbose_hint.setObjectName("hint")
+            verbose_hint.setWordWrap(True)
+            right_panel.addWidget(verbose_hint)
             cb_runtime_log = QtWidgets.QCheckBox(tr("runtime_log_file"))
             cb_runtime_log.setChecked(runtime_log_file)
             right_panel.addWidget(cb_runtime_log)
+            runtime_log_hint = QtWidgets.QLabel(tr("hint_runtime_log_file"))
+            runtime_log_hint.setObjectName("hint")
+            runtime_log_hint.setWordWrap(True)
+            right_panel.addWidget(runtime_log_hint)
             discovery_label = QtWidgets.QLabel(tr("discovery"))
             discovery_label.setObjectName("muted")
             right_panel.addWidget(discovery_label)
             cb_discovery_send = QtWidgets.QCheckBox(tr("discovery_send"))
             cb_discovery_send.setChecked(discovery_send)
             right_panel.addWidget(cb_discovery_send)
+            discovery_send_hint = QtWidgets.QLabel(tr("hint_discovery_send"))
+            discovery_send_hint.setObjectName("hint")
+            discovery_send_hint.setWordWrap(True)
+            right_panel.addWidget(discovery_send_hint)
             cb_discovery_reply = QtWidgets.QCheckBox(tr("discovery_reply"))
             cb_discovery_reply.setChecked(discovery_reply)
             right_panel.addWidget(cb_discovery_reply)
+            discovery_reply_hint = QtWidgets.QLabel(tr("hint_discovery_reply"))
+            discovery_reply_hint.setObjectName("hint")
+            discovery_reply_hint.setWordWrap(True)
+            right_panel.addWidget(discovery_reply_hint)
             cb_clear_pending = QtWidgets.QCheckBox(tr("clear_pending_on_switch"))
             cb_clear_pending.setChecked(clear_pending_on_switch)
             right_panel.addWidget(cb_clear_pending)
+            clear_pending_hint = QtWidgets.QLabel(tr("hint_clear_pending"))
+            clear_pending_hint.setObjectName("hint")
+            clear_pending_hint.setWordWrap(True)
+            right_panel.addWidget(clear_pending_hint)
 
             security_label = QtWidgets.QLabel(tr("security"))
             security_label.setObjectName("muted")
@@ -3306,20 +3378,20 @@ def main() -> int:
                 pass
             compact_field(sec_policy, width=240)
             sec_layout.addRow(tr("security_policy"), sec_policy)
+            sec_policy_hint = QtWidgets.QLabel(tr("security_auto_hint"))
+            sec_policy_hint.setObjectName("hint")
+            sec_policy_hint.setWordWrap(True)
+            sec_layout.addRow("", sec_policy_hint)
             cb_rekey = QtWidgets.QCheckBox(tr("session_rekey"))
             cb_rekey.setChecked(bool(session_rekey_enabled))
             cb_rekey.setToolTip(tr("session_rekey_hint"))
             sec_layout.addRow("", cb_rekey)
+            cb_rekey_hint = QtWidgets.QLabel(tr("session_rekey_hint"))
+            cb_rekey_hint.setObjectName("hint")
+            cb_rekey_hint.setWordWrap(True)
+            sec_layout.addRow("", cb_rekey_hint)
 
             right_panel.addWidget(sec_group)
-            sec_hint = QtWidgets.QLabel(tr("security_auto_hint"))
-            sec_hint.setObjectName("hint")
-            sec_hint.setWordWrap(True)
-            right_panel.addWidget(sec_hint)
-            rekey_hint = QtWidgets.QLabel(tr("session_rekey_hint"))
-            rekey_hint.setObjectName("hint")
-            rekey_hint.setWordWrap(True)
-            right_panel.addWidget(rekey_hint)
 
             top_row.addLayout(left_panel, 1)
             top_row.addLayout(right_panel, 1)
