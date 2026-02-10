@@ -7,6 +7,7 @@
 Added
 - Wire protocol version advertisement in key-exchange frames (`mt_wire`, `mt_msg`, `mt_mc`) for forward/backward compatibility tracking.
 - Extended wire protocol specification in docs (with explicit versioning).
+- Settings: `parallel_sends` (packets per `rate_seconds` window) to allow short send bursts without waiting for ACK between packets.
 
 Changed
 - Changelog entries now include release dates in headings.
@@ -104,6 +105,7 @@ Removed
 Добавлено
 - Объявление версий wire-протокола в key‑exchange кадрах (`mt_wire`, `mt_msg`, `mt_mc`) для отслеживания совместимости.
 - Расширенная спецификация wire‑протокола в документации (с явным версионированием).
+- Настройки: `parallel_sends` (сколько пакетов можно отправить подряд в одном окне `rate_seconds`) для быстрых отправок без ожидания ACK между пакетами.
 
 Изменено
 - В заголовках версий в changelog добавлены даты релизов.

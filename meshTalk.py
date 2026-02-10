@@ -504,6 +504,12 @@ def main() -> int:
     ap.add_argument("--max-seconds", type=int, default=3600, help="max time to wait for ACK (default: 3600). RU: максимум ожидания ACK, сек (по умолчанию: 3600).")
     ap.add_argument("--max-bytes", type=int, default=200, help="max payload bytes per packet (default: 200). RU: максимум байт полезной нагрузки (по умолчанию: 200).")
     ap.add_argument("--rate-seconds", type=int, default=30, help="min seconds between sends (default: 30). RU: минимум секунд между отправками (по умолчанию: 30).")
+    ap.add_argument(
+        "--parallel-sends",
+        type=int,
+        default=1,
+        help="packets per rate window (default: 1). RU: сколько пакетов можно отправить подряд в одном окне rate (по умолчанию: 1).",
+    )
 
 
     args = ap.parse_args()
@@ -1271,7 +1277,10 @@ def main() -> int:
     print("Listening: ON")
     max_plain = max(0, int(args.max_bytes) - PAYLOAD_OVERHEAD)
     print(f"Max plaintext bytes: {max_plain} (payload limit {args.max_bytes}, overhead {PAYLOAD_OVERHEAD})")
-    print(f"Rate limit: {args.rate_seconds}s, retry: {args.retry_seconds}s, max: {args.max_seconds}s")
+    print(
+        f"Rate limit: {args.rate_seconds}s x{max(1, int(getattr(args, 'parallel_sends', 1) or 1))}, "
+        f"retry: {args.retry_seconds}s, max: {args.max_seconds}s"
+    )
 
     if interface is not None:
         pub.subscribe(on_receive, "meshtastic.receive.data")
@@ -1588,20 +1597,42 @@ def main() -> int:
         tracked_peers.add(peer_norm)
         return (group_id, total, normalize_compression_name(cmp_label), cmp_eff_pct)
 
-    global_last_send_ts = 0.0
+    send_window_start_ts = 0.0
+    send_window_count = 0
+    send_rr_offset = 0
 
     def send_due() -> None:
-        nonlocal global_last_send_ts
+        nonlocal send_window_start_ts, send_window_count, send_rr_offset
         if not radio_ready or interface is None:
             return
         now = time.time()
-        if (now - global_last_send_ts) < float(args.rate_seconds):
-            return
+        try:
+            rate_s = float(getattr(args, "rate_seconds", 0) or 0)
+        except Exception:
+            rate_s = 0.0
+        try:
+            parallel = int(getattr(args, "parallel_sends", 1) or 1)
+        except Exception:
+            parallel = 1
+        parallel = max(1, parallel)
+
+        if rate_s > 0.0:
+            if (send_window_start_ts <= 0.0) or ((now - send_window_start_ts) >= rate_s):
+                send_window_start_ts = now
+                send_window_count = 0
+            if send_window_count >= parallel:
+                return
         with pending_lock:
             peer_list = set(pending_by_peer.keys())
         peer_list |= set(tracked_peers)
 
-        for peer_norm in sorted(peer_list):
+        peers_sorted = sorted(peer_list)
+        if not peers_sorted:
+            return
+        n_peers = len(peers_sorted)
+        start = int(send_rr_offset) % max(1, n_peers)
+        for i in range(n_peers):
+            peer_norm = peers_sorted[(start + i) % n_peers]
             norm_peer = norm_id_for_filename(peer_norm)
             if norm_peer != peer_norm and peer_norm in pending_by_peer:
                 with pending_lock:
@@ -1749,7 +1780,8 @@ def main() -> int:
                 with pending_lock:
                     pending_by_peer.setdefault(peer_norm, {})[rec["id"]] = rec
                     save_state(pending_by_peer)
-                global_last_send_ts = now
+                send_window_count += 1
+                send_rr_offset = (start + i + 1) % max(1, n_peers)
                 if rec["attempts"] == 1:
                     append_history("send", peer_norm, rec["id"], text, f"attempt={rec['attempts']} cmp={cmp_name}")
                 ui_emit("log", f"{ts_local()} SEND: {rec['id']} attempt={rec['attempts']} cmp={cmp_name} -> {peer_norm}")
@@ -1928,6 +1960,7 @@ def main() -> int:
                 "max_seconds": "Max seconds",
                 "max_bytes": "Max bytes",
                 "rate": "Rate seconds",
+                "parallel_sends": "Parallel packets",
                 "discovery": "Discovery",
                 "discovery_send": "Send broadcast discovery",
                 "discovery_reply": "Reply to broadcast discovery",
@@ -1994,6 +2027,7 @@ def main() -> int:
                 "max_seconds": "Макс ожидание, сек",
                 "max_bytes": "Макс байт",
                 "rate": "Мин интервал, сек",
+                "parallel_sends": "Параллельно, пакетов",
                 "discovery": "Обнаружение",
                 "discovery_send": "Отправлять broadcast discovery",
                 "discovery_reply": "Отвечать на broadcast discovery",
@@ -2282,6 +2316,7 @@ def main() -> int:
                     "max_seconds": cfg.get("max_seconds", args.max_seconds),
                     "max_bytes": cfg.get("max_bytes", args.max_bytes),
                     "rate_seconds": cfg.get("rate_seconds", args.rate_seconds),
+                    "parallel_sends": cfg.get("parallel_sends", getattr(args, "parallel_sends", 1)),
                     "discovery_enabled": bool(discovery_send and discovery_reply),
                     "discovery_send": discovery_send,
                     "discovery_reply": discovery_reply,
@@ -2374,21 +2409,31 @@ def main() -> int:
             maxsec_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_seconds", args.max_seconds), int(args.max_seconds)))
             maxbytes_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_bytes", args.max_bytes), int(args.max_bytes)))
             rate_edit = QtWidgets.QLineEdit(int_text(cfg.get("rate_seconds", args.rate_seconds), int(args.rate_seconds)))
+            parallel_edit = QtWidgets.QLineEdit(
+                int_text(
+                    cfg.get("parallel_sends", getattr(args, "parallel_sends", 1)),
+                    int(getattr(args, "parallel_sends", 1) or 1),
+                )
+            )
             compact_field(port_edit)
             compact_field(retry_edit)
             compact_field(maxsec_edit)
             compact_field(maxbytes_edit)
             compact_field(rate_edit)
+            compact_field(parallel_edit, width=120)
             int_validator = QtGui.QIntValidator(0, 999999, dlg)
+            parallel_validator = QtGui.QIntValidator(1, 128, dlg)
             retry_edit.setValidator(int_validator)
             maxsec_edit.setValidator(int_validator)
             maxbytes_edit.setValidator(int_validator)
             rate_edit.setValidator(int_validator)
+            parallel_edit.setValidator(parallel_validator)
             runtime_layout.addRow(tr("port"), port_edit)
             runtime_layout.addRow(tr("retry"), retry_edit)
             runtime_layout.addRow(tr("max_seconds"), maxsec_edit)
             runtime_layout.addRow(tr("max_bytes"), maxbytes_edit)
             runtime_layout.addRow(tr("rate"), rate_edit)
+            runtime_layout.addRow(tr("parallel_sends"), parallel_edit)
             left_panel.addWidget(runtime_group)
             restart_label = QtWidgets.QLabel(tr("settings_restart"))
             restart_label.setObjectName("hint")
@@ -2499,6 +2544,7 @@ def main() -> int:
                 cfg["max_seconds"] = parse_int_field(maxsec_edit, 3600)
                 cfg["max_bytes"] = parse_int_field(maxbytes_edit, 200)
                 cfg["rate_seconds"] = parse_int_field(rate_edit, 30)
+                cfg["parallel_sends"] = max(1, parse_int_field(parallel_edit, 1))
                 cfg["discovery_enabled"] = bool(discovery_send and discovery_reply)
                 cfg["discovery_send"] = discovery_send
                 cfg["discovery_reply"] = discovery_reply
@@ -2621,6 +2667,7 @@ def main() -> int:
                     args.max_seconds = 3600
                     args.max_bytes = 200
                     args.rate_seconds = 30
+                    args.parallel_sends = 1
                 except Exception:
                     pass
                 # Recreate local keypair for current profile.
@@ -4262,6 +4309,13 @@ def main() -> int:
                     args.max_seconds = int(cfg.get("max_seconds", args.max_seconds))
                     args.max_bytes = int(cfg.get("max_bytes", args.max_bytes))
                     args.rate_seconds = int(float(cfg.get("rate_seconds", args.rate_seconds)))
+                    try:
+                        args.parallel_sends = max(
+                            1,
+                            int(cfg.get("parallel_sends", getattr(args, "parallel_sends", 1))),
+                        )
+                    except Exception:
+                        args.parallel_sends = 1
                     pinned_dialogs = set(cfg.get("pinned_dialogs", []))
                     hidden_contacts = set(cfg.get("hidden_contacts", []))
                     peer_meta_dirty = False
