@@ -122,7 +122,14 @@ class AdaptivePacer:
             retries_ratio = sum(1 for a in acks if a.attempts > 1) / float(len(acks))
             rtts = sorted(a.rtt_s for a in acks)
             rtt_p50 = rtts[len(rtts) // 2] if rtts else 0.0
-            timeout_drops = sum(1 for d in self._drops if d.reason == "timeout")
+            # Consider only timeouts that happened since the last adjustment.
+            # Otherwise, a single old timeout in the stats window could keep
+            # halving the rate multiple times, which hurts throughput.
+            timeout_drops = sum(
+                1
+                for d in self._drops
+                if (d.reason == "timeout" and d.ts > float(self._last_adjust_ts))
+            )
 
             cur_rate = int(self.rate_seconds)
             cur_par = int(self.parallel_sends)
@@ -209,4 +216,3 @@ class AdaptivePacer:
                     best_rate = int(rate)
                     best_par = int(par)
         return (best_rate, best_par)
-
