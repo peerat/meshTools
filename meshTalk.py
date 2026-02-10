@@ -3194,9 +3194,16 @@ def main() -> int:
             # Prevent too small window size that would clip numeric fields.
             dlg.setMinimumSize(760, 560)
             layout = QtWidgets.QVBoxLayout(dlg)
-            top_row = QtWidgets.QHBoxLayout()
-            top_row.setContentsMargins(0, 0, 0, 0)
-            top_row.setSpacing(14)
+            # Settings area is scrollable to keep minimum size usable.
+            settings_scroll = QtWidgets.QScrollArea()
+            settings_scroll.setWidgetResizable(True)
+            settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            settings_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            settings_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            settings_host = QtWidgets.QWidget()
+            settings_host_layout = QtWidgets.QHBoxLayout(settings_host)
+            settings_host_layout.setContentsMargins(0, 0, 0, 0)
+            settings_host_layout.setSpacing(14)
             left_panel = QtWidgets.QVBoxLayout()
             left_panel.setContentsMargins(0, 0, 0, 0)
             left_panel.setSpacing(6)
@@ -3215,11 +3222,22 @@ def main() -> int:
             runtime_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
 
             def compact_field(widget, width: int = 240):
-                widget.setMinimumWidth(180)
-                # Let fields grow with dialog width; clipping is worse than extra whitespace.
-                widget.setMaximumWidth(16777215)
-                widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+                widget.setMinimumWidth(220)
+                # Avoid comically wide fields on large windows.
+                widget.setMaximumWidth(max(280, int(width)))
+                widget.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
                 return widget
+
+            def bounded_field(widget, width: int = 520) -> QtWidgets.QWidget:
+                """Keep fields readable on small windows but not absurdly wide on large ones."""
+                compact_field(widget, width=width)
+                host = QtWidgets.QWidget()
+                row = QtWidgets.QHBoxLayout(host)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(0)
+                row.addWidget(widget, 0)
+                row.addStretch(1)
+                return host
 
             def int_text(value, fallback: int) -> str:
                 try:
@@ -3238,12 +3256,18 @@ def main() -> int:
                     int(getattr(args, "parallel_sends", 1) or 1),
                 )
             )
-            compact_field(port_edit)
-            compact_field(retry_edit)
-            compact_field(maxsec_edit)
-            compact_field(maxbytes_edit)
-            compact_field(rate_edit)
-            compact_field(parallel_edit, width=120)
+            # Ensure numbers stay readable.
+            for _e in (retry_edit, maxsec_edit, maxbytes_edit, rate_edit, parallel_edit):
+                try:
+                    _e.setMinimumContentsLength(10)
+                except Exception:
+                    pass
+            port_field = bounded_field(port_edit, width=520)
+            retry_field = bounded_field(retry_edit, width=240)
+            maxsec_field = bounded_field(maxsec_edit, width=240)
+            maxbytes_field = bounded_field(maxbytes_edit, width=240)
+            rate_field = bounded_field(rate_edit, width=240)
+            parallel_field = bounded_field(parallel_edit, width=160)
             int_validator = QtGui.QIntValidator(0, 999999, dlg)
             parallel_validator = QtGui.QIntValidator(1, 128, dlg)
             retry_edit.setValidator(int_validator)
@@ -3251,32 +3275,32 @@ def main() -> int:
             maxbytes_edit.setValidator(int_validator)
             rate_edit.setValidator(int_validator)
             parallel_edit.setValidator(parallel_validator)
-            runtime_layout.addRow(tr("port"), port_edit)
+            runtime_layout.addRow(tr("port"), port_field)
             port_hint = QtWidgets.QLabel(tr("hint_port"))
             port_hint.setObjectName("hint")
             port_hint.setWordWrap(True)
             runtime_layout.addRow("", port_hint)
-            runtime_layout.addRow(tr("retry"), retry_edit)
+            runtime_layout.addRow(tr("retry"), retry_field)
             retry_hint = QtWidgets.QLabel(tr("hint_retry"))
             retry_hint.setObjectName("hint")
             retry_hint.setWordWrap(True)
             runtime_layout.addRow("", retry_hint)
-            runtime_layout.addRow(tr("max_seconds"), maxsec_edit)
+            runtime_layout.addRow(tr("max_seconds"), maxsec_field)
             maxsec_hint = QtWidgets.QLabel(tr("hint_max_seconds"))
             maxsec_hint.setObjectName("hint")
             maxsec_hint.setWordWrap(True)
             runtime_layout.addRow("", maxsec_hint)
-            runtime_layout.addRow(tr("max_bytes"), maxbytes_edit)
+            runtime_layout.addRow(tr("max_bytes"), maxbytes_field)
             maxbytes_hint = QtWidgets.QLabel(tr("hint_max_bytes"))
             maxbytes_hint.setObjectName("hint")
             maxbytes_hint.setWordWrap(True)
             runtime_layout.addRow("", maxbytes_hint)
-            runtime_layout.addRow(tr("rate"), rate_edit)
+            runtime_layout.addRow(tr("rate"), rate_field)
             rate_hint = QtWidgets.QLabel(tr("hint_rate"))
             rate_hint.setObjectName("hint")
             rate_hint.setWordWrap(True)
             runtime_layout.addRow("", rate_hint)
-            runtime_layout.addRow(tr("parallel_sends"), parallel_edit)
+            runtime_layout.addRow(tr("parallel_sends"), parallel_field)
             parallel_hint = QtWidgets.QLabel(tr("hint_parallel"))
             parallel_hint.setObjectName("hint")
             parallel_hint.setWordWrap(True)
@@ -3379,10 +3403,10 @@ def main() -> int:
                 sec_policy.setCurrentIndex(idx if idx >= 0 else 0)
             except Exception:
                 pass
-            compact_field(sec_policy, width=240)
+            sec_policy_field = bounded_field(sec_policy, width=320)
             sec_policy_label = QtWidgets.QLabel(tr("security_policy"))
             sec_policy_label.setWordWrap(True)
-            sec_layout.addRow(sec_policy_label, sec_policy)
+            sec_layout.addRow(sec_policy_label, sec_policy_field)
             sec_policy_hint = QtWidgets.QLabel(tr("security_auto_hint"))
             sec_policy_hint.setObjectName("hint")
             sec_policy_hint.setWordWrap(True)
@@ -3399,9 +3423,14 @@ def main() -> int:
             right_panel.addWidget(sec_group)
 
             # Give runtime params more space than toggles on small widths.
-            top_row.addLayout(left_panel, 2)
-            top_row.addLayout(right_panel, 1)
-            layout.addLayout(top_row)
+            left_w = QtWidgets.QWidget()
+            left_w.setLayout(left_panel)
+            right_w = QtWidgets.QWidget()
+            right_w.setLayout(right_panel)
+            settings_host_layout.addWidget(left_w, 2)
+            settings_host_layout.addWidget(right_w, 1)
+            settings_scroll.setWidget(settings_host)
+            layout.addWidget(settings_scroll, 1)
             log_view = QtWidgets.QTextEdit()
             log_view.setReadOnly(True)
             set_mono(log_view, 10)
