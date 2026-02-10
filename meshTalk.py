@@ -441,10 +441,27 @@ class PeerState:
         self.last_key_req_initiator = ""
         self.next_key_refresh_ts = 0.0
         self.await_key_confirm = False
+        # TOFU pinning / key mismatch diagnostics (peer rotated key, but we keep old key until user resets).
+        self.pinned_mismatch = False
+        self.pinned_old_fp = ""
+        self.pinned_new_fp = ""
+        self.last_pinned_mismatch_log_ts = 0.0
 
     @property
     def key_ready(self) -> bool:
         return self.aes is not None
+
+
+def _int_cfg(value: object, default: int, min_v: int, max_v: int) -> int:
+    try:
+        v = int(value)
+    except Exception:
+        v = int(default)
+    if v < int(min_v):
+        return int(min_v)
+    if v > int(max_v):
+        return int(max_v)
+    return int(v)
 
 
 def resolve_peer_path(peer_arg: str) -> str:
@@ -894,7 +911,78 @@ def main() -> int:
             f.write(b64e(pub_raw_bytes))
         harden_file(path)
         update_peer_pub(peer_id_norm, pub_raw_bytes)
+        # Clear pinned mismatch state on successful store.
+        st = get_peer_state(peer_id_norm)
+        if st:
+            st.pinned_mismatch = False
+            st.pinned_old_fp = ""
+            st.pinned_new_fp = ""
         return path
+
+    def force_store_peer_pub(peer_id: str, pub_raw: bytes) -> str:
+        """Store peer public key even if it overwrites an existing pinned key (used by policy)."""
+        if not isinstance(pub_raw, (bytes, bytearray)):
+            raise ValueError("invalid peer public key type")
+        pub_raw_bytes = bytes(pub_raw)
+        if len(pub_raw_bytes) != 32:
+            raise ValueError("invalid peer public key length")
+        x25519.X25519PublicKey.from_public_bytes(pub_raw_bytes)
+        peer_id_norm = norm_id_for_filename(peer_id)
+        if not re.fullmatch(r"[0-9a-fA-F]{8}", peer_id_norm):
+            raise ValueError("invalid peer id")
+        path = os.path.join(keydir, f"{peer_id_norm}.pub")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(b64e(pub_raw_bytes))
+        harden_file(path)
+        update_peer_pub(peer_id_norm, pub_raw_bytes)
+        st = get_peer_state(peer_id_norm)
+        if st:
+            st.pinned_mismatch = False
+            st.pinned_old_fp = ""
+            st.pinned_new_fp = ""
+        return path
+
+    def should_auto_accept_peer_key_rotation(peer_norm: str, st: Optional[PeerState]) -> tuple[bool, str]:
+        pol = str(security_policy or "auto").strip().lower()
+        now = time.time()
+        try:
+            key_conf = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) if st else 0.0
+        except Exception:
+            key_conf = 0.0
+        try:
+            last_seen = float(getattr(st, "last_seen_ts", 0.0) or 0.0) if st else 0.0
+        except Exception:
+            last_seen = 0.0
+        key_age_h: Optional[int] = None
+        seen_age_m: Optional[int] = None
+        if key_conf > 0.0:
+            key_age_h = int(max(0.0, (now - key_conf) / 3600.0))
+        if last_seen > 0.0:
+            seen_age_m = int(max(0.0, (now - last_seen) / 60.0))
+
+        if pol == "always":
+            return True, f"policy=always key_age_h={key_age_h} seen_age_m={seen_age_m}"
+        if pol == "strict":
+            return False, f"policy=strict key_age_h={key_age_h} seen_age_m={seen_age_m}"
+
+        stale_h = int(security_auto_stale_hours or 24)
+        seen_m = int(security_auto_seen_minutes or 0)
+        mode = str(security_auto_mode or "or").strip().lower()
+        if mode not in ("or", "and"):
+            mode = "or"
+
+        # Guard: if we recently confirmed the existing key, do NOT auto-accept rotation.
+        if key_conf > 0.0 and (now - key_conf) < float(stale_h) * 3600.0:
+            return False, f"policy=auto guard=recent_confirm key_age_h={key_age_h} < {stale_h}h seen_age_m={seen_age_m}"
+
+        stale_ok = bool(key_conf > 0.0 and (now - key_conf) >= float(stale_h) * 3600.0)
+        seen_ok = bool(seen_m > 0 and last_seen > 0.0 and (now - last_seen) <= float(seen_m) * 60.0)
+        ok = (stale_ok and seen_ok) if mode == "and" else (stale_ok or seen_ok)
+        return (
+            bool(ok),
+            f"policy=auto mode={mode} stale_ok={1 if stale_ok else 0} seen_ok={1 if seen_ok else 0} key_age_h={key_age_h} stale_h={stale_h} seen_age_m={seen_age_m} seen_m={seen_m}",
+        )
 
     def on_receive(packet, interface=None):
         nonlocal last_activity_ts
@@ -954,10 +1042,88 @@ def main() -> int:
             try:
                 store_peer_pub(peer_id, pub_raw)
             except PeerKeyPinnedError as ex:
-                ui_emit(
-                    "log",
-                    f"{ts_local()} KEY: pinned key mismatch for {peer_id} old={ex.old_fp} new={ex.new_fp}. Use 'Reset key' to accept new.",
-                )
+                st = get_peer_state(peer_norm)
+                auto_ok, auto_why = should_auto_accept_peer_key_rotation(peer_norm, st)
+                if auto_ok:
+                    # Overwrite pinned key according to policy (AUTO/ALWAYS).
+                    try:
+                        path = os.path.join(keydir, f"{norm_id_for_filename(peer_id)}.pub")
+                        try:
+                            if os.path.isfile(path):
+                                os.remove(path)
+                        except Exception:
+                            pass
+                        force_store_peer_pub(peer_id, pub_raw)
+                        ui_emit(
+                            "log",
+                            f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=auto_accept {auto_why}",
+                        )
+                    except Exception as e:
+                        ui_emit(
+                            "log",
+                            f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required auto_accept_failed={type(e).__name__}",
+                        )
+                        # Fall through to pinned-mismatch behavior (manual reset).
+                    else:
+                        # Continue processing this key frame normally.
+                        last_activity_ts = time.time()
+                        st2 = get_peer_state(peer_norm)
+                        if st2 and trusted_capabilities:
+                            if peer_modes:
+                                st2.compression_capable = True
+                                st2.compression_modes = set(peer_modes)
+                            else:
+                                st2.compression_capable = False
+                                st2.compression_modes = set(LEGACY_COMPRESSION_MODES)
+                            st2.aad_type_bound = bool(peer_caps and ("aad_type" in peer_caps))
+                            if peer_wire:
+                                st2.peer_wire_versions = set(peer_wire)
+                            else:
+                                st2.peer_wire_versions = {int(PROTO_VERSION)}
+                            if peer_msg:
+                                st2.peer_msg_versions = set(peer_msg)
+                            else:
+                                st2.peer_msg_versions = {1}
+                            if peer_mc:
+                                st2.peer_mc_versions = set(peer_mc)
+                            else:
+                                st2.peer_mc_versions = {1}
+                        if st2 and st2.key_ready and kind == "resp":
+                            st2.last_key_ok_ts = time.time()
+                            st2.key_confirmed_ts = st2.last_key_ok_ts
+                            ui_emit(
+                                "log",
+                                f"{ts_local()} KEYOK: confirmed_by=resp peer={peer_id} initiator=remote wire=MT-WIREv1 aes-256-gcm",
+                            )
+                            st2.force_key_req = False
+                            st2.await_key_confirm = False
+                            st2.next_key_req_ts = float('inf')
+                        ui_emit("peer_update", peer_norm)
+                        return
+
+                # Peer rotated key. Keep old pinned key until user resets explicitly.
+                # Suppress repeated logs to avoid noisy spam loops.
+                if st:
+                    st.pinned_mismatch = True
+                    st.pinned_old_fp = str(ex.old_fp or "")
+                    st.pinned_new_fp = str(ex.new_fp or "")
+                    st.force_key_req = False
+                    st.await_key_confirm = False
+                    st.next_key_req_ts = float("inf")
+                    # Don't keep trying to decrypt with a known-stale key.
+                    st.aes = None
+                    now = time.time()
+                    if (now - float(getattr(st, "last_pinned_mismatch_log_ts", 0.0) or 0.0)) >= 30.0:
+                        st.last_pinned_mismatch_log_ts = now
+                        ui_emit(
+                            "log",
+                            f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required {auto_why}",
+                        )
+                else:
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required {auto_why}",
+                    )
                 return
             except ValueError:
                 ui_emit("log", f"{ts_local()} KEY: reject invalid key frame from {peer_id}.")
@@ -1094,6 +1260,12 @@ def main() -> int:
                 st.decrypt_fail_count = 0
             st.decrypt_fail_count += 1
             st.last_decrypt_fail_ts = now
+            if bool(getattr(st, "pinned_mismatch", False)):
+                ui_emit(
+                    "log",
+                    f"{ts_local()} KEY: decrypt failed peer={from_id} but key is pinned_mismatch; action=reset_key_required",
+                )
+                return
             ui_emit(
                 "log",
                 f"{ts_local()} KEY: decrypt failed peer={from_id} count={st.decrypt_fail_count} (possible stale key) initiator=remote event=decrypt_fail wire=MT-WIREv1 aes-256-gcm",
@@ -1476,6 +1648,15 @@ def main() -> int:
         if peer_norm == self_id:
             return
         st = get_peer_state(peer_norm)
+        if st and bool(getattr(st, "pinned_mismatch", False)):
+            # If peer rotated key and it's pinned, do not auto-spam key requests.
+            # Allow explicit user actions to re-initiate.
+            if str(reason or "") not in ("reset_key", "manual_request_key"):
+                ui_emit(
+                    "log",
+                    f"{ts_local()} KEY: suppressed peer={wire_id_from_norm(peer_norm)} initiator=local reason=pinned_key_mismatch action=reset_key_required",
+                )
+                return
         now = time.time()
         if st and (now - st.last_key_req_ts) < 5.0:
             left_s = int(max(0.0, 5.0 - (now - st.last_key_req_ts)))
@@ -2154,6 +2335,18 @@ def main() -> int:
                 "discovery_send": "Send broadcast discovery",
                 "discovery_reply": "Reply to broadcast discovery",
                 "clear_pending_on_switch": "Clear pending when profile switches",
+                "security": "Security",
+                "security_policy": "Key rotation policy",
+                "security_policy_auto": "AUTO (recommended)",
+                "security_policy_strict": "STRICT",
+                "security_policy_always": "ALWAYS ACCEPT",
+                "security_policy_hint": "Controls what happens when a peer key changes (TOFU).",
+                "security_auto_stale_hours": "Auto accept if key age, h",
+                "security_auto_seen_minutes": "Auto accept if seen within, min",
+                "security_auto_mode": "Auto rule",
+                "security_auto_mode_or": "OR (either is enough)",
+                "security_auto_mode_and": "AND (both required)",
+                "security_auto_hint": "AUTO accepts new peer key only when it looks like a normal rotation. STRICT always requires manual reset. ALWAYS ACCEPT is most convenient but weakest against key substitution.",
                 "full_reset": "Full reset",
                 "full_reset_confirm": "Delete all profile settings, history, pending state and keys for '{name}'?\n\nThis action cannot be undone.",
                 "full_reset_done": "Profile data and keys were reset.",
@@ -2235,6 +2428,18 @@ def main() -> int:
                 "discovery_send": "Отправлять broadcast discovery",
                 "discovery_reply": "Отвечать на broadcast discovery",
                 "clear_pending_on_switch": "Очищать очередь при смене профиля",
+                "security": "Безопасность",
+                "security_policy": "Политика смены ключа",
+                "security_policy_auto": "AUTO (рекомендуется)",
+                "security_policy_strict": "STRICT",
+                "security_policy_always": "ALWAYS ACCEPT",
+                "security_policy_hint": "Определяет поведение при смене публичного ключа пира (TOFU).",
+                "security_auto_stale_hours": "Автопринять если ключ старше, ч",
+                "security_auto_seen_minutes": "Автопринять если был в сети, мин",
+                "security_auto_mode": "Правило AUTO",
+                "security_auto_mode_or": "ИЛИ (достаточно одного)",
+                "security_auto_mode_and": "И (нужно оба условия)",
+                "security_auto_hint": "AUTO принимает новый ключ только когда это похоже на штатную ротацию. STRICT всегда требует ручной сброс. ALWAYS ACCEPT удобнее всего, но слабее к подмене ключа.",
                 "full_reset": "Полный сброс",
                 "full_reset_confirm": "Удалить все настройки профиля, историю, очередь и ключи для '{name}'?\n\nДействие необратимо.",
                 "full_reset_done": "Данные профиля и ключи сброшены.",
@@ -2269,6 +2474,14 @@ def main() -> int:
         verbose_log = bool(cfg.get("log_verbose", True))
         runtime_log_file = bool(cfg.get("runtime_log_file", True))
         auto_pacing = bool(cfg.get("auto_pacing", True))
+        security_policy = str(cfg.get("security_key_rotation_policy", "auto") or "auto").strip().lower()
+        if security_policy not in ("auto", "strict", "always"):
+            security_policy = "auto"
+        security_auto_stale_hours = _int_cfg(cfg.get("security_auto_accept_stale_hours", 24), 24, 1, 24 * 30)
+        security_auto_seen_minutes = _int_cfg(cfg.get("security_auto_accept_seen_minutes", 120), 120, 0, 24 * 60)
+        security_auto_mode = str(cfg.get("security_auto_accept_mode", "or") or "or").strip().lower()
+        if security_auto_mode not in ("or", "and"):
+            security_auto_mode = "or"
         last_pacing_save_ts = 0.0
         pinned_dialogs = set(cfg.get("pinned_dialogs", []))
         hidden_contacts = set(cfg.get("hidden_contacts", []))
@@ -2614,6 +2827,7 @@ def main() -> int:
             nonlocal settings_rate_edit, settings_parallel_edit, settings_auto_pacing_cb
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
+            nonlocal security_policy, security_auto_stale_hours, security_auto_seen_minutes, security_auto_mode
             nonlocal errors_need_ack
             errors_need_ack = False
             update_status()
@@ -2738,6 +2952,67 @@ def main() -> int:
             cb_clear_pending.setChecked(clear_pending_on_switch)
             right_panel.addWidget(cb_clear_pending)
 
+            security_label = QtWidgets.QLabel(tr("security"))
+            security_label.setObjectName("muted")
+            right_panel.addWidget(security_label)
+            sec_group = QtWidgets.QGroupBox("")
+            sec_layout = QtWidgets.QFormLayout(sec_group)
+            sec_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+            sec_layout.setFormAlignment(QtCore.Qt.AlignTop)
+            sec_layout.setVerticalSpacing(8)
+            sec_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+
+            sec_policy = QtWidgets.QComboBox()
+            sec_policy.addItem(tr("security_policy_auto"), "auto")
+            sec_policy.addItem(tr("security_policy_strict"), "strict")
+            sec_policy.addItem(tr("security_policy_always"), "always")
+            try:
+                idx = sec_policy.findData(security_policy)
+                sec_policy.setCurrentIndex(idx if idx >= 0 else 0)
+            except Exception:
+                pass
+            compact_field(sec_policy, width=240)
+            sec_layout.addRow(tr("security_policy"), sec_policy)
+
+            sec_auto_mode = QtWidgets.QComboBox()
+            sec_auto_mode.addItem(tr("security_auto_mode_or"), "or")
+            sec_auto_mode.addItem(tr("security_auto_mode_and"), "and")
+            try:
+                idx = sec_auto_mode.findData(security_auto_mode)
+                sec_auto_mode.setCurrentIndex(idx if idx >= 0 else 0)
+            except Exception:
+                pass
+            compact_field(sec_auto_mode, width=240)
+            sec_layout.addRow(tr("security_auto_mode"), sec_auto_mode)
+
+            sec_stale = QtWidgets.QSpinBox()
+            sec_stale.setRange(1, 24 * 30)
+            sec_stale.setValue(int(security_auto_stale_hours))
+            compact_field(sec_stale, width=120)
+            sec_layout.addRow(tr("security_auto_stale_hours"), sec_stale)
+
+            sec_seen = QtWidgets.QSpinBox()
+            sec_seen.setRange(0, 24 * 60)
+            sec_seen.setValue(int(security_auto_seen_minutes))
+            compact_field(sec_seen, width=120)
+            sec_layout.addRow(tr("security_auto_seen_minutes"), sec_seen)
+
+            right_panel.addWidget(sec_group)
+            sec_hint = QtWidgets.QLabel(tr("security_auto_hint"))
+            sec_hint.setObjectName("hint")
+            sec_hint.setWordWrap(True)
+            right_panel.addWidget(sec_hint)
+
+            def sync_security_fields() -> None:
+                pol = str(sec_policy.currentData() or "auto")
+                auto = pol == "auto"
+                sec_auto_mode.setEnabled(auto)
+                sec_stale.setEnabled(auto)
+                sec_seen.setEnabled(auto)
+
+            sync_security_fields()
+            sec_policy.currentIndexChanged.connect(lambda _i: sync_security_fields())
+
             top_row.addLayout(left_panel, 1)
             top_row.addLayout(right_panel, 1)
             layout.addLayout(top_row)
@@ -2820,6 +3095,18 @@ def main() -> int:
                 cfg["discovery_reply"] = discovery_reply
                 cfg["runtime_log_file"] = runtime_log_file
                 cfg["clear_pending_on_switch"] = clear_pending_on_switch
+                security_policy = str(sec_policy.currentData() or "auto").strip().lower()
+                if security_policy not in ("auto", "strict", "always"):
+                    security_policy = "auto"
+                security_auto_mode = str(sec_auto_mode.currentData() or "or").strip().lower()
+                if security_auto_mode not in ("or", "and"):
+                    security_auto_mode = "or"
+                security_auto_stale_hours = int(sec_stale.value())
+                security_auto_seen_minutes = int(sec_seen.value())
+                cfg["security_key_rotation_policy"] = security_policy
+                cfg["security_auto_accept_stale_hours"] = int(security_auto_stale_hours)
+                cfg["security_auto_accept_seen_minutes"] = int(security_auto_seen_minutes)
+                cfg["security_auto_accept_mode"] = security_auto_mode
                 try:
                     args.auto_pacing = bool(auto_pacing)
                 except Exception:
@@ -3854,6 +4141,9 @@ def main() -> int:
             st = get_peer_state(peer_id)
             if st:
                 st.aes = None
+                st.pinned_mismatch = False
+                st.pinned_old_fp = ""
+                st.pinned_new_fp = ""
                 st.force_key_req = True
                 st.next_key_req_ts = 0.0
             send_key_request(peer_id, require_confirm=True, reason="reset_key")
@@ -4994,6 +5284,14 @@ def main() -> int:
                         args.auto_pacing = bool(auto_pacing)
                     except Exception:
                         pass
+                    security_policy = str(cfg.get("security_key_rotation_policy", security_policy) or "auto").strip().lower()
+                    if security_policy not in ("auto", "strict", "always"):
+                        security_policy = "auto"
+                    security_auto_stale_hours = _int_cfg(cfg.get("security_auto_accept_stale_hours", security_auto_stale_hours), 24, 1, 24 * 30)
+                    security_auto_seen_minutes = _int_cfg(cfg.get("security_auto_accept_seen_minutes", security_auto_seen_minutes), 120, 0, 24 * 60)
+                    security_auto_mode = str(cfg.get("security_auto_accept_mode", security_auto_mode) or "or").strip().lower()
+                    if security_auto_mode not in ("or", "and"):
+                        security_auto_mode = "or"
                     legacy_discovery = cfg.get("discovery_enabled", None)
                     if "discovery_send" in cfg:
                         discovery_send = bool(cfg.get("discovery_send"))
@@ -5677,6 +5975,7 @@ def main() -> int:
                     add_action(tr("group_add"), add_to_group)
                 add_action(tr("msg_ctx_route"), lambda: trace_route(current_id))
                 add_action(tr("key_request"), lambda: request_key(current_id))
+                add_action(tr("key_reset"), lambda: reset_peer_key(current_id))
                 add_action(tr("clear_history"), lambda: clear_history(current_id))
                 add_action(tr("peer_delete"), lambda: delete_peer(current_id))
 

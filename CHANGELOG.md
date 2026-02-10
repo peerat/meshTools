@@ -17,6 +17,7 @@ Added
 - Extended wire protocol specification in docs (with explicit versioning).
 - Settings: `parallel_sends` (packets per `rate_seconds` window) to allow short send bursts without waiting for ACK between packets.
 - Settings: `auto_pacing` (adaptive) to auto-tune `rate_seconds`/`parallel_sends` from recent ACK stats.
+- Settings: key rotation policy (`security_key_rotation_policy`) with AUTO/STRICT/ALWAYS and explicit TOFU key-mismatch handling.
 - Contact context action: traceroute (Meshtastic `TRACEROUTE_APP`) and post output into dialog.
 
 Changed
@@ -129,6 +130,7 @@ Removed
 - Расширенная спецификация wire‑протокола в документации (с явным версионированием).
 - Настройки: `parallel_sends` (сколько пакетов можно отправить подряд в одном окне `rate_seconds`) для быстрых отправок без ожидания ACK между пакетами.
 - Настройки: `auto_pacing` (адаптивно) автоподбирает `rate_seconds`/`parallel_sends` по статистике ACK.
+- Настройки: политика смены ключа (`security_key_rotation_policy`) с AUTO/STRICT/ALWAYS и явной обработкой TOFU key-mismatch.
 - Действие в контекстном меню контакта: traceroute (Meshtastic `TRACEROUTE_APP`) и вывод результата в диалог.
 
 Изменено
