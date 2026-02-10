@@ -809,6 +809,11 @@ def main() -> int:
     gui_enabled = True
     last_activity_ts = time.time()
     last_key_sent_ts = 0.0
+    # Security policy (TOFU key rotation). Must be visible to on_receive().
+    security_policy = "auto"  # auto|strict|always
+    security_auto_stale_hours = 24
+    security_auto_seen_minutes = 120
+    security_auto_mode = "or"  # or|and
 
     def ui_emit(evt: str, payload: object) -> None:
         if gui_enabled:
@@ -2267,6 +2272,7 @@ def main() -> int:
         except Exception:
             return -1
 
+        nonlocal security_policy, security_auto_stale_hours, security_auto_seen_minutes, security_auto_mode
         app = QtWidgets.QApplication(sys.argv)
         win = QtWidgets.QWidget()
         win.setWindowTitle(f"meshTalk v{VERSION}")
@@ -2474,12 +2480,22 @@ def main() -> int:
         verbose_log = bool(cfg.get("log_verbose", True))
         runtime_log_file = bool(cfg.get("runtime_log_file", True))
         auto_pacing = bool(cfg.get("auto_pacing", True))
-        security_policy = str(cfg.get("security_key_rotation_policy", "auto") or "auto").strip().lower()
+        security_policy = str(cfg.get("security_key_rotation_policy", security_policy) or "auto").strip().lower()
         if security_policy not in ("auto", "strict", "always"):
             security_policy = "auto"
-        security_auto_stale_hours = _int_cfg(cfg.get("security_auto_accept_stale_hours", 24), 24, 1, 24 * 30)
-        security_auto_seen_minutes = _int_cfg(cfg.get("security_auto_accept_seen_minutes", 120), 120, 0, 24 * 60)
-        security_auto_mode = str(cfg.get("security_auto_accept_mode", "or") or "or").strip().lower()
+        security_auto_stale_hours = _int_cfg(
+            cfg.get("security_auto_accept_stale_hours", security_auto_stale_hours),
+            24,
+            1,
+            24 * 30,
+        )
+        security_auto_seen_minutes = _int_cfg(
+            cfg.get("security_auto_accept_seen_minutes", security_auto_seen_minutes),
+            120,
+            0,
+            24 * 60,
+        )
+        security_auto_mode = str(cfg.get("security_auto_accept_mode", security_auto_mode) or "or").strip().lower()
         if security_auto_mode not in ("or", "and"):
             security_auto_mode = "or"
         last_pacing_save_ts = 0.0
@@ -5244,6 +5260,7 @@ def main() -> int:
         def process_ui_events() -> None:
             nonlocal init_step, last_init_label_ts, initializing
             nonlocal current_lang, verbose_log, runtime_log_file, auto_pacing, last_pacing_save_ts, pinned_dialogs, hidden_contacts, groups
+            nonlocal security_policy, security_auto_stale_hours, security_auto_seen_minutes, security_auto_mode
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
             nonlocal incoming_state
