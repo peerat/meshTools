@@ -80,9 +80,7 @@ from message_text_compression import (
     MODE_BYTE_DICT,
     MODE_FIXED_BITS,
     MODE_LZMA,
-    MODE_NLTK,
-    MODE_SPACY,
-    MODE_TENSORFLOW,
+    MODE_ZSTD,
     MODE_ZLIB,
     compress_text,
     mode_name,
@@ -128,16 +126,37 @@ _STORAGE = Storage(
     keydir=keydir,
 )
 COMPRESSION_MODES = (
+    # Default local capabilities; actual supported modes are controlled by Settings and runtime dependencies.
     int(MODE_DEFLATE),
     int(MODE_ZLIB),
     int(MODE_BZ2),
     int(MODE_LZMA),
-    int(MODE_NLTK),
-    int(MODE_SPACY),
-    int(MODE_TENSORFLOW),
 )
 LEGACY_COMPRESSION_MODES = tuple(COMPRESSION_MODES)
 AUTO_MIN_GAIN_BYTES = 2
+
+try:
+    import zstandard as _mt_zstd  # type: ignore
+
+    _ZSTD_AVAILABLE = True
+except Exception:
+    _mt_zstd = None
+    _ZSTD_AVAILABLE = False
+
+# Global config dict.
+# Some worker threads call helpers defined at module scope (e.g. discovery broadcast),
+# so config must exist as a module global to avoid NameError.
+cfg: Dict[str, object] = {}
+
+
+def supported_mc_modes_for_config(cfg_obj: dict) -> tuple[int, ...]:
+    """Return local MC mode IDs to advertise/use based on Settings and installed optional deps."""
+    # ZSTD is now a required dependency, but keep runtime check for broken installs.
+    modes = [int(MODE_DEFLATE), int(MODE_ZLIB), int(MODE_BZ2), int(MODE_LZMA)]
+    if _ZSTD_AVAILABLE:
+        modes.append(int(MODE_ZSTD))
+    # Stable order for wire advertisement.
+    return tuple(sorted({int(m) for m in modes}))
 
 
 def ts_local() -> str:
@@ -446,6 +465,7 @@ class PeerState:
         # Set only after confirmed two-way key exchange (peer has our pub and we have peer pub).
         self.key_confirmed_ts = 0.0
         self.compression_capable = False
+        # Local MC mode capabilities are resolved from config at runtime.
         self.compression_modes = set(LEGACY_COMPRESSION_MODES)
         self.aad_type_bound = False
         # Peer-advertised protocol versions (from KR1/KR2 frames).
@@ -525,7 +545,7 @@ def parse_key_frame(
         payload=payload,
         key_req_prefix=KEY_REQ_PREFIX,
         key_resp_prefix=KEY_RESP_PREFIX,
-        supported_modes=set(COMPRESSION_MODES),
+        supported_modes=set(supported_mc_modes_for_config(cfg)),
     )
     if parsed is None:
         return None
@@ -846,6 +866,9 @@ def main() -> int:
     gui_enabled = True
     last_activity_ts = time.time()
     last_key_sent_ts = 0.0
+    # Config must be available to sender_loop/key exchange/discovery even before GUI starts.
+    global cfg
+    cfg = load_config()
     # Security policy (TOFU key rotation). Must be visible to on_receive().
     security_policy = "auto"  # auto|strict|always
     # Session rekey (ephemeral X25519) to reduce impact of long-term key compromise.
@@ -899,7 +922,7 @@ def main() -> int:
                 aes_local = AESGCM(derive_key(priv, pub_self))
                 st = PeerState(peer_norm, aes_local)
                 st.compression_capable = True
-                st.compression_modes = set(COMPRESSION_MODES)
+                st.compression_modes = set(supported_mc_modes_for_config(cfg))
                 st.last_key_ok_ts = time.time()
                 peer_states[peer_norm] = st
                 return st
@@ -985,7 +1008,8 @@ def main() -> int:
         return path
 
     def should_auto_accept_peer_key_rotation(peer_norm: str, st: Optional[PeerState]) -> tuple[bool, str]:
-        pol = str(security_policy or "auto").strip().lower()
+        # Read policy from config at call-time to avoid relying on closure state.
+        pol = str(cfg.get("security_key_rotation_policy", "auto") or "auto").strip().lower()
         try:
             key_conf = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) if st else 0.0
         except Exception:
@@ -1298,7 +1322,7 @@ def main() -> int:
                         f"{ts_local()} KEY: response suppressed peer={peer_id} initiator=remote reason=recent_response wait={left_s}s",
                     )
                 else:
-                    modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+                    modes_bytes = ",".join(str(m) for m in supported_mc_modes_for_config(cfg)).encode("ascii")
                     wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
                     msg_bytes = b"1,2"
                     mc_bytes = b"1"
@@ -1330,8 +1354,9 @@ def main() -> int:
                         "log",
                         f"{ts_local()} KEY: response sent to {peer_id} initiator=remote event=req_reply retry_confirm={1 if retrying_confirm else 0} frame=KR2 plaintext x25519+hkdf-sha256->aes-256-gcm",
                     )
-                if st and not is_broadcast:
-                    st.await_key_confirm = True
+                if st and not is_broadcast and bool(st.await_key_confirm):
+                    # Receiving peer KR1 must not start a new local confirm loop by itself.
+                    # Only extend timer if we already have our own confirm flow in progress.
                     st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
             else:
                 if st:
@@ -1459,7 +1484,7 @@ def main() -> int:
                 )
 
         def build_ack_text(hops: Optional[int]) -> bytes:
-            parts = ["ACK", "mc=1", f"mc_modes={','.join(str(m) for m in COMPRESSION_MODES)}"]
+            parts = ["ACK", "mc=1", f"mc_modes={','.join(str(m) for m in supported_mc_modes_for_config(cfg))}"]
             if hops is not None:
                 parts.append(f"hops={hops}")
             return "|".join(parts).encode("utf-8")
@@ -1487,7 +1512,7 @@ def main() -> int:
                             for item in m_modes.group(1).split(",")
                             if item != ""
                         }
-                        parsed_modes = {m for m in parsed_modes if m in COMPRESSION_MODES}
+                        parsed_modes = {m for m in parsed_modes if m in set(supported_mc_modes_for_config(cfg))}
                         if parsed_modes:
                             st.compression_modes = set(parsed_modes)
                             st.compression_capable = True
@@ -1734,9 +1759,7 @@ def main() -> int:
                         "mc_zlib": MODE_ZLIB,
                         "mc_bz2": MODE_BZ2,
                         "mc_lzma": MODE_LZMA,
-                        "mc_nltk": MODE_NLTK,
-                        "mc_spacy": MODE_SPACY,
-                        "mc_tensorflow": MODE_TENSORFLOW,
+                        # Legacy / removed experimental mode ids are not supported anymore.
                     }
                     if payload_cmp in label_to_mode:
                         st.compression_modes.add(int(label_to_mode[payload_cmp]))
@@ -1952,7 +1975,7 @@ def main() -> int:
             )
             return
         dest_id = wire_id_from_norm(peer_norm)
-        modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+        modes_bytes = ",".join(str(m) for m in supported_mc_modes_for_config(cfg)).encode("ascii")
         wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
         msg_bytes = b"1,2"
         mc_bytes = b"1"
@@ -2000,7 +2023,7 @@ def main() -> int:
     def send_discovery_broadcast() -> None:
         if not radio_ready or interface is None:
             return
-        modes_bytes = ",".join(str(m) for m in sorted(COMPRESSION_MODES)).encode("ascii")
+        modes_bytes = ",".join(str(m) for m in supported_mc_modes_for_config(cfg)).encode("ascii")
         wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
         msg_bytes = b"1,2"
         mc_bytes = b"1"
@@ -2073,17 +2096,12 @@ def main() -> int:
             "mc_zlib": "ZLIB",
             "mc_bz2": "BZ2",
             "mc_lzma": "LZMA",
-            "mc_nltk": "NLTK",
-            "mc_spacy": "SPACY",
-            "mc_tensorflow": "TENSORFLOW",
+            "mc_zstd": "ZSTD",
             "mc_unknown": "MC",
             "deflate": "DEFLATE",
             "zlib": "ZLIB",
             "bz2": "BZ2",
             "lzma": "LZMA",
-            "nltk": "NLTK",
-            "spacy": "SPACY",
-            "tensorflow": "TENSORFLOW",
         }
         return aliases.get(low, name)
 
@@ -2102,17 +2120,22 @@ def main() -> int:
         use_compact_wire = False
         compression_flag = 0
         cmp_label = "none"
+        cmp_norm_label = "off"
+        packed_blob_len = len(text_bytes)
         cmp_eff_pct: Optional[float] = None
         peer_supports_mc = bool(st.compression_capable)
         peer_supports_msg_v2 = bool(
             (getattr(st, "peer_msg_versions", None) is None)
             or (2 in set(getattr(st, "peer_msg_versions", {1})))
         )
+        local_modes = set(supported_mc_modes_for_config(cfg))
         peer_supported_modes = sorted(
-            {int(m) for m in getattr(st, "compression_modes", set()) if int(m) in COMPRESSION_MODES}
+            {int(m) for m in getattr(st, "compression_modes", set()) if int(m) in local_modes}
         )
         if not peer_supported_modes:
             peer_supported_modes = list(LEGACY_COMPRESSION_MODES)
+        compression_policy = str(cfg.get("compression_policy", "auto") or "auto").strip().lower()
+        compression_force_mode = int(cfg.get("compression_force_mode", int(MODE_DEFLATE)) or int(MODE_DEFLATE))
         plain_fits_one_packet = len(
             build_legacy_wire_payload(
                 created_s=created_s,
@@ -2125,15 +2148,26 @@ def main() -> int:
         ) <= max_plain
         chunks_bytes: list[bytes] = []
         chunks_text: list[str] = []
-        if peer_supports_mc and peer_supports_msg_v2 and (not plain_fits_one_packet):
+        if compression_policy != "off" and peer_supports_mc and peer_supports_msg_v2 and (not plain_fits_one_packet):
             best_blob: Optional[bytes] = None
             best_mode: Optional[int] = None
-            mode_order = list(peer_supported_modes)
+            normalize_mode = str(cfg.get("compression_normalize", "off") or "off").strip().lower()
+            if compression_policy == "force":
+                if compression_force_mode in peer_supported_modes:
+                    mode_order = [compression_force_mode]
+                else:
+                    mode_order = list(peer_supported_modes)
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} COMPRESS: force mode {compression_force_mode} not supported by {peer_norm}, using AUTO",
+                    )
+            else:
+                mode_order = list(peer_supported_modes)
             for mode_try in mode_order:
                 if best_mode is not None and mode_try == best_mode:
                     continue
                 try:
-                    candidate = compress_text(text, mode=mode_try, preserve_case=True)
+                    candidate = compress_text(text, mode=mode_try, preserve_case=True, normalize=normalize_mode)
                 except Exception:
                     continue
                 if (best_blob is None) or (len(candidate) < len(best_blob)):
@@ -2144,7 +2178,15 @@ def main() -> int:
                 use_compact_wire = True
                 compression_flag = 1
                 cmp_label = mode_name(int(best_mode))
+                cmp_norm_label = normalize_mode
+                packed_blob_len = len(best_blob)
                 cmp_eff_pct = compression_efficiency_pct(len(text_bytes), len(best_blob))
+                ui_emit(
+                    "log",
+                    f"{ts_local()} COMPRESS: group={group_id} mode={normalize_compression_name(cmp_label) or cmp_label} "
+                    f"norm={cmp_norm_label} plain={len(text_bytes)} packed={packed_blob_len} "
+                    f"gain={(cmp_eff_pct if cmp_eff_pct is not None else 0.0):.1f}%",
+                )
         if use_compact_wire:
             max_chunk = max(1, max_plain - MSG_V2_HEADER_LEN)
             chunks_bytes = split_bytes(payload_blob, max_chunk)
@@ -2193,6 +2235,7 @@ def main() -> int:
                     "use_compact": bool(use_compact_wire),
                     "compression": compression_flag,
                     "cmp": cmp_label,
+                    "cmp_norm": cmp_norm_label,
                     "cmp_eff_pct": cmp_eff_pct,
                     "created": created,
                     "attempts": 0,
@@ -2207,6 +2250,22 @@ def main() -> int:
                 peer_pending[mid] = rec
             save_state(pending_by_peer)
         append_history("queue", peer_norm, group_id, text, f"parts={total} cmp={cmp_label}")
+        try:
+            comp_stats["total_msgs"] = int(comp_stats.get("total_msgs", 0)) + 1
+            comp_stats["plain_bytes_total"] = int(comp_stats.get("plain_bytes_total", 0)) + int(len(text_bytes))
+            comp_stats["packed_bytes_total"] = int(comp_stats.get("packed_bytes_total", 0)) + int(packed_blob_len)
+            if int(compression_flag) == 1:
+                comp_stats["compressed_msgs"] = int(comp_stats.get("compressed_msgs", 0)) + 1
+                by_mode = dict(comp_stats.get("by_mode", {}) or {})
+                by_norm = dict(comp_stats.get("by_norm", {}) or {})
+                mode_key = str(normalize_compression_name(cmp_label) or cmp_label or "MC")
+                norm_key = str(cmp_norm_label or "off")
+                by_mode[mode_key] = int(by_mode.get(mode_key, 0)) + 1
+                by_norm[norm_key] = int(by_norm.get(norm_key, 0)) + 1
+                comp_stats["by_mode"] = by_mode
+                comp_stats["by_norm"] = by_norm
+        except Exception:
+            pass
         last_activity_ts = time.time()
         if st.key_ready:
             print(f"QUEUE: {group_id} parts={total} bytes={len(text_bytes)} cmp={cmp_label}")
@@ -2219,6 +2278,14 @@ def main() -> int:
     send_window_start_ts = 0.0
     send_window_count = 0
     send_rr_offset = 0
+    comp_stats = {
+        "total_msgs": 0,
+        "compressed_msgs": 0,
+        "plain_bytes_total": 0,
+        "packed_bytes_total": 0,
+        "by_mode": {},
+        "by_norm": {},
+    }
 
     def send_due() -> None:
         nonlocal send_window_start_ts, send_window_count, send_rr_offset
@@ -2438,6 +2505,7 @@ def main() -> int:
         last_health_ts = 0.0
         last_names_refresh_ts = 0.0
         last_rekey_tick_ts = 0.0
+        last_compstats_ts = 0.0
         while True:
             send_due()
             now = time.time()
@@ -2550,6 +2618,32 @@ def main() -> int:
                     "log",
                     f"{ts_local()} HEALTH: peers={len(peers_snapshot)} tracked={len(tracked_peers)} pending={pending_count} avg_rtt={avg_rtt:.2f}s",
                 )
+            if (now - last_compstats_ts) >= 300.0:
+                last_compstats_ts = now
+                try:
+                    total_msgs = int(comp_stats.get("total_msgs", 0) or 0)
+                    comp_msgs = int(comp_stats.get("compressed_msgs", 0) or 0)
+                    plain_total = int(comp_stats.get("plain_bytes_total", 0) or 0)
+                    packed_total = int(comp_stats.get("packed_bytes_total", 0) or 0)
+                    gain_pct = compression_efficiency_pct(plain_total, packed_total)
+                    by_mode = dict(comp_stats.get("by_mode", {}) or {})
+                    by_norm = dict(comp_stats.get("by_norm", {}) or {})
+                    top_mode = "-"
+                    top_norm = "-"
+                    if by_mode:
+                        top_mode = max(by_mode.items(), key=lambda kv: kv[1])[0]
+                    if by_norm:
+                        top_norm = max(by_norm.items(), key=lambda kv: kv[1])[0]
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} COMPSTAT: total={total_msgs} compressed={comp_msgs} "
+                        f"ratio={(100.0 * comp_msgs / max(1, total_msgs)):.1f}% "
+                        f"plain={plain_total} packed={packed_total} "
+                        f"gain={(gain_pct if gain_pct is not None else 0.0):.1f}% "
+                        f"top_mode={top_mode} top_norm={top_norm}",
+                    )
+                except Exception:
+                    pass
             if (now % 60.0) < 0.25:
                 cutoff = now - 3600.0
                 with seen_lock:
@@ -2623,6 +2717,11 @@ def main() -> int:
                 "log": "Log",
                 "settings": "⚙",
                 "settings_title": "Settings",
+                "tab_general": "General",
+                "tab_security": "Security",
+                "tab_compression": "Compression",
+                "tab_log": "Log",
+                "tab_about": "About",
                 "language": "Language",
                 "lang_ru": "Russian",
                 "lang_en": "English",
@@ -2654,7 +2753,6 @@ def main() -> int:
                 "key_request": "Request key",
                 "key_reset": "Reset key",
                 "settings_runtime": "Runtime settings",
-                "settings_restart": "Port/retry/limits apply after reconnect or restart",
                 "port": "Port",
                 "channel": "Channel",
                 "retry": "Retry seconds",
@@ -2687,6 +2785,21 @@ def main() -> int:
                 "security_policy_hint": "Controls what happens when a peer key changes (TOFU).",
                 "session_rekey": "Session rekey (ephemeral)",
                 "session_rekey_hint": "When enabled, periodically refreshes the session key using ephemeral X25519 inside the encrypted channel. This reduces impact of long-term key compromise, but increases control traffic slightly.",
+                "compression_title": "Compression",
+                "compression_policy": "Compression policy",
+                "compression_policy_auto": "AUTO (recommended)",
+                "compression_policy_off": "OFF (disable compression)",
+                "compression_policy_force": "Force algorithm",
+                "compression_force_algo": "Algorithm",
+                "compression_normalize": "Normalization (preprocess)",
+                "compression_normalize_off": "OFF",
+                "compression_normalize_tokens": "Token stream (basic, reversible)",
+                "compression_normalize_sp_vocab": "SentencePiece vocab (reversible)",
+                "compression_normalize_hint": "Normalization runs before compression and is lossless: the receiver reconstructs the exact original text.",
+                # kept for backward config parsing (no longer shown in UI)
+                "compression_allow_zstd": "Zstandard (ZSTD)",
+                "compression_allow_zstd_hint": "Zstandard is a required dependency (requirements.txt).",
+                "compression_force_hint": "Force is applied only when peer supports MC+MSGv2; otherwise AUTO/plain is used.",
                 "security_auto_stale_hours": "Auto accept if key age, h",
                 "security_auto_seen_minutes": "Auto accept if seen within, min",
                 "security_auto_mode": "Auto rule",
@@ -2730,6 +2843,11 @@ def main() -> int:
                 "log": "Лог",
                 "settings": "⚙",
                 "settings_title": "Настройки",
+                "tab_general": "Общие",
+                "tab_security": "Безопасность",
+                "tab_compression": "Сжатие",
+                "tab_log": "Лог",
+                "tab_about": "О программе",
                 "language": "Язык",
                 "lang_ru": "Русский",
                 "lang_en": "Английский",
@@ -2761,7 +2879,6 @@ def main() -> int:
                 "key_request": "Запросить ключ",
                 "key_reset": "Сбросить ключ",
                 "settings_runtime": "Параметры запуска",
-                "settings_restart": "Порт/повтор/лимиты применяются после переподключения или перезапуска",
                 "port": "Порт",
                 "channel": "Канал",
                 "retry": "Повтор, сек",
@@ -2794,6 +2911,21 @@ def main() -> int:
                 "security_policy_hint": "Определяет поведение при смене публичного ключа пира (TOFU).",
                 "session_rekey": "Rekey сессии (ephemeral)",
                 "session_rekey_hint": "Если включено, периодически обновляет ключ сессии через ephemeral X25519 внутри зашифрованного канала. Это снижает эффект компрометации долгоживущего ключа, но чуть увеличивает служебный трафик.",
+                "compression_title": "Сжатие",
+                "compression_policy": "Политика сжатия",
+                "compression_policy_auto": "AUTO (рекомендуется)",
+                "compression_policy_off": "OFF (не сжимать)",
+                "compression_policy_force": "Принудительный алгоритм",
+                "compression_force_algo": "Алгоритм",
+                "compression_normalize": "Нормализация (подготовка)",
+                "compression_normalize_off": "OFF",
+                "compression_normalize_tokens": "Token stream (базовый, обратимый)",
+                "compression_normalize_sp_vocab": "SentencePiece vocab (обратимый)",
+                "compression_normalize_hint": "Нормализация выполняется перед сжатием и обратима: получатель восстановит точный исходный текст.",
+                # kept for backward config parsing (no longer shown in UI)
+                "compression_allow_zstd": "Zstandard (ZSTD)",
+                "compression_allow_zstd_hint": "Zstandard теперь обязательная зависимость (requirements.txt).",
+                "compression_force_hint": "Принудительный режим применяется только при поддержке peer MC+MSGv2; иначе используется AUTO/plain.",
                 "security_auto_stale_hours": "Автопринять если ключ старше, ч",
                 "security_auto_seen_minutes": "Автопринять если был в сети, мин",
                 "security_auto_mode": "Правило AUTO",
@@ -2826,7 +2958,14 @@ def main() -> int:
                 "about_disclaimer": "Отказ от ответственности: ПО «как есть», без гарантий; автор не отвечает за ущерб",
             },
         }
-        cfg: Dict[str, object] = {}
+        # Load persisted config before rendering the UI so Settings reflect saved values.
+        try:
+            cfg_new = load_config()
+            if isinstance(cfg_new, dict):
+                cfg.clear()
+                cfg.update(cfg_new)
+        except Exception:
+            pass
         log_startup = []
         for line in startup_events:
             log_startup.append(line)
@@ -2843,6 +2982,7 @@ def main() -> int:
         hidden_contacts = set(cfg.get("hidden_contacts", []))
         groups_cfg = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
         clear_pending_on_switch = bool(cfg.get("clear_pending_on_switch", True))
+        last_limits_logged: Optional[Tuple[int, int, int, int]] = None
         _STORAGE.set_runtime_log_enabled(runtime_log_file)
         if current_lang not in ("ru", "en"):
             current_lang = "ru"
@@ -3039,6 +3179,25 @@ def main() -> int:
             QLineEdit { background: #2b0a22; border: 1px solid #6f4a7a; padding: 6px; }
             QPushButton { background: #5c3566; border: 1px solid #6f4a7a; padding: 6px 10px; }
             QPushButton:hover { background: #6f4a7a; }
+            QTabWidget::pane { border: 1px solid #6f4a7a; top: -1px; }
+            QTabBar::tab {
+                background: #43264a;
+                color: #efe7f2;
+                border: 1px solid #6f4a7a;
+                border-bottom: 0;
+                padding: 6px 12px;
+                margin-right: 2px;
+                min-height: 22px;
+            }
+            QTabBar::tab:selected {
+                background: #ff9800;
+                color: #2b0a22;
+                font-weight: 700;
+            }
+            QTabBar::tab:!selected:hover {
+                background: #5a3363;
+                color: #ffffff;
+            }
             QMenu { background: #2b0a22; border: 1px solid #6f4a7a; padding: 2px; }
             QMenu::item { padding: 6px 14px; color: #eeeeec; }
             QMenu::item:selected { background: #ff9800; color: #2b0a22; }
@@ -3188,491 +3347,816 @@ def main() -> int:
             nonlocal errors_need_ack
             errors_need_ack = False
             update_status()
-            dlg = QtWidgets.QDialog(win)
-            dlg.setWindowTitle(tr("settings_title"))
-            dlg.resize(820, 600)
-            # Prevent too small window size that would clip numeric fields.
-            dlg.setMinimumSize(760, 560)
-            layout = QtWidgets.QVBoxLayout(dlg)
-            # Settings area is scrollable to keep minimum size usable.
-            settings_scroll = QtWidgets.QScrollArea()
-            settings_scroll.setWidgetResizable(True)
-            settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-            settings_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-            settings_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-            settings_host = QtWidgets.QWidget()
-            settings_host_layout = QtWidgets.QHBoxLayout(settings_host)
-            settings_host_layout.setContentsMargins(0, 0, 0, 0)
-            settings_host_layout.setSpacing(14)
-            left_panel = QtWidgets.QVBoxLayout()
-            left_panel.setContentsMargins(0, 0, 0, 0)
-            left_panel.setSpacing(6)
-            right_panel = QtWidgets.QVBoxLayout()
-            right_panel.setContentsMargins(0, 0, 0, 0)
-            right_panel.setSpacing(6)
-            runtime_title = QtWidgets.QLabel(tr("settings_runtime"))
-            runtime_title.setObjectName("muted")
-            runtime_title.setStyleSheet("font-weight:600;")
-            left_panel.addWidget(runtime_title)
-            runtime_group = QtWidgets.QGroupBox("")
-            runtime_layout = QtWidgets.QFormLayout(runtime_group)
-            runtime_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
-            runtime_layout.setFormAlignment(QtCore.Qt.AlignTop)
-            runtime_layout.setVerticalSpacing(8)
-            runtime_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
 
-            def compact_field(widget, width: int = 240):
-                widget.setMinimumWidth(220)
-                # Avoid comically wide fields on large windows.
-                widget.setMaximumWidth(max(280, int(width)))
-                widget.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
-                return widget
-
-            def bounded_field(widget, width: int = 520) -> QtWidgets.QWidget:
-                """Keep fields readable on small windows but not absurdly wide on large ones."""
-                compact_field(widget, width=width)
-                host = QtWidgets.QWidget()
-                row = QtWidgets.QHBoxLayout(host)
-                row.setContentsMargins(0, 0, 0, 0)
-                row.setSpacing(0)
-                row.addWidget(widget, 0)
-                row.addStretch(1)
-                return host
-
-            def int_text(value, fallback: int) -> str:
+            # Rebuild the dialog when language changes so all labels/hints are translated.
+            while True:
+                dlg = QtWidgets.QDialog(win)
+                dlg.setWindowTitle(tr("settings_title"))
+                dlg.resize(820, 600)
+                dlg.setMinimumSize(760, 560)
+                # Prevent minimizing a modal Settings dialog: a minimized modal can "steal" focus and block the main UI.
                 try:
-                    return str(int(float(value)))
+                    dlg.setWindowFlags(dlg.windowFlags() & ~QtCore.Qt.WindowMinimizeButtonHint)
                 except Exception:
-                    return str(int(fallback))
+                    pass
+                try:
+                    class _NoMinimizeSettings(QtCore.QObject):
+                        def eventFilter(self, obj, event):  # type: ignore[override]
+                            try:
+                                if event.type() == QtCore.QEvent.WindowStateChange:
+                                    if isinstance(obj, QtWidgets.QWidget) and obj.windowState() & QtCore.Qt.WindowMinimized:
+                                        obj.setWindowState(obj.windowState() & ~QtCore.Qt.WindowMinimized)
+                                        obj.showNormal()
+                                        obj.raise_()
+                                        obj.activateWindow()
+                                        return True
+                            except Exception:
+                                pass
+                            return False
 
-            port_edit = QtWidgets.QLineEdit(str(cfg.get("port", args.port)))
-            retry_edit = QtWidgets.QLineEdit(int_text(cfg.get("retry_seconds", args.retry_seconds), int(args.retry_seconds)))
-            maxsec_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_seconds", args.max_seconds), int(args.max_seconds)))
-            maxbytes_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_bytes", args.max_bytes), int(args.max_bytes)))
-            rate_edit = QtWidgets.QLineEdit(int_text(cfg.get("rate_seconds", args.rate_seconds), int(args.rate_seconds)))
-            parallel_edit = QtWidgets.QLineEdit(
-                int_text(
-                    cfg.get("parallel_sends", getattr(args, "parallel_sends", 1)),
-                    int(getattr(args, "parallel_sends", 1) or 1),
+                    _no_min_settings = _NoMinimizeSettings(dlg)
+                    dlg.installEventFilter(_no_min_settings)
+                    dlg._no_min_settings = _no_min_settings  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                layout = QtWidgets.QVBoxLayout(dlg)
+                layout.setContentsMargins(10, 10, 10, 10)
+                layout.setSpacing(10)
+
+                tabs = QtWidgets.QTabWidget(dlg)
+                layout.addWidget(tabs, 1)
+
+                reopen = {"flag": False}
+
+                # -------------------
+                # General tab
+                # -------------------
+                tab_general = QtWidgets.QWidget()
+                tabs.addTab(tab_general, tr("tab_general"))
+                general_layout = QtWidgets.QHBoxLayout(tab_general)
+                general_layout.setContentsMargins(14, 12, 14, 10)
+                general_layout.setSpacing(26)
+
+                left_panel = QtWidgets.QVBoxLayout()
+                left_panel.setContentsMargins(0, 0, 0, 0)
+                left_panel.setSpacing(12)
+                right_panel = QtWidgets.QVBoxLayout()
+                right_panel.setContentsMargins(0, 0, 0, 0)
+                right_panel.setSpacing(12)
+
+                # Keep panels compact; use stretch between them so resizing doesn't inflate either side.
+                general_layout.addLayout(left_panel)
+                general_layout.addStretch(1)
+                general_layout.addLayout(right_panel)
+
+                runtime_title = QtWidgets.QLabel(tr("settings_runtime"))
+                runtime_title.setObjectName("muted")
+                runtime_title.setStyleSheet("font-weight:600;")
+                runtime_title.setContentsMargins(6, 8, 0, 0)
+                left_panel.addWidget(runtime_title)
+
+                runtime_group = QtWidgets.QGroupBox("")
+                runtime_layout = QtWidgets.QFormLayout(runtime_group)
+                runtime_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+                runtime_layout.setFormAlignment(QtCore.Qt.AlignTop)
+                runtime_layout.setVerticalSpacing(6)
+                runtime_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
+                runtime_layout.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+                try:
+                    runtime_layout.setContentsMargins(10, 10, 10, 10)
+                except Exception:
+                    pass
+
+                def compact_field(widget, width: int = 240):
+                    # Keep input fields stable: do not scale with Settings window resizing.
+                    w = max(140, int(width))
+                    try:
+                        widget.setFixedWidth(w)
+                    except Exception:
+                        widget.setMinimumWidth(w)
+                        widget.setMaximumWidth(w)
+                    # Stable height (do not scale by height).
+                    try:
+                        widget.setFixedHeight(28)
+                    except Exception:
+                        pass
+                    widget.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+                    return widget
+
+                def int_text(value, fallback: int) -> str:
+                    try:
+                        return str(int(float(value)))
+                    except Exception:
+                        return str(int(fallback))
+
+                # Port is auto-detected; do not expose it in UI.
+                retry_edit = QtWidgets.QLineEdit(int_text(cfg.get("retry_seconds", args.retry_seconds), int(args.retry_seconds)))
+                maxsec_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_seconds", args.max_seconds), int(args.max_seconds)))
+                maxbytes_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_bytes", args.max_bytes), int(args.max_bytes)))
+                rate_edit = QtWidgets.QLineEdit(int_text(cfg.get("rate_seconds", args.rate_seconds), int(args.rate_seconds)))
+                parallel_edit = QtWidgets.QLineEdit(
+                    int_text(
+                        cfg.get("parallel_sends", getattr(args, "parallel_sends", 1)),
+                        int(getattr(args, "parallel_sends", 1) or 1),
+                    )
                 )
-            )
-            # Ensure numbers stay readable.
-            for _e in (retry_edit, maxsec_edit, maxbytes_edit, rate_edit, parallel_edit):
+
+                compact_field(retry_edit, width=240)
+                compact_field(maxsec_edit, width=240)
+                compact_field(maxbytes_edit, width=240)
+                compact_field(rate_edit, width=240)
+                compact_field(parallel_edit, width=160)
+
+                int_validator = QtGui.QIntValidator(0, 999999, dlg)
+                parallel_validator = QtGui.QIntValidator(1, 128, dlg)
+                retry_edit.setValidator(int_validator)
+                maxsec_edit.setValidator(int_validator)
+                maxbytes_edit.setValidator(int_validator)
+                rate_edit.setValidator(int_validator)
+                parallel_edit.setValidator(parallel_validator)
+
+                runtime_layout.addRow(tr("retry"), retry_edit)
+                retry_hint = QtWidgets.QLabel(tr("hint_retry"))
+                retry_hint.setObjectName("hint")
+                retry_hint.setWordWrap(True)
+                runtime_layout.addRow("", retry_hint)
+
+                runtime_layout.addRow(tr("max_seconds"), maxsec_edit)
+                maxsec_hint = QtWidgets.QLabel(tr("hint_max_seconds"))
+                maxsec_hint.setObjectName("hint")
+                maxsec_hint.setWordWrap(True)
+                runtime_layout.addRow("", maxsec_hint)
+
+                runtime_layout.addRow(tr("max_bytes"), maxbytes_edit)
+                maxbytes_hint = QtWidgets.QLabel(tr("hint_max_bytes"))
+                maxbytes_hint.setObjectName("hint")
+                maxbytes_hint.setWordWrap(True)
+                runtime_layout.addRow("", maxbytes_hint)
+
+                runtime_layout.addRow(tr("rate"), rate_edit)
+                rate_hint = QtWidgets.QLabel(tr("hint_rate"))
+                rate_hint.setObjectName("hint")
+                rate_hint.setWordWrap(True)
+                runtime_layout.addRow("", rate_hint)
+
+                runtime_layout.addRow(tr("parallel_sends"), parallel_edit)
+                parallel_hint = QtWidgets.QLabel(tr("hint_parallel"))
+                parallel_hint.setObjectName("hint")
+                parallel_hint.setWordWrap(True)
+                runtime_layout.addRow("", parallel_hint)
+
+                cb_auto_pacing = QtWidgets.QCheckBox("")
+                cb_auto_pacing.setChecked(bool(cfg.get("auto_pacing", auto_pacing)))
+                runtime_layout.addRow(tr("auto_pacing"), cb_auto_pacing)
+                auto_pacing_hint = QtWidgets.QLabel(tr("hint_auto_pacing"))
+                auto_pacing_hint.setObjectName("hint")
+                auto_pacing_hint.setWordWrap(True)
+                runtime_layout.addRow("", auto_pacing_hint)
+
+                settings_rate_edit = rate_edit
+                settings_parallel_edit = parallel_edit
+                settings_auto_pacing_cb = cb_auto_pacing
+
+                def sync_auto_pacing_fields() -> None:
+                    on = cb_auto_pacing.isChecked()
+                    rate_edit.setEnabled(not on)
+                    parallel_edit.setEnabled(not on)
+
+                sync_auto_pacing_fields()
+                cb_auto_pacing.toggled.connect(lambda _checked: sync_auto_pacing_fields())
+
+                left_panel.addWidget(runtime_group)
+
+                left_panel.addStretch(1)
+
+                lang_title = QtWidgets.QLabel(tr("language"))
+                lang_title.setObjectName("muted")
+                lang_title.setStyleSheet("font-weight:600;")
+                lang_title.setContentsMargins(6, 8, 0, 0)
+                right_panel.addWidget(lang_title)
+
+                lang_group = QtWidgets.QGroupBox("")
+                lang_v = QtWidgets.QVBoxLayout(lang_group)
+                rb_ru = QtWidgets.QRadioButton(tr("lang_ru"))
+                rb_en = QtWidgets.QRadioButton(tr("lang_en"))
+                if current_lang == "en":
+                    rb_en.setChecked(True)
+                else:
+                    rb_ru.setChecked(True)
+                lang_row = QtWidgets.QHBoxLayout()
+                lang_row.setContentsMargins(0, 0, 0, 0)
+                lang_row.addWidget(rb_ru)
+                lang_row.addWidget(rb_en)
+                lang_row.addStretch(1)
+                lang_v.addLayout(lang_row)
+                right_panel.addWidget(lang_group)
+
+                log_title = QtWidgets.QLabel(tr("log") + " (events)")
+                log_title.setObjectName("muted")
+                log_title.setStyleSheet("font-weight:600;")
+                log_title.setContentsMargins(6, 8, 0, 0)
+                # Log settings moved to the Log tab to reduce clutter in General.
+
+                discovery_title = QtWidgets.QLabel(tr("discovery"))
+                discovery_title.setObjectName("muted")
+                discovery_title.setStyleSheet("font-weight:600;")
+                discovery_title.setContentsMargins(6, 8, 0, 0)
+                right_panel.addWidget(discovery_title)
+
+                discovery_group = QtWidgets.QGroupBox("")
+                discovery_v = QtWidgets.QVBoxLayout(discovery_group)
+                cb_discovery_send = QtWidgets.QCheckBox(tr("discovery_send"))
+                cb_discovery_send.setChecked(discovery_send)
+                discovery_v.addWidget(cb_discovery_send)
+                discovery_send_hint = QtWidgets.QLabel(tr("hint_discovery_send"))
+                discovery_send_hint.setObjectName("hint")
+                discovery_send_hint.setWordWrap(True)
+                discovery_v.addWidget(discovery_send_hint)
+
+                cb_discovery_reply = QtWidgets.QCheckBox(tr("discovery_reply"))
+                cb_discovery_reply.setChecked(discovery_reply)
+                discovery_v.addWidget(cb_discovery_reply)
+                discovery_reply_hint = QtWidgets.QLabel(tr("hint_discovery_reply"))
+                discovery_reply_hint.setObjectName("hint")
+                discovery_reply_hint.setWordWrap(True)
+                discovery_v.addWidget(discovery_reply_hint)
+
+                cb_clear_pending = QtWidgets.QCheckBox(tr("clear_pending_on_switch"))
+                cb_clear_pending.setChecked(clear_pending_on_switch)
+                discovery_v.addWidget(cb_clear_pending)
+                clear_pending_hint = QtWidgets.QLabel(tr("hint_clear_pending"))
+                clear_pending_hint.setObjectName("hint")
+                clear_pending_hint.setWordWrap(True)
+                discovery_v.addWidget(clear_pending_hint)
+
+                right_panel.addWidget(discovery_group)
+                right_panel.addStretch(1)
+
+                # -------------------
+                # Security tab
+                # -------------------
+                tab_sec = QtWidgets.QWidget()
+                tabs.addTab(tab_sec, tr("tab_security"))
+                sec_root = QtWidgets.QVBoxLayout(tab_sec)
+                sec_root.setContentsMargins(14, 12, 14, 10)
+                sec_root.setSpacing(12)
+
+                sec_title = QtWidgets.QLabel(tr("security"))
+                sec_title.setObjectName("muted")
+                sec_title.setStyleSheet("font-weight:600;")
+                sec_title.setContentsMargins(6, 8, 0, 0)
+                sec_root.addWidget(sec_title)
+
+                sec_group = QtWidgets.QGroupBox("")
+                sec_layout = QtWidgets.QFormLayout(sec_group)
+                sec_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+                sec_layout.setFormAlignment(QtCore.Qt.AlignTop)
+                sec_layout.setVerticalSpacing(8)
+                sec_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
                 try:
-                    _e.setMinimumContentsLength(10)
+                    sec_layout.setContentsMargins(10, 10, 10, 10)
                 except Exception:
                     pass
-            port_field = bounded_field(port_edit, width=520)
-            retry_field = bounded_field(retry_edit, width=240)
-            maxsec_field = bounded_field(maxsec_edit, width=240)
-            maxbytes_field = bounded_field(maxbytes_edit, width=240)
-            rate_field = bounded_field(rate_edit, width=240)
-            parallel_field = bounded_field(parallel_edit, width=160)
-            int_validator = QtGui.QIntValidator(0, 999999, dlg)
-            parallel_validator = QtGui.QIntValidator(1, 128, dlg)
-            retry_edit.setValidator(int_validator)
-            maxsec_edit.setValidator(int_validator)
-            maxbytes_edit.setValidator(int_validator)
-            rate_edit.setValidator(int_validator)
-            parallel_edit.setValidator(parallel_validator)
-            runtime_layout.addRow(tr("port"), port_field)
-            port_hint = QtWidgets.QLabel(tr("hint_port"))
-            port_hint.setObjectName("hint")
-            port_hint.setWordWrap(True)
-            runtime_layout.addRow("", port_hint)
-            runtime_layout.addRow(tr("retry"), retry_field)
-            retry_hint = QtWidgets.QLabel(tr("hint_retry"))
-            retry_hint.setObjectName("hint")
-            retry_hint.setWordWrap(True)
-            runtime_layout.addRow("", retry_hint)
-            runtime_layout.addRow(tr("max_seconds"), maxsec_field)
-            maxsec_hint = QtWidgets.QLabel(tr("hint_max_seconds"))
-            maxsec_hint.setObjectName("hint")
-            maxsec_hint.setWordWrap(True)
-            runtime_layout.addRow("", maxsec_hint)
-            runtime_layout.addRow(tr("max_bytes"), maxbytes_field)
-            maxbytes_hint = QtWidgets.QLabel(tr("hint_max_bytes"))
-            maxbytes_hint.setObjectName("hint")
-            maxbytes_hint.setWordWrap(True)
-            runtime_layout.addRow("", maxbytes_hint)
-            runtime_layout.addRow(tr("rate"), rate_field)
-            rate_hint = QtWidgets.QLabel(tr("hint_rate"))
-            rate_hint.setObjectName("hint")
-            rate_hint.setWordWrap(True)
-            runtime_layout.addRow("", rate_hint)
-            runtime_layout.addRow(tr("parallel_sends"), parallel_field)
-            parallel_hint = QtWidgets.QLabel(tr("hint_parallel"))
-            parallel_hint.setObjectName("hint")
-            parallel_hint.setWordWrap(True)
-            runtime_layout.addRow("", parallel_hint)
-            cb_auto_pacing = QtWidgets.QCheckBox("")
-            cb_auto_pacing.setChecked(bool(cfg.get("auto_pacing", auto_pacing)))
-            runtime_layout.addRow(tr("auto_pacing"), cb_auto_pacing)
-            auto_pacing_hint = QtWidgets.QLabel(tr("hint_auto_pacing"))
-            auto_pacing_hint.setObjectName("hint")
-            auto_pacing_hint.setWordWrap(True)
-            runtime_layout.addRow("", auto_pacing_hint)
-            settings_rate_edit = rate_edit
-            settings_parallel_edit = parallel_edit
-            settings_auto_pacing_cb = cb_auto_pacing
 
-            def sync_auto_pacing_fields() -> None:
-                on = cb_auto_pacing.isChecked()
-                rate_edit.setEnabled(not on)
-                parallel_edit.setEnabled(not on)
-
-            sync_auto_pacing_fields()
-            cb_auto_pacing.toggled.connect(lambda _checked: sync_auto_pacing_fields())
-            left_panel.addWidget(runtime_group)
-            restart_label = QtWidgets.QLabel(tr("settings_restart"))
-            restart_label.setObjectName("hint")
-            restart_label.setWordWrap(True)
-            left_panel.addWidget(restart_label)
-            lang_label = QtWidgets.QLabel(tr("language"))
-            right_panel.addWidget(lang_label)
-            rb_ru = QtWidgets.QRadioButton(tr("lang_ru"))
-            rb_en = QtWidgets.QRadioButton(tr("lang_en"))
-            if current_lang == "en":
-                rb_en.setChecked(True)
-            else:
-                rb_ru.setChecked(True)
-            lang_row = QtWidgets.QHBoxLayout()
-            lang_row.setContentsMargins(0, 0, 0, 0)
-            lang_row.addWidget(rb_ru)
-            lang_row.addWidget(rb_en)
-            lang_row.addStretch(1)
-            right_panel.addLayout(lang_row)
-            log_label = QtWidgets.QLabel(tr("log") + " (events)")
-            log_label.setObjectName("muted")
-            right_panel.addWidget(log_label)
-            cb_verbose = QtWidgets.QCheckBox(tr("verbose_events"))
-            cb_verbose.setChecked(verbose_log)
-            right_panel.addWidget(cb_verbose)
-            verbose_hint = QtWidgets.QLabel(tr("hint_verbose"))
-            verbose_hint.setObjectName("hint")
-            verbose_hint.setWordWrap(True)
-            right_panel.addWidget(verbose_hint)
-            cb_runtime_log = QtWidgets.QCheckBox(tr("runtime_log_file"))
-            cb_runtime_log.setChecked(runtime_log_file)
-            right_panel.addWidget(cb_runtime_log)
-            runtime_log_hint = QtWidgets.QLabel(tr("hint_runtime_log_file"))
-            runtime_log_hint.setObjectName("hint")
-            runtime_log_hint.setWordWrap(True)
-            right_panel.addWidget(runtime_log_hint)
-            discovery_label = QtWidgets.QLabel(tr("discovery"))
-            discovery_label.setObjectName("muted")
-            right_panel.addWidget(discovery_label)
-            cb_discovery_send = QtWidgets.QCheckBox(tr("discovery_send"))
-            cb_discovery_send.setChecked(discovery_send)
-            right_panel.addWidget(cb_discovery_send)
-            discovery_send_hint = QtWidgets.QLabel(tr("hint_discovery_send"))
-            discovery_send_hint.setObjectName("hint")
-            discovery_send_hint.setWordWrap(True)
-            right_panel.addWidget(discovery_send_hint)
-            cb_discovery_reply = QtWidgets.QCheckBox(tr("discovery_reply"))
-            cb_discovery_reply.setChecked(discovery_reply)
-            right_panel.addWidget(cb_discovery_reply)
-            discovery_reply_hint = QtWidgets.QLabel(tr("hint_discovery_reply"))
-            discovery_reply_hint.setObjectName("hint")
-            discovery_reply_hint.setWordWrap(True)
-            right_panel.addWidget(discovery_reply_hint)
-            cb_clear_pending = QtWidgets.QCheckBox(tr("clear_pending_on_switch"))
-            cb_clear_pending.setChecked(clear_pending_on_switch)
-            right_panel.addWidget(cb_clear_pending)
-            clear_pending_hint = QtWidgets.QLabel(tr("hint_clear_pending"))
-            clear_pending_hint.setObjectName("hint")
-            clear_pending_hint.setWordWrap(True)
-            right_panel.addWidget(clear_pending_hint)
-
-            security_label = QtWidgets.QLabel(tr("security"))
-            security_label.setObjectName("muted")
-            right_panel.addWidget(security_label)
-            sec_group = QtWidgets.QGroupBox("")
-            sec_layout = QtWidgets.QFormLayout(sec_group)
-            sec_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
-            sec_layout.setFormAlignment(QtCore.Qt.AlignTop)
-            sec_layout.setVerticalSpacing(8)
-            sec_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
-
-            sec_policy = QtWidgets.QComboBox()
-            sec_policy.addItem(tr("security_policy_auto"), "auto")
-            sec_policy.addItem(tr("security_policy_strict"), "strict")
-            sec_policy.addItem(tr("security_policy_always"), "always")
-            try:
-                idx = sec_policy.findData(security_policy)
-                sec_policy.setCurrentIndex(idx if idx >= 0 else 0)
-            except Exception:
-                pass
-            sec_policy_field = bounded_field(sec_policy, width=320)
-            sec_policy_label = QtWidgets.QLabel(tr("security_policy"))
-            sec_policy_label.setWordWrap(True)
-            sec_layout.addRow(sec_policy_label, sec_policy_field)
-            sec_policy_hint = QtWidgets.QLabel(tr("security_auto_hint"))
-            sec_policy_hint.setObjectName("hint")
-            sec_policy_hint.setWordWrap(True)
-            sec_layout.addRow("", sec_policy_hint)
-            cb_rekey = QtWidgets.QCheckBox(tr("session_rekey"))
-            cb_rekey.setChecked(bool(session_rekey_enabled))
-            cb_rekey.setToolTip(tr("session_rekey_hint"))
-            sec_layout.addRow("", cb_rekey)
-            cb_rekey_hint = QtWidgets.QLabel(tr("session_rekey_hint"))
-            cb_rekey_hint.setObjectName("hint")
-            cb_rekey_hint.setWordWrap(True)
-            sec_layout.addRow("", cb_rekey_hint)
-
-            right_panel.addWidget(sec_group)
-
-            # Give runtime params more space than toggles on small widths.
-            left_w = QtWidgets.QWidget()
-            left_w.setLayout(left_panel)
-            right_w = QtWidgets.QWidget()
-            right_w.setLayout(right_panel)
-            settings_host_layout.addWidget(left_w, 2)
-            settings_host_layout.addWidget(right_w, 1)
-            settings_scroll.setWidget(settings_host)
-            layout.addWidget(settings_scroll, 1)
-            log_view = QtWidgets.QTextEdit()
-            log_view.setReadOnly(True)
-            set_mono(log_view, 10)
-            try:
-                log_view.installEventFilter(_no_ctrl_zoom)
-                log_view.viewport().installEventFilter(_no_ctrl_zoom)
-            except Exception:
-                pass
-            layout.addWidget(log_view, 2)
-            nonlocal settings_log_view
-            settings_log_view = log_view
-            copy_row = QtWidgets.QHBoxLayout()
-            copy_row.setContentsMargins(0, 0, 0, 0)
-            copy_row.addStretch(1)
-            btn_clear = QtWidgets.QPushButton(tr("clear_log"))
-            btn_copy = QtWidgets.QPushButton(tr("copy_log"))
-            copy_row.addWidget(btn_clear)
-            copy_row.addWidget(btn_copy)
-            layout.addLayout(copy_row)
-            author_label = QtWidgets.QLabel(
-                f"meshTalk v{VERSION}\n"
-                f"{tr('about_author')}: Anton Vologzhanin\n"
-                f"{tr('about_callsign')}: R3VAF\n"
-                f"{tr('about_telegram')}: @peerat33\n"
-                f"{tr('about_vision')}\n"
-                f"{tr('about_author_position')}\n"
-                f"{tr('about_disclaimer')}"
-            )
-            set_mono(author_label, 9)
-            author_label.setObjectName("muted")
-            layout.addWidget(author_label)
-            danger_row = QtWidgets.QHBoxLayout()
-            danger_row.setContentsMargins(0, 0, 0, 0)
-            danger_row.addStretch(1)
-            btn_full_reset = QtWidgets.QPushButton(tr("full_reset"))
-            btn_full_reset.setStyleSheet(
-                "QPushButton { background:#8f1d1d; border:1px solid #c85a5a; color:#ffecec; font-weight:600; }"
-                "QPushButton:hover { background:#a82424; }"
-            )
-            danger_row.addWidget(btn_full_reset)
-            layout.addLayout(danger_row)
-            buttons = QtWidgets.QDialogButtonBox(
-                QtWidgets.QDialogButtonBox.Ok
-                | QtWidgets.QDialogButtonBox.Cancel
-                | QtWidgets.QDialogButtonBox.Apply
-            )
-            layout.addWidget(buttons)
-            for text, level in log_buffer[-500:]:
-                log_append_view(log_view, text, level)
-
-            def parse_int_field(edit: QtWidgets.QLineEdit, default: int) -> int:
+                sec_policy = QtWidgets.QComboBox()
+                sec_policy.addItem(tr("security_policy_auto"), "auto")
+                sec_policy.addItem(tr("security_policy_strict"), "strict")
+                sec_policy.addItem(tr("security_policy_always"), "always")
                 try:
-                    raw = edit.text().strip()
-                    return int(raw) if raw else int(default)
-                except Exception:
-                    return int(default)
-
-            def apply_settings(close_dialog: bool) -> None:
-                nonlocal verbose_log, runtime_log_file, auto_pacing, discovery_send, discovery_reply, clear_pending_on_switch
-                nonlocal security_policy, session_rekey_enabled
-                verbose_log = cb_verbose.isChecked()
-                runtime_log_file = cb_runtime_log.isChecked()
-                auto_pacing = cb_auto_pacing.isChecked()
-                _STORAGE.set_runtime_log_enabled(runtime_log_file)
-                prev_send = discovery_send
-                discovery_send = cb_discovery_send.isChecked()
-                discovery_reply = cb_discovery_reply.isChecked()
-                clear_pending_on_switch = cb_clear_pending.isChecked()
-                set_language("ru" if rb_ru.isChecked() else "en", persist=True)
-                cfg["port"] = port_edit.text().strip() or "auto"
-                cfg["retry_seconds"] = parse_int_field(retry_edit, 30)
-                cfg["max_seconds"] = parse_int_field(maxsec_edit, 3600)
-                cfg["max_bytes"] = parse_int_field(maxbytes_edit, 200)
-                cfg["rate_seconds"] = parse_int_field(rate_edit, 30)
-                cfg["parallel_sends"] = max(1, parse_int_field(parallel_edit, 1))
-                cfg["auto_pacing"] = bool(auto_pacing)
-                cfg["discovery_enabled"] = bool(discovery_send and discovery_reply)
-                cfg["discovery_send"] = discovery_send
-                cfg["discovery_reply"] = discovery_reply
-                cfg["runtime_log_file"] = runtime_log_file
-                cfg["clear_pending_on_switch"] = clear_pending_on_switch
-                security_policy = str(sec_policy.currentData() or "auto").strip().lower()
-                if security_policy not in ("auto", "strict", "always"):
-                    security_policy = "auto"
-                cfg["security_key_rotation_policy"] = security_policy
-                session_rekey_enabled = bool(cb_rekey.isChecked())
-                cfg["session_rekey"] = bool(session_rekey_enabled)
-                try:
-                    args.auto_pacing = bool(auto_pacing)
+                    idx = sec_policy.findData(security_policy)
+                    sec_policy.setCurrentIndex(idx if idx >= 0 else 0)
                 except Exception:
                     pass
-                save_gui_config()
-                if discovery_send and not prev_send:
-                    reset_discovery_schedule()
-                    ui_emit("log", f"{ts_local()} DISCOVERY: enabled (burst)")
-                if close_dialog:
-                    dlg.accept()
+                compact_field(sec_policy, width=320)
+                sec_policy_label = QtWidgets.QLabel(tr("security_policy"))
+                sec_policy_label.setWordWrap(True)
+                sec_layout.addRow(sec_policy_label, sec_policy)
+                sec_policy_hint = QtWidgets.QLabel(tr("security_auto_hint"))
+                sec_policy_hint.setObjectName("hint")
+                sec_policy_hint.setWordWrap(True)
+                sec_layout.addRow("", sec_policy_hint)
 
-            def on_accept():
-                apply_settings(close_dialog=True)
+                cb_rekey = QtWidgets.QCheckBox(tr("session_rekey"))
+                cb_rekey.setChecked(bool(session_rekey_enabled))
+                cb_rekey.setToolTip(tr("session_rekey_hint"))
+                sec_layout.addRow("", cb_rekey)
+                cb_rekey_hint = QtWidgets.QLabel(tr("session_rekey_hint"))
+                cb_rekey_hint.setObjectName("hint")
+                cb_rekey_hint.setWordWrap(True)
+                sec_layout.addRow("", cb_rekey_hint)
 
-            def on_apply():
-                apply_settings(close_dialog=False)
-            def on_copy():
+                sec_root.addWidget(sec_group)
+
+                # Place the "Full reset" button centered, but not at the very bottom.
+                sec_root.addSpacing(10)
+                danger_row = QtWidgets.QHBoxLayout()
+                danger_row.setContentsMargins(0, 8, 0, 0)
+                danger_row.addStretch(1)
+                btn_full_reset = QtWidgets.QPushButton(tr("full_reset"))
                 try:
-                    text = log_view.toPlainText().strip()
-                    if not text:
-                        text = "\n".join(t for t, _lvl in log_buffer)
-                    cb = QtWidgets.QApplication.clipboard()
-                    if cb is None:
+                    btn_full_reset.setFixedWidth(220)
+                except Exception:
+                    pass
+                btn_full_reset.setStyleSheet(
+                    "QPushButton { background:#8f1d1d; border:1px solid #c85a5a; color:#ffecec; font-weight:600; }"
+                    "QPushButton:hover { background:#a82424; }"
+                )
+                danger_row.addWidget(btn_full_reset)
+                danger_row.addStretch(1)
+                sec_root.addLayout(danger_row)
+                sec_root.addStretch(1)
+
+                # -------------------
+                # Compression tab
+                # -------------------
+                tab_cmp = QtWidgets.QWidget()
+                tabs.addTab(tab_cmp, tr("tab_compression"))
+                cmp_root = QtWidgets.QVBoxLayout(tab_cmp)
+                cmp_root.setContentsMargins(14, 12, 14, 10)
+                cmp_root.setSpacing(12)
+
+                cmp_title = QtWidgets.QLabel(tr("compression_title"))
+                cmp_title.setObjectName("muted")
+                cmp_title.setStyleSheet("font-weight:600;")
+                cmp_title.setContentsMargins(6, 8, 0, 0)
+                cmp_root.addWidget(cmp_title)
+
+                cmp_group = QtWidgets.QGroupBox("")
+                cmp_layout = QtWidgets.QFormLayout(cmp_group)
+                cmp_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+                cmp_layout.setFormAlignment(QtCore.Qt.AlignTop)
+                cmp_layout.setVerticalSpacing(8)
+                cmp_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+                try:
+                    cmp_layout.setContentsMargins(10, 10, 10, 10)
+                except Exception:
+                    pass
+
+                compression_policy = str(cfg.get("compression_policy", "auto") or "auto").strip().lower()
+                compression_force_mode = int(cfg.get("compression_force_mode", int(MODE_DEFLATE)) or int(MODE_DEFLATE))
+                compression_normalize = str(cfg.get("compression_normalize", "off") or "off").strip().lower()
+                cmp_norm = QtWidgets.QComboBox()
+                cmp_norm.addItem(tr("compression_normalize_off"), "off")
+                cmp_norm.addItem(tr("compression_normalize_tokens"), "tokens")
+                cmp_norm.addItem(tr("compression_normalize_sp_vocab"), "sp_vocab")
+                try:
+                    idx = cmp_norm.findData(compression_normalize)
+                    cmp_norm.setCurrentIndex(idx if idx >= 0 else 0)
+                except Exception:
+                    pass
+                compact_field(cmp_norm, width=320)
+                cmp_layout.addRow(tr("compression_normalize"), cmp_norm)
+                norm_hint = QtWidgets.QLabel(tr("compression_normalize_hint"))
+                norm_hint.setObjectName("hint")
+                norm_hint.setWordWrap(True)
+                cmp_layout.addRow("", norm_hint)
+
+                # Single dropdown: AUTO/OFF or pick an algorithm directly (force).
+                cmp_choice = QtWidgets.QComboBox()
+                cmp_choice.addItem(tr("compression_policy_auto"), "auto")
+                cmp_choice.addItem(tr("compression_policy_off"), "off")
+                cmp_choice.addItem("DEFLATE", int(MODE_DEFLATE))
+                cmp_choice.addItem("ZLIB", int(MODE_ZLIB))
+                cmp_choice.addItem("BZ2", int(MODE_BZ2))
+                cmp_choice.addItem("LZMA", int(MODE_LZMA))
+                # ZSTD: required dependency, but keep disabled if import failed (broken install).
+                cmp_choice.addItem("ZSTD", int(MODE_ZSTD))
+                try:
+                    model = cmp_choice.model()
+                    if model is not None:
+                        item = model.item(cmp_choice.count() - 1)
+                        if item is not None and not _ZSTD_AVAILABLE:
+                            item.setEnabled(False)
+                except Exception:
+                    pass
+
+                # Apply stored policy/mode into the single dropdown.
+                try:
+                    if compression_policy == "off":
+                        idx = cmp_choice.findData("off")
+                    elif compression_policy == "force":
+                        idx = cmp_choice.findData(int(compression_force_mode))
+                    else:
+                        idx = cmp_choice.findData("auto")
+                    cmp_choice.setCurrentIndex(idx if idx >= 0 else 0)
+                except Exception:
+                    pass
+                compact_field(cmp_choice, width=320)
+                cmp_layout.addRow(tr("compression_policy"), cmp_choice)
+                force_hint = QtWidgets.QLabel(tr("compression_force_hint"))
+                force_hint.setObjectName("hint")
+                force_hint.setWordWrap(True)
+                cmp_layout.addRow("", force_hint)
+
+                cmp_root.addWidget(cmp_group)
+                cmp_root.addStretch(1)
+
+                # -------------------
+                # Log tab
+                # -------------------
+                tab_log = QtWidgets.QWidget()
+                tabs.addTab(tab_log, tr("tab_log"))
+                tab_log_l = QtWidgets.QVBoxLayout(tab_log)
+                tab_log_l.setContentsMargins(14, 12, 14, 10)
+                tab_log_l.setSpacing(10)
+
+                # Log settings (moved from General tab).
+                cb_verbose = QtWidgets.QCheckBox(tr("verbose_events"))
+                cb_verbose.setChecked(verbose_log)
+                tab_log_l.addWidget(cb_verbose)
+                verbose_hint = QtWidgets.QLabel(tr("hint_verbose"))
+                verbose_hint.setObjectName("hint")
+                verbose_hint.setWordWrap(True)
+                tab_log_l.addWidget(verbose_hint)
+
+                cb_runtime_log = QtWidgets.QCheckBox(tr("runtime_log_file"))
+                cb_runtime_log.setChecked(runtime_log_file)
+                tab_log_l.addWidget(cb_runtime_log)
+                runtime_log_hint = QtWidgets.QLabel(tr("hint_runtime_log_file"))
+                runtime_log_hint.setObjectName("hint")
+                runtime_log_hint.setWordWrap(True)
+                tab_log_l.addWidget(runtime_log_hint)
+
+                try:
+                    sep = QtWidgets.QFrame()
+                    sep.setFrameShape(QtWidgets.QFrame.HLine)
+                    sep.setFrameShadow(QtWidgets.QFrame.Sunken)
+                    tab_log_l.addWidget(sep)
+                except Exception:
+                    pass
+
+                log_view = QtWidgets.QTextEdit()
+                log_view.setReadOnly(True)
+                set_mono(log_view, 10)
+                try:
+                    log_view.installEventFilter(_no_ctrl_zoom)
+                    log_view.viewport().installEventFilter(_no_ctrl_zoom)
+                except Exception:
+                    pass
+                tab_log_l.addWidget(log_view, 1)
+                nonlocal settings_log_view
+                settings_log_view = log_view
+
+                copy_row = QtWidgets.QHBoxLayout()
+                copy_row.setContentsMargins(0, 0, 0, 0)
+                copy_row.addStretch(1)
+                btn_clear = QtWidgets.QPushButton(tr("clear_log"))
+                btn_copy = QtWidgets.QPushButton(tr("copy_log"))
+                copy_row.addWidget(btn_clear)
+                copy_row.addWidget(btn_copy)
+                tab_log_l.addLayout(copy_row)
+
+                # -------------------
+                # About tab
+                # -------------------
+                tab_about = QtWidgets.QWidget()
+                tabs.addTab(tab_about, tr("tab_about"))
+                about_l = QtWidgets.QVBoxLayout(tab_about)
+                about_l.setContentsMargins(14, 12, 14, 10)
+                about_l.setSpacing(10)
+
+                author_label = QtWidgets.QLabel(
+                    f"meshTalk v{VERSION}\n"
+                    f"{tr('about_author')}: Anton Vologzhanin\n"
+                    f"{tr('about_callsign')}: R3VAF\n"
+                    f"{tr('about_telegram')}: @peerat33\n"
+                    f"{tr('about_vision')}\n"
+                    f"{tr('about_author_position')}\n"
+                    f"{tr('about_disclaimer')}"
+                )
+                set_mono(author_label, 10)
+                author_label.setObjectName("muted")
+                author_label.setWordWrap(True)
+                about_l.addWidget(author_label)
+                about_l.addStretch(1)
+
+                # Custom bottom buttons to enforce consistent order and styling:
+                # OK, Cancel, Apply (left-to-right), without theme icons.
+                btn_row = QtWidgets.QHBoxLayout()
+                btn_row.setContentsMargins(0, 0, 0, 0)
+                btn_row.addStretch(1)
+
+                if current_lang == "en":
+                    ok_text, cancel_text, apply_text = ("OK", "Cancel", "Apply")
+                else:
+                    ok_text, cancel_text, apply_text = ("ОК", "Отмена", "Применить")
+                btn_ok = QtWidgets.QPushButton(ok_text)
+                btn_cancel = QtWidgets.QPushButton(cancel_text)
+                btn_apply = QtWidgets.QPushButton(apply_text)
+                try:
+                    btn_ok.setIcon(QtGui.QIcon())
+                    btn_cancel.setIcon(QtGui.QIcon())
+                    btn_apply.setIcon(QtGui.QIcon())
+                except Exception:
+                    pass
+
+                btn_ok.setStyleSheet(
+                    "QPushButton { background:#1f6f3a; border:1px solid #2fa760; color:#eafff1; font-weight:600; }"
+                    "QPushButton:hover { background:#238042; }"
+                    "QPushButton:pressed { background:#1a5f32; }"
+                )
+                btn_apply.setStyleSheet(
+                    "QPushButton { background:#1f6f3a; border:1px solid #2fa760; color:#eafff1; font-weight:600; }"
+                    "QPushButton:hover { background:#238042; }"
+                    "QPushButton:pressed { background:#1a5f32; }"
+                )
+                btn_cancel.setStyleSheet(
+                    "QPushButton { background:#8f1d1d; border:1px solid #c85a5a; color:#ffecec; font-weight:600; }"
+                    "QPushButton:hover { background:#a82424; }"
+                    "QPushButton:pressed { background:#7b1818; }"
+                )
+
+                btn_row.addWidget(btn_ok)
+                btn_row.addWidget(btn_cancel)
+                btn_row.addWidget(btn_apply)
+                layout.addLayout(btn_row)
+
+                for text, level in log_buffer[-500:]:
+                    log_append_view(log_view, text, level)
+
+                def parse_int_field(edit: QtWidgets.QLineEdit, default: int) -> int:
+                    try:
+                        raw = edit.text().strip()
+                        return int(raw) if raw else int(default)
+                    except Exception:
+                        return int(default)
+
+                def apply_settings(close_dialog: bool) -> None:
+                    nonlocal verbose_log, runtime_log_file, auto_pacing, discovery_send, discovery_reply, clear_pending_on_switch
+                    nonlocal security_policy, session_rekey_enabled
+                    nonlocal max_plain, current_lang, last_limits_logged
+                    verbose_log = cb_verbose.isChecked()
+                    runtime_log_file = cb_runtime_log.isChecked()
+                    auto_pacing = cb_auto_pacing.isChecked()
+                    _STORAGE.set_runtime_log_enabled(runtime_log_file)
+                    prev_send = discovery_send
+                    discovery_send = cb_discovery_send.isChecked()
+                    discovery_reply = cb_discovery_reply.isChecked()
+                    clear_pending_on_switch = cb_clear_pending.isChecked()
+
+                    prev_lang = current_lang
+                    next_lang = "ru" if rb_ru.isChecked() else "en"
+                    cfg["lang"] = next_lang
+                    if prev_lang != next_lang:
+                        set_language(next_lang, persist=False)
+                    else:
+                        current_lang = next_lang
+
+                    # Port is auto-detected.
+                    cfg["port"] = "auto"
+                    cfg["retry_seconds"] = parse_int_field(retry_edit, 30)
+                    cfg["max_seconds"] = parse_int_field(maxsec_edit, 3600)
+                    cfg["max_bytes"] = parse_int_field(maxbytes_edit, 200)
+                    cfg["rate_seconds"] = parse_int_field(rate_edit, 30)
+                    cfg["parallel_sends"] = max(1, parse_int_field(parallel_edit, 1))
+                    cfg["auto_pacing"] = bool(auto_pacing)
+                    cfg["discovery_enabled"] = bool(discovery_send and discovery_reply)
+                    cfg["discovery_send"] = discovery_send
+                    cfg["discovery_reply"] = discovery_reply
+                    cfg["runtime_log_file"] = runtime_log_file
+                    cfg["clear_pending_on_switch"] = clear_pending_on_switch
+
+                    # Compression settings
+                    choice = cmp_choice.currentData()
+                    if choice == "off":
+                        cfg["compression_policy"] = "off"
+                    elif choice == "auto":
+                        cfg["compression_policy"] = "auto"
+                    else:
+                        cfg["compression_policy"] = "force"
+                        try:
+                            cfg["compression_force_mode"] = int(choice)
+                        except Exception:
+                            cfg["compression_force_mode"] = int(MODE_DEFLATE)
+                    cfg["compression_normalize"] = str(cmp_norm.currentData() or "off").strip().lower()
+                    # ZSTD is a required dependency; keep no per-user toggle.
+
+                    # Apply numeric settings immediately.
+                    try:
+                        args.retry_seconds = int(cfg["retry_seconds"])
+                        args.max_seconds = int(cfg["max_seconds"])
+                        args.max_bytes = int(cfg["max_bytes"])
+                        args.rate_seconds = int(cfg["rate_seconds"])
+                        args.parallel_sends = int(cfg["parallel_sends"])
+                    except Exception:
+                        pass
+                    try:
+                        max_plain = max(0, int(getattr(args, "max_bytes", 200) or 200) - int(PAYLOAD_OVERHEAD))
+                    except Exception:
+                        pass
+
+                    security_policy = str(sec_policy.currentData() or "auto").strip().lower()
+                    if security_policy not in ("auto", "strict", "always"):
+                        security_policy = "auto"
+                    cfg["security_key_rotation_policy"] = security_policy
+                    session_rekey_enabled = bool(cb_rekey.isChecked())
+                    cfg["session_rekey"] = bool(session_rekey_enabled)
+                    try:
+                        args.auto_pacing = bool(auto_pacing)
+                    except Exception:
+                        pass
+
+                    # One diagnostic line when auto pacing is toggled (avoid spam).
+                    try:
+                        prev_auto = bool(getattr(args, "_prev_auto_pacing", auto_pacing))
+                        setattr(args, "_prev_auto_pacing", bool(auto_pacing))
+                        if bool(prev_auto) != bool(auto_pacing):
+                            state = "enabled" if auto_pacing else "disabled"
+                            log_line(
+                                f"{ts_local()} PACE: {state} rate={int(getattr(args, 'rate_seconds', 30) or 30)}s "
+                                f"parallel={int(getattr(args, 'parallel_sends', 1) or 1)}",
+                                "pace",
+                            )
+                    except Exception:
+                        pass
+
+                    # Confirm runtime application of limits in the log.
+                    try:
+                        limits_now = (
+                            int(getattr(args, "max_bytes", 200) or 200),
+                            int(max_plain),
+                            int(getattr(args, "retry_seconds", 30) or 30),
+                            int(getattr(args, "max_seconds", 3600) or 3600),
+                        )
+                        if limits_now != last_limits_logged:
+                            log_line(
+                                f"{ts_local()} LIMITS: max_bytes={limits_now[0]} "
+                                f"max_plain={limits_now[1]} retry={limits_now[2]}s max={limits_now[3]}s",
+                                "info",
+                            )
+                            last_limits_logged = limits_now
+                    except Exception:
+                        pass
+
+                    save_gui_config()
+                    if discovery_send and not prev_send:
+                        reset_discovery_schedule()
+                        ui_emit("log", f"{ts_local()} DISCOVERY: enabled (burst)")
+
+                    if close_dialog:
+                        dlg.accept()
                         return
-                    cb.setText(text)
+                    if prev_lang != next_lang:
+                        reopen["flag"] = True
+                        dlg.accept()
+                        return
+
+                def on_accept():
+                    apply_settings(close_dialog=True)
+
+                def on_apply():
+                    apply_settings(close_dialog=False)
+
+                def on_copy():
                     try:
-                        cb.setText(text, QtGui.QClipboard.Mode.Clipboard)
+                        text = log_view.toPlainText().strip()
+                        if not text:
+                            text = "\n".join(t for t, _lvl in log_buffer)
+                        cb = QtWidgets.QApplication.clipboard()
+                        if cb is None:
+                            return
+                        cb.setText(text)
+                        try:
+                            cb.setText(text, QtGui.QClipboard.Mode.Clipboard)
+                        except Exception:
+                            pass
+                        try:
+                            cb.setText(text, QtGui.QClipboard.Mode.Selection)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
+
+                def on_clear():
                     try:
-                        cb.setText(text, QtGui.QClipboard.Mode.Selection)
+                        log_buffer.clear()
+                        if settings_log_view is not None:
+                            settings_log_view.clear()
+                        _STORAGE.clear_runtime_log()
                     except Exception:
                         pass
-                except Exception:
-                    pass
-            def on_clear():
-                try:
+
+                def on_full_reset():
+                    nonlocal current_lang, verbose_log, runtime_log_file
+                    nonlocal discovery_send, discovery_reply, clear_pending_on_switch
+                    if not self_id or not priv_path or not pub_path:
+                        QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_unavailable"))
+                        return
+                    name = norm_id_for_wire(self_id)
+                    reply = QtWidgets.QMessageBox.warning(
+                        win,
+                        "meshTalk",
+                        tr("full_reset_confirm").format(name=name),
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if reply != QtWidgets.QMessageBox.Yes:
+                        return
+                    import shutil
+
+                    # Clear in-memory profile state first so UI immediately reflects reset.
+                    with pending_lock:
+                        pending_by_peer.clear()
+                    incoming_state.clear()
+                    with seen_lock:
+                        seen_msgs.clear()
+                        seen_parts.clear()
+                    key_response_last_ts.clear()
+                    tracked_peers.clear()
+                    known_peers.clear()
+                    peer_states.clear()
+                    with peer_names_lock:
+                        peer_names.clear()
+                    dialogs.clear()
+                    chat_history.clear()
+                    list_index.clear()
+                    groups.clear()
+                    pinned_dialogs.clear()
+                    hidden_contacts.clear()
+                    cfg.clear()
                     log_buffer.clear()
                     if settings_log_view is not None:
                         settings_log_view.clear()
-                    _STORAGE.clear_runtime_log()
-                except Exception:
-                    pass
-            def on_full_reset():
-                nonlocal current_lang, verbose_log, runtime_log_file
-                nonlocal discovery_send, discovery_reply, clear_pending_on_switch
-                if not self_id or not priv_path or not pub_path:
-                    QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_unavailable"))
-                    return
-                name = norm_id_for_wire(self_id)
-                reply = QtWidgets.QMessageBox.warning(
-                    win,
-                    "meshTalk",
-                    tr("full_reset_confirm").format(name=name),
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No,
-                )
-                if reply != QtWidgets.QMessageBox.Yes:
-                    return
-                import shutil
-                # Clear in-memory profile state first so UI immediately reflects reset.
-                with pending_lock:
-                    pending_by_peer.clear()
-                incoming_state.clear()
-                with seen_lock:
-                    seen_msgs.clear()
-                    seen_parts.clear()
-                key_response_last_ts.clear()
-                tracked_peers.clear()
-                known_peers.clear()
-                peer_states.clear()
-                with peer_names_lock:
-                    peer_names.clear()
-                dialogs.clear()
-                chat_history.clear()
-                list_index.clear()
-                groups.clear()
-                pinned_dialogs.clear()
-                hidden_contacts.clear()
-                cfg.clear()
-                log_buffer.clear()
-                if settings_log_view is not None:
-                    settings_log_view.clear()
-                # Delete persisted profile files.
-                for path in (CONFIG_FILE, STATE_FILE, HISTORY_FILE, INCOMING_FILE, RUNTIME_LOG_FILE):
+
+                    # Delete persisted profile files.
+                    for path in (CONFIG_FILE, STATE_FILE, HISTORY_FILE, INCOMING_FILE, RUNTIME_LOG_FILE):
+                        try:
+                            if os.path.isfile(path):
+                                os.remove(path)
+                        except Exception:
+                            pass
                     try:
-                        if os.path.isfile(path):
-                            os.remove(path)
+                        if os.path.isdir(keydir):
+                            shutil.rmtree(keydir, ignore_errors=True)
                     except Exception:
                         pass
-                try:
-                    if os.path.isdir(keydir):
-                        shutil.rmtree(keydir, ignore_errors=True)
-                except Exception:
-                    pass
-                try:
-                    os.makedirs(keydir, exist_ok=True)
-                except Exception:
-                    pass
-                # New storage key for history/state at rest.
-                _STORAGE.set_paths(
-                    config_file=CONFIG_FILE,
-                    state_file=STATE_FILE,
-                    history_file=HISTORY_FILE,
-                    incoming_file=INCOMING_FILE,
-                    runtime_log_file=RUNTIME_LOG_FILE,
-                    keydir=keydir,
-                )
-                ensure_storage_key()
-                # Reset runtime options to defaults.
-                current_lang = "ru"
-                verbose_log = True
-                runtime_log_file = False
-                auto_pacing = True
-                discovery_send = False
-                discovery_reply = False
-                clear_pending_on_switch = True
-                _STORAGE.set_runtime_log_enabled(runtime_log_file)
-                try:
-                    args.retry_seconds = 30
-                    args.max_seconds = 3600
-                    args.max_bytes = 200
-                    args.rate_seconds = 30
-                    args.parallel_sends = 1
-                    args.auto_pacing = True
-                except Exception:
-                    pass
-                # Recreate local keypair for current profile.
-                regenerate_keys()
-                try:
-                    search_field.clear()
-                    msg_entry.clear()
-                    chat_text.clear()
-                    items_list.clear()
-                except Exception:
-                    pass
-                apply_language()
-                select_dialog(None)
-                refresh_list()
-                log_line(f"{ts_local()} RESET: full profile reset completed", "warn")
-                QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_done"))
-                dlg.accept()
-            buttons.accepted.connect(on_accept)
-            buttons.rejected.connect(dlg.reject)
-            btn_apply = buttons.button(QtWidgets.QDialogButtonBox.Apply)
-            if btn_apply is not None:
+                    try:
+                        os.makedirs(keydir, exist_ok=True)
+                    except Exception:
+                        pass
+
+                    # New storage key for history/state at rest.
+                    _STORAGE.set_paths(
+                        config_file=CONFIG_FILE,
+                        state_file=STATE_FILE,
+                        history_file=HISTORY_FILE,
+                        incoming_file=INCOMING_FILE,
+                        runtime_log_file=RUNTIME_LOG_FILE,
+                        keydir=keydir,
+                    )
+                    ensure_storage_key()
+
+                    # Reset runtime options to defaults.
+                    current_lang = "ru"
+                    verbose_log = True
+                    runtime_log_file = False
+                    auto_pacing = True
+                    discovery_send = False
+                    discovery_reply = False
+                    clear_pending_on_switch = True
+                    _STORAGE.set_runtime_log_enabled(runtime_log_file)
+                    try:
+                        args.retry_seconds = 30
+                        args.max_seconds = 3600
+                        args.max_bytes = 200
+                        args.rate_seconds = 30
+                        args.parallel_sends = 1
+                        args.auto_pacing = True
+                    except Exception:
+                        pass
+
+                    regenerate_keys()
+                    try:
+                        search_field.clear()
+                        msg_entry.clear()
+                        chat_text.clear()
+                        items_list.clear()
+                    except Exception:
+                        pass
+                    apply_language()
+                    select_dialog(None)
+                    refresh_list()
+                    log_line(f"{ts_local()} RESET: full profile reset completed", "warn")
+                    QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_done"))
+                    dlg.accept()
+
+                btn_ok.clicked.connect(on_accept)
+                btn_cancel.clicked.connect(dlg.reject)
                 btn_apply.clicked.connect(on_apply)
-            btn_copy.clicked.connect(on_copy)
-            btn_clear.clicked.connect(on_clear)
-            btn_full_reset.clicked.connect(on_full_reset)
-            dlg.exec()
-            settings_log_view = None
-            settings_rate_edit = None
-            settings_parallel_edit = None
-            settings_auto_pacing_cb = None
+                btn_copy.clicked.connect(on_copy)
+                btn_clear.clicked.connect(on_clear)
+                btn_full_reset.clicked.connect(on_full_reset)
+
+                dlg.exec()
+
+                settings_log_view = None
+                settings_rate_edit = None
+                settings_parallel_edit = None
+                settings_auto_pacing_cb = None
+
+                if reopen["flag"]:
+                    continue
+                break
 
         settings_btn.clicked.connect(open_settings)
         click_state = {"last_ts": 0.0, "count": 0}
@@ -4339,6 +4823,7 @@ def main() -> int:
             nonlocal current_lang
             if lang not in ("ru", "en"):
                 lang = "ru"
+            changed = (lang != current_lang)
             current_lang = lang
             if persist:
                 save_gui_config()
@@ -4352,7 +4837,8 @@ def main() -> int:
             win.update()
             win.repaint()
             app.processEvents()
-            print(f"GUI: lang={current_lang}")
+            if changed:
+                print(f"GUI: lang={current_lang}")
 
         set_language(current_lang, persist=False)
 
@@ -5214,6 +5700,8 @@ def main() -> int:
         def log_append_view(view: QtWidgets.QTextEdit, text: str, level: str) -> None:
             if level == "error":
                 color = "#f92672"
+            elif level == "pace":
+                color = "#a6e22e"
             elif level == "keyok":
                 color = "#ffd75f"
             elif level == "key":
@@ -5223,6 +5711,16 @@ def main() -> int:
                 color = "#66d9ef"
             elif level == "warn":
                 color = "#fd971f"
+            elif level == "health":
+                color = "#6be5b5"
+            elif level == "discovery":
+                color = "#b894ff"
+            elif level == "radio":
+                color = "#74b2ff"
+            elif level == "gui":
+                color = "#e0e0e0"
+            elif level == "queue":
+                color = "#c3b38a"
             else:
                 color = "#8a7f8b"
             append_html(view, text, color)
@@ -5251,6 +5749,18 @@ def main() -> int:
                 # TRACE logs (diagnostics) get their own color in the UI.
                 if "trace:" in low and "traceback" not in low:
                     lvl = "trace"
+                elif "pace:" in low:
+                    lvl = "pace"
+                elif "health:" in low:
+                    lvl = "health"
+                elif "discovery:" in low:
+                    lvl = "discovery"
+                elif "radio:" in low:
+                    lvl = "radio"
+                elif "gui:" in low:
+                    lvl = "gui"
+                elif "queue:" in low:
+                    lvl = "queue"
                 if ("pinned key mismatch" in low) or ("reject invalid public key" in low):
                     lvl = "error"
                 elif ("error" in low) or ("exception" in low) or ("traceback" in low):
@@ -5258,7 +5768,7 @@ def main() -> int:
                     lvl = "error"
                 elif "keyok:" in low:
                     lvl = "keyok"
-                elif "key:" in low:
+                elif ("key:" in low) or ("crypto:" in low):
                     lvl = "key"
             if lvl == "error" and settings_log_view is None:
                 errors_need_ack = True

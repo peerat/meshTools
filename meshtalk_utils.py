@@ -32,9 +32,7 @@ MC_MODE_DEFLATE = 2
 MC_MODE_ZLIB = 3
 MC_MODE_BZ2 = 4
 MC_MODE_LZMA = 5
-MC_MODE_NLTK = 6
-MC_MODE_SPACY = 7
-MC_MODE_TENSORFLOW = 8
+MC_MODE_ZSTD = 9
 HISTORY_TEXT_PREFIX = "b64:"
 HISTORY_TEXT_ENC_PREFIX = "enc1:"
 
@@ -133,9 +131,7 @@ def looks_like_mc_block(data: bytes) -> bool:
         MC_MODE_ZLIB,
         MC_MODE_BZ2,
         MC_MODE_LZMA,
-        MC_MODE_NLTK,
-        MC_MODE_SPACY,
-        MC_MODE_TENSORFLOW,
+        MC_MODE_ZSTD,
     ):
         return False
     if dict_id != MC_DICT_ID:
@@ -347,8 +343,8 @@ def parse_compact_meta(meta_u8: int, body: bytes = b"") -> Tuple[int, Optional[s
     if meta_u8 == 0:
         return (0, None, "none")
     if meta_u8 == 1:
-        # meta=1 is ambiguous with legacy deflate.
-        # Treat as MC only when payload has valid MC header.
+        # In MT-MSG v2 compact framing meta=1 means compressed payload.
+        # Only the first chunk necessarily starts with MC magic; subsequent chunks may not.
         legacy = message_codec_from_id(meta_u8)
         if looks_like_mc_block(body):
             try:
@@ -362,12 +358,11 @@ def parse_compact_meta(meta_u8: int, body: bytes = b"") -> Tuple[int, Optional[s
                 MC_MODE_ZLIB: "mc_zlib",
                 MC_MODE_BZ2: "mc_bz2",
                 MC_MODE_LZMA: "mc_lzma",
-                MC_MODE_NLTK: "mc_nltk",
-                MC_MODE_SPACY: "mc_spacy",
-                MC_MODE_TENSORFLOW: "mc_tensorflow",
+                MC_MODE_ZSTD: "mc_zstd",
             }.get(mc_mode, "mc")
             return (1, legacy, mode_label)
-        return (0, legacy, str(legacy or "none"))
+        # Keep compressed flag; generic label until assembled payload is available.
+        return (1, legacy, "mc")
     legacy_codec = message_codec_from_id(meta_u8)
     return (0, legacy_codec, str(legacy_codec or "none"))
 

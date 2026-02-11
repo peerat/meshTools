@@ -13,21 +13,24 @@ Changed
 ### 0.3.3 (2026-02-10)
 
 Added
-- Wire protocol version advertisement in key-exchange frames (`mt_wire`, `mt_msg`, `mt_mc`) for forward/backward compatibility tracking.
-- Extended wire protocol specification in docs (with explicit versioning).
 - Settings: `parallel_sends` (packets per `rate_seconds` window) to allow short send bursts without waiting for ACK between packets.
 - Settings: `auto_pacing` (adaptive) to auto-tune `rate_seconds`/`parallel_sends` from recent ACK stats.
 - Settings: key rotation policy (`security_key_rotation_policy`) with AUTO/STRICT/ALWAYS and explicit TOFU key-mismatch handling.
 - Session rekey (ephemeral X25519) inside the encrypted channel (`session_rekey`, enabled by default) to refresh per-peer session keys with low additional control traffic.
 - Contact context action: traceroute (Meshtastic `TRACEROUTE_APP`) and post output into dialog.
+- Settings: Compression tab with AUTO/OFF/FORCE policy and reversible normalization options.
+- Tools: build/normalize SentencePiece vocab for reversible normalization (`tools/build_sp_vocab_from_logs.py`, `tools/normalize_sp_vocab.py`).
 
 Changed
 - Traceroute uses retry/backoff policy similar to outgoing sends and shows attempts/hops in message status.
 - Traceroute output resolves node names from Meshtastic node DB as `LongName [Short] !id` and is refreshed periodically.
 - Traceroute and key-exchange events now include detailed diagnostics in runtime log (initiator/reason, retries, timeouts); crypto log lines are highlighted.
 - Contact list: lock icon is shown only for confirmed two-way key exchange and expires after 24 hours; key age/last-seen annotations refined.
-- GUI: prevent Ctrl+wheel zoom in chat/log views; current dialog highlight is darker for clarity.
-- Documentation wording updated to avoid security/privacy guarantees.
+- Settings: log toggles moved to Log tab; Apply now updates retry/limits/rate/parallel immediately (no restart needed); new event type colorization (`PACE`, `HEALTH`, `DISCOVERY`, `RADIO`, `GUI`, `QUEUE`).
+- Compression: added `mc_zstd` mode id and reversible normalizations ("token stream", "SentencePiece vocab") before binary codecs.
+- Dependencies: `zstandard` is now included in `requirements.txt` (no separate optional requirements file).
+- Runtime log: added compression telemetry lines (`COMPRESS` per message and periodic `COMPSTAT` totals with gain/mode/normalization).
+- Settings UI: tab title contrast improved for Windows themes.
 
 ### 0.3.2 (2026-02-10)
 
@@ -38,7 +41,7 @@ Added
 
 Changed
 - Key exchange waits for confirmation: retries until peer confirmation (`KR2`) or verified payload is observed; logs `KEYOK` on confirmed handshake.
-- Text compression selection is automatic; Settings no longer exposes compression choice. Added wire-level aliases `NLTK`/`SPACY`/`TENSORFLOW` mapped to built-in codecs.
+- Text compression selection is automatic; Settings no longer exposes compression choice.
 - Discovery broadcast and `runtime.log` are enabled by default; `.gitignore` updated to keep local artifacts (tests, zips, runtime data) out of git.
 
 Removed
@@ -127,19 +130,24 @@ Removed
 ### 0.3.3 (2026-02-10)
 
 Добавлено
-- Объявление версий wire-протокола в key‑exchange кадрах (`mt_wire`, `mt_msg`, `mt_mc`) для отслеживания совместимости.
-- Расширенная спецификация wire‑протокола в документации (с явным версионированием).
 - Настройки: `parallel_sends` (сколько пакетов можно отправить подряд в одном окне `rate_seconds`) для быстрых отправок без ожидания ACK между пакетами.
 - Настройки: `auto_pacing` (адаптивно) автоподбирает `rate_seconds`/`parallel_sends` по статистике ACK.
 - Настройки: политика смены ключа (`security_key_rotation_policy`) с AUTO/STRICT/ALWAYS и явной обработкой TOFU key-mismatch.
 - Rekey сессии (ephemeral X25519) внутри зашифрованного канала (`session_rekey`, по умолчанию включено) для периодического обновления session key с небольшим служебным трафиком.
 - Действие в контекстном меню контакта: traceroute (Meshtastic `TRACEROUTE_APP`) и вывод результата в диалог.
+- Настройки: вкладка Сжатие с политикой AUTO/OFF/FORCE и вариантами обратимой нормализации.
+- Инструменты: сборка/нормализация SentencePiece vocab для обратимой нормализации (`tools/build_sp_vocab_from_logs.py`, `tools/normalize_sp_vocab.py`).
 
 Изменено
 - Traceroute использует политику повторов/backoff как исходящие отправки и показывает attempts/hops в статусе.
 - Вывод traceroute сопоставляет имена узлов из базы Meshtastic как `LongName [Short] !id` и база периодически обновляется.
 - Traceroute и key exchange пишут подробную диагностику в runtime‑лог (инициатор/причина, повторы, таймауты); строки криптографии подсвечены.
 - Список контактов: замок показывается только при подтвержденном двустороннем обмене и имеет срок валидности 24 часа; уточнены подписи “ключ/в сети”.
+- Settings: настройки лога перенесены на вкладку Log; Apply теперь применяет повтор/лимиты/rate/параллельно сразу (без перезапуска); добавлена цветовая разметка типов событий (`PACE`, `HEALTH`, `DISCOVERY`, `RADIO`, `GUI`, `QUEUE`).
+- Сжатие: добавлен режим `mc_zstd` и обратимые нормализации ("token stream", "SentencePiece vocab") перед бинарными кодеками.
+- Зависимости: `zstandard` включен в `requirements.txt` (без отдельного optional-файла зависимостей).
+- Runtime-лог: добавлены телеметрические строки по сжатию (`COMPRESS` на сообщение и периодический `COMPSTAT` с суммарным выигрышем/режимом/нормализацией).
+- UI настроек: повышен контраст заголовков вкладок для тем Windows.
 
 ### 0.3.2 (2026-02-10)
 
@@ -150,7 +158,7 @@ Removed
 
 Изменено
 - Обмен ключами теперь ждет подтверждения: повторы до `KR2` или появления валидированного payload; в логе появляется `KEYOK` при подтвержденном обмене.
-- Выбор сжатия текста полностью автоматический; настройки выбора алгоритма убраны. Добавлены wire-level алиасы `NLTK`/`SPACY`/`TENSORFLOW` поверх встроенных кодеков.
+- Выбор сжатия текста полностью автоматический; настройки выбора алгоритма убраны.
 - Discovery broadcast и `runtime.log` включены по умолчанию; `.gitignore` обновлен, чтобы локальные артефакты (tests, zip, runtime data) не попадали в git.
 
 Удалено

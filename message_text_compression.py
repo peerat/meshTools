@@ -7,10 +7,16 @@ from __future__ import annotations
 import bz2
 import heapq
 import lzma
+import os
 import re
 import zlib
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    import zstandard as _zstd  # type: ignore
+except Exception:
+    _zstd = None  # required by requirements.txt; keep defensive fallback for broken installs
 
 MAGIC = b"MC"
 VERSION = 1
@@ -22,10 +28,7 @@ MODE_DEFLATE = 2
 MODE_ZLIB = 3
 MODE_BZ2 = 4
 MODE_LZMA = 5
-# NLP profile mode ids are wire-level aliases; encode/decode stays dependency-free.
-MODE_NLTK = 6
-MODE_SPACY = 7
-MODE_TENSORFLOW = 8
+MODE_ZSTD = 9
 SUPPORTED_MODES = (
     MODE_BYTE_DICT,
     MODE_FIXED_BITS,
@@ -33,9 +36,7 @@ SUPPORTED_MODES = (
     MODE_ZLIB,
     MODE_BZ2,
     MODE_LZMA,
-    MODE_NLTK,
-    MODE_SPACY,
-    MODE_TENSORFLOW,
+    MODE_ZSTD,
 )
 MODE_TO_NAME: Dict[int, str] = {
     MODE_BYTE_DICT: "mc_byte_dict",
@@ -44,15 +45,14 @@ MODE_TO_NAME: Dict[int, str] = {
     MODE_ZLIB: "mc_zlib",
     MODE_BZ2: "mc_bz2",
     MODE_LZMA: "mc_lzma",
-    MODE_NLTK: "mc_nltk",
-    MODE_SPACY: "mc_spacy",
-    MODE_TENSORFLOW: "mc_tensorflow",
+    MODE_ZSTD: "mc_zstd",
 }
 
 FLAG_LOWERCASE_USED = 1 << 0
 FLAG_PRESERVE_CASE = 1 << 1
 FLAG_PUNCT_TOKENS_ENABLED = 1 << 2
 FLAG_EXACT_TEXT = 1 << 3
+FLAG_TOKEN_STREAM = 1 << 4  # binary codec payload is a serialized token stream (exact, reversible)
 
 ESCAPE_BYTE = 0xFF
 MAX_ESCAPE_TOKEN_BYTES = 64
@@ -88,6 +88,147 @@ DEFAULT_PHRASES = [
     "в процессе",
     "начали прием",
 ]
+
+_SP_VOCAB_CACHE: Optional[List[str]] = None
+_SP_TRIE_CACHE: Optional[dict] = None
+
+
+def _unescape_vocab_token(s: str) -> str:
+    """Decode simple escapes in vocab file lines.
+
+    Supported:
+    - \\s => space
+    - \\t => tab
+    - \\n => newline
+    - \\\\ => backslash
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= len(s):
+            out.append("\\")
+            break
+        nxt = s[i + 1]
+        if nxt == "s":
+            out.append(" ")
+            i += 2
+        elif nxt == "t":
+            out.append("\t")
+            i += 2
+        elif nxt == "n":
+            out.append("\n")
+            i += 2
+        elif nxt == "\\":
+            out.append("\\")
+            i += 2
+        else:
+            out.append("\\")
+            out.append(nxt)
+            i += 2
+    return "".join(out)
+
+
+def _load_sentencepiece_vocab_tokens() -> List[str]:
+    """Load optional SentencePiece-derived vocab tokens from disk.
+
+    This is NOT the sentencepiece runtime.
+    We only use a static list of literal substrings for a reversible token-stream normalization.
+    Receiver does not need any external libs.
+    """
+    global _SP_VOCAB_CACHE
+    if _SP_VOCAB_CACHE is not None:
+        return _SP_VOCAB_CACHE
+
+    paths = [
+        os.path.join(os.path.dirname(__file__), "meshtalk", "sp_vocab.txt"),
+        os.path.join(os.path.dirname(__file__), "sp_vocab.txt"),
+    ]
+    tokens: List[str] = []
+    for path in paths:
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.rstrip("\n")
+                    if not line:
+                        continue
+                    if line.lstrip().startswith("#"):
+                        continue
+                    tok = _unescape_vocab_token(line)
+                    if not tok:
+                        continue
+                    if len(tok) > 64:
+                        continue
+                    tokens.append(tok)
+        except Exception:
+            continue
+
+    uniq: Dict[str, None] = {}
+    for t in tokens:
+        if t not in uniq:
+            uniq[t] = None
+    out = sorted(uniq.keys(), key=lambda x: (-len(x), x))
+    _SP_VOCAB_CACHE = out[:4096]
+    return _SP_VOCAB_CACHE
+
+
+def _build_trie(tokens: Sequence[str]) -> dict:
+    root: dict = {}
+    for tok in tokens:
+        if len(tok) < 2:
+            continue
+        node = root
+        for ch in tok:
+            nxt = node.get(ch)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[ch] = nxt
+            node = nxt
+        node["\0"] = tok
+    return root
+
+
+def _tokenize_sentencepiece_vocab(text: str) -> List[str]:
+    """Greedy longest-match tokenization using a local vocab list.
+
+    Tokens are literal substrings of the original text => reversible by `"".join(tokens)`.
+    """
+    global _SP_TRIE_CACHE
+    vocab = _load_sentencepiece_vocab_tokens()
+    if not vocab:
+        return list(text)
+    if _SP_TRIE_CACHE is None:
+        _SP_TRIE_CACHE = _build_trie(vocab)
+    trie = _SP_TRIE_CACHE
+
+    out: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        node = trie
+        j = i
+        best: Optional[str] = None
+        while j < n and isinstance(node, dict):
+            ch = text[j]
+            if ch not in node:
+                break
+            node = node[ch]
+            j += 1
+            if isinstance(node, dict) and "\0" in node:
+                best = node["\0"]
+        if best is not None:
+            out.append(best)
+            i += len(best)
+        else:
+            out.append(text[i])
+            i += 1
+    return out
 
 
 class CompressionError(ValueError):
@@ -144,6 +285,32 @@ def _varint_decode(data: bytes, offset: int) -> Tuple[int, int]:
         if shift > 35:
             break
     raise CompressionFormatError("invalid varint")
+
+
+def _encode_token_stream(tokens: Sequence[str]) -> bytes:
+    out = bytearray()
+    out.extend(_varint_encode(len(tokens)))
+    for tok in tokens:
+        raw = str(tok).encode("utf-8")
+        out.extend(_varint_encode(len(raw)))
+        out.extend(raw)
+    return bytes(out)
+
+
+def _decode_token_stream(data: bytes) -> List[str]:
+    pos = 0
+    count, pos = _varint_decode(data, pos)
+    tokens: List[str] = []
+    for _ in range(count):
+        ln, pos = _varint_decode(data, pos)
+        end = pos + int(ln)
+        if end > len(data):
+            raise CompressionFormatError("truncated token stream")
+        tokens.append(data[pos:end].decode("utf-8", errors="strict"))
+        pos = end
+    if pos != len(data):
+        raise CompressionFormatError("trailing bytes in token stream")
+    return tokens
 
 
 def _tokenize_basic(text: str, preserve_case: bool = False) -> List[str]:
@@ -511,33 +678,48 @@ def _encode_fixed(tokens: Sequence[str]) -> bytes:
     return bytes(out)
 
 
-def _encode_binary(text: str, mode: int, preserve_case: bool) -> bytes:
-    source = text if preserve_case else text.lower()
-    raw = source.encode("utf-8")
-    if mode in (MODE_DEFLATE, MODE_NLTK):
+def _encode_binary_bytes(raw: bytes, mode: int) -> bytes:
+    if mode == MODE_DEFLATE:
         cobj = zlib.compressobj(level=9, wbits=-15)
         return cobj.compress(raw) + cobj.flush()
-    if mode in (MODE_ZLIB, MODE_SPACY):
+    if mode == MODE_ZLIB:
         return zlib.compress(raw, level=9)
     if mode == MODE_BZ2:
         return bz2.compress(raw, compresslevel=9)
-    if mode in (MODE_LZMA, MODE_TENSORFLOW):
+    if mode == MODE_LZMA:
         return lzma.compress(raw, preset=9)
+    if mode == MODE_ZSTD:
+        if _zstd is None:
+            raise CompressionError("zstandard is not installed (required for MODE_ZSTD)")
+        cctx = _zstd.ZstdCompressor(level=10)
+        return cctx.compress(raw)
     raise CompressionError(f"unsupported binary compression mode: {mode}")
+
+def _decode_binary_bytes(data: bytes, mode: int) -> bytes:
+    if mode == MODE_DEFLATE:
+        return zlib.decompress(data, wbits=-15)
+    elif mode == MODE_ZLIB:
+        return zlib.decompress(data)
+    elif mode == MODE_BZ2:
+        return bz2.decompress(data)
+    elif mode == MODE_LZMA:
+        return lzma.decompress(data)
+    elif mode == MODE_ZSTD:
+        if _zstd is None:
+            raise CompressionFormatError("MODE_ZSTD requires zstandard package")
+        dctx = _zstd.ZstdDecompressor()
+        return dctx.decompress(data)
+    else:
+        raise CompressionFormatError(f"unsupported binary compression mode: {mode}")
+
+
+def _encode_binary(text: str, mode: int, preserve_case: bool) -> bytes:
+    source = text if preserve_case else text.lower()
+    return _encode_binary_bytes(source.encode("utf-8"), mode)
 
 
 def _decode_binary(data: bytes, mode: int) -> str:
-    if mode in (MODE_DEFLATE, MODE_NLTK):
-        raw = zlib.decompress(data, wbits=-15)
-    elif mode in (MODE_ZLIB, MODE_SPACY):
-        raw = zlib.decompress(data)
-    elif mode == MODE_BZ2:
-        raw = bz2.decompress(data)
-    elif mode in (MODE_LZMA, MODE_TENSORFLOW):
-        raw = lzma.decompress(data)
-    else:
-        raise CompressionFormatError(f"unsupported binary compression mode: {mode}")
-    return raw.decode("utf-8", errors="strict")
+    return _decode_binary_bytes(data, mode).decode("utf-8", errors="strict")
 
 
 def mode_name(mode: int) -> str:
@@ -598,7 +780,12 @@ def _decode_fixed(data: bytes) -> List[str]:
     return tokens
 
 
-def compress_text(text: str, mode: int = MODE_BYTE_DICT, preserve_case: bool = False) -> bytes:
+def compress_text(
+    text: str,
+    mode: int = MODE_BYTE_DICT,
+    preserve_case: bool = False,
+    normalize: str = "off",
+) -> bytes:
     if not isinstance(text, str):
         raise CompressionError("text must be str")
     tokens = _tokenize(text, preserve_case=preserve_case)
@@ -611,11 +798,22 @@ def compress_text(text: str, mode: int = MODE_BYTE_DICT, preserve_case: bool = F
         MODE_ZLIB,
         MODE_BZ2,
         MODE_LZMA,
-        MODE_NLTK,
-        MODE_SPACY,
-        MODE_TENSORFLOW,
+        MODE_ZSTD,
     ):
-        data = _encode_binary(text, mode, preserve_case=preserve_case)
+        norm = str(normalize or "off").strip().lower()
+        if norm != "off":
+            # Serialize exact tokens first (reversible), then compress with binary codec.
+            # This tends to help short chat-like texts due to higher token repetition.
+            if norm in ("tokens", "token_stream", "basic"):
+                toks = _tokenize_basic(text, preserve_case=True)
+            elif norm in ("sp_vocab", "sentencepiece", "sentencepiece_vocab", "sp"):
+                toks = _tokenize_sentencepiece_vocab(text)
+            else:
+                toks = _tokenize_basic(text, preserve_case=True)
+            tok_stream = _encode_token_stream(toks)
+            data = _encode_binary_bytes(tok_stream, mode)
+        else:
+            data = _encode_binary(text, mode, preserve_case=preserve_case)
     else:
         raise CompressionError(f"unsupported compression mode: {mode}")
 
@@ -624,6 +822,8 @@ def compress_text(text: str, mode: int = MODE_BYTE_DICT, preserve_case: bool = F
         flags |= FLAG_LOWERCASE_USED
     if preserve_case:
         flags |= FLAG_PRESERVE_CASE
+    if str(normalize or "off").strip().lower() != "off":
+        flags |= FLAG_TOKEN_STREAM
 
     header = bytes([MAGIC[0], MAGIC[1], VERSION, mode & 0xFF, DICT_ID & 0xFF, flags & 0xFF])
     crc = _crc8(header + data)
@@ -661,11 +861,13 @@ def decompress_text(blob: bytes) -> str:
         MODE_ZLIB,
         MODE_BZ2,
         MODE_LZMA,
-        MODE_NLTK,
-        MODE_SPACY,
-        MODE_TENSORFLOW,
+        MODE_ZSTD,
     ):
-        return _decode_binary(data, mode)
+        raw_bin = _decode_binary_bytes(data, mode)
+        if flags & FLAG_TOKEN_STREAM:
+            tokens = _decode_token_stream(raw_bin)
+            return "".join(tokens)
+        return raw_bin.decode("utf-8", errors="strict")
     else:
         raise CompressionFormatError(f"unsupported mode: {mode}")
     if flags & FLAG_EXACT_TEXT:

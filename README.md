@@ -22,14 +22,23 @@ Small utilities around Meshtastic.
 
 ## Contents
 
-- `meshLogger.py` polls traceroute and writes daily logs to `meshLogger/`.
-- `meshLogger.py` also writes an SQLite DB (`meshLogger.db`) once per hour using `meshtastic --nodes`.
-- `nodeDbUpdater.py` is legacy (text DB); keep only if you still need `nodeDb.txt`.
-- `graphGen.py` builds Graphviz (DOT/SVG) and D3.js (HTML/JSON) graphs from logs and node DB in `graphGen/` (SQLite preferred, `nodeDb.txt` fallback).
-- `meshTalk.py` is a research prototype: ACK-based, best-effort P2P payload exchange over Meshtastic (Python API) with cryptographic primitives.
-- meshTalk UI: unread indicator (orange dot) in contact list.
-- Per-file references:
-  - `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+- `meshTalk.py`: research prototype GUI for best-effort P2P payload exchange (ACK/retry, key exchange, runtime diagnostics).
+- `meshLogger.py`: traceroute/events logger + SQLite telemetry DB (`meshLogger.db`).
+- `graphGen.py`: Graphviz + D3 map/graph generator from collected logs/DB.
+- `nodeDbUpdater.py`: legacy text node DB updater (`nodeDb.txt`).
+- `meshtalk/`: internal protocol/storage modules (`protocol.py`, `storage.py`).
+- `meshtalk_utils.py`: shared parsing/formatting/runtime helpers.
+- `message_text_compression.py`: compression/normalization pipeline for payload text.
+- Text references: `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+
+## Key capabilities
+
+- Best-effort delivery over Meshtastic with ACK/retry/backoff and message status tracking.
+- Per-peer key exchange flow (KR1/KR2), MT-WIRE AES-256-GCM container, and local at-rest sealing for profile data.
+- Adaptive pacing and queue control to reduce traffic noise.
+- Traceroute integration in dialogs with route details and diagnostics.
+- Compression with automatic mode selection (`DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `ZSTD`) plus reversible normalization (`Token stream`, `SentencePiece vocab`).
+- Runtime observability: colorized event log, health snapshots, compression stats (`COMPRESS`/`COMPSTAT`).
 
 ## Requirements
 
@@ -63,7 +72,7 @@ pip install -r requirements.txt
 Optional NLP-related compression profiles:
 
 ```bash
-pip install -r requirements-ml.txt
+pip install -r requirements.txt
 ```
 
 Check that tools are in PATH:
@@ -122,6 +131,7 @@ Local at-rest storage key is stored in `keyRings/storage.key` (32 bytes, base64;
 ## Cryptography (where/when)
 
 This project uses cryptographic primitives for payload sealing and local at-rest sealing. It does not claim or guarantee any specific security properties.
+On startup the runtime log prints a `CRYPTO:` line with the active primitive set.
 
 - Key exchange frames (MT-KEY v1): `KR1|...` / `KR2|...`
   - Format: plaintext UTF-8/ASCII with `|` separators.
@@ -132,6 +142,39 @@ This project uses cryptographic primitives for payload sealing and local at-rest
 - Local at-rest sealing (per node profile): AES-256-GCM (AEAD)
   - Key file: `<node_id>/keyRings/storage.key` (32 bytes, base64; local-only).
   - Applied: `history.log`, `state.json`, `incoming.json` sensitive fields (see `meshtalk/storage.py` and `meshtalk/storage.txt`).
+
+### Session rekey (optional)
+
+`meshTalk.py` can periodically refresh per-peer session keys inside the encrypted channel (`session_rekey`).
+Control frames are carried inside MT-MSG plaintext (`RK1`/`RK2`/`RK3`) and derive a new per-peer AES key from
+HKDF(static_shared || ephemeral_shared). Full details: `meshtalk/protocol.txt`.
+
+## Wire Protocol / Packet Structure
+
+Full, versioned specification: `meshtalk/protocol.txt`.
+
+Quick summary:
+- MT-KEY v1 (plaintext): `KR1|...` / `KR2|...`
+- MT-WIRE v1 (AES-256-GCM): `[ver=1][type][msg_id(8)][nonce(12)][ct||tag]`
+- MT-MSG v2 (inside MSG): binary `M2` framing (16-byte header + chunk)
+- MT-ACK (inside ACK): UTF-8 `ACK|...`
+
+## Runtime Log: Event Types and UI Colors
+
+Log lines are colorized in the GUI by event prefix (as a reading aid only):
+- `ERROR` (red, `#f92672`): exceptions/tracebacks, decode failures, pinned key mismatch.
+- `WARN` (orange, `#fd971f`): non-fatal warnings.
+- `KEY` / `CRYPTO` (yellow, `#ffd75f`): key exchange, rekey, crypto diagnostics.
+- `KEYOK` (yellow, `#ffd75f`): confirmed key exchange.
+- `TRACE` (cyan, `#66d9ef`): traceroute.
+- `PACE` (green, `#a6e22e`): adaptive pacing suggestions/changes.
+- `HEALTH` (mint, `#6be5b5`): periodic health line.
+- `DISCOVERY` (violet, `#b894ff`): discovery/broadcast scheduling.
+- `RADIO` (blue, `#74b2ff`): connect/disconnect and low-level radio events.
+- `GUI` (light, `#e0e0e0`): GUI lifecycle events.
+- `QUEUE` (sand, `#c3b38a`): queue changes/clears.
+- `COMPRESS` / `COMPSTAT` (default log color): compression decision and periodic compression/normalization efficiency totals.
+
 The script detects your node id from the radio automatically.
 If a peer key is missing, a key exchange is requested automatically.
 Outgoing messages are stored per node profile in `<node_id>/state.json` and `<node_id>/history.log`.
@@ -142,14 +185,18 @@ Type `/keys` to rotate your keys (they will be regenerated and exchanged again).
 
 Compression is applied to payload bytes before MT-WIRE sealing and only when it gives size gain.
 
-- Compression settings are hidden from UI and work automatically.
+- Compression is configurable in Settings (recommended: AUTO).
 - Decision rule: all supported modes are compared; compression is used only when the best mode is smaller than plain UTF-8.
 - External transport protocol is unchanged; compression works inside message payload bytes.
 - Peer compatibility guard: compression is enabled per peer only after capability markers are observed (`mc=1`, `mc_modes=...`) from validated peer traffic.
 - First message to an unknown peer is sent plain, then compression can activate automatically.
 - Table modes `BYTE_DICT`/`FIXED_BITS` are disabled for new outgoing messages.
-- Additional automatic modes are enabled: `NLTK`, `SPACY`, `TENSORFLOW`.
-- These NLP profiles are wire-level mode aliases over built-in codecs to keep decode path dependency-free.
+- Zstandard mode (`mc_zstd`) is supported (dependency: `zstandard`, see `requirements.txt`). It is used only when the peer advertises it in `mc_modes`.
+- Normalization (lossless, before binary codecs): improves compression for short chat-like texts.
+  - `OFF`: no normalization.
+  - `Token stream (basic, reversible)`: serializes exact tokens (incl. whitespace) before compression.
+  - `SentencePiece vocab (reversible)`: greedy tokenization by `meshtalk/sp_vocab.txt` before compression.
+    `sentencepiece` is used only to generate/update that vocab file; runtime decode does not depend on it.
 
 Compressed block format (`compression=1`):
 
@@ -157,10 +204,10 @@ Compressed block format (`compression=1`):
 
 - `MAGIC`: `0x4D 0x43` (`"MC"`)
 - `VER`: `1`
-- `MODE`: `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`), `6` (`NLTK`), `7` (`SPACY`), `8` (`TENSORFLOW`) for new outgoing messages.
+- `MODE`: `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`), `9` (`ZSTD`) for new outgoing messages.
 - Legacy values `0` (`BYTE_DICT`) and `1` (`FIXED_BITS`) are kept only for backward decode compatibility.
 - `DICT_ID`: static dictionary id (`2`)
-- `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled
+- `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled, bit4 token_stream_payload
 - `CRC8`: checksum over header+data
 - Tokenization: words + punctuation tokens from `.,!?-:;()"'`.
 - Escape for unknown token:
@@ -262,13 +309,23 @@ Output: `dist\meshTalk.exe`
 
 ## Содержание
 
-- `meshLogger.py` опрашивает traceroute и пишет ежедневные логи в `meshLogger/`.
-- `meshLogger.py` также пишет SQLite-базу (`meshLogger.db`) раз в час через `meshtastic --nodes`.
-- `nodeDbUpdater.py` — устаревший (текстовый) вариант; нужен только если нужен `nodeDb.txt`.
-- `graphGen.py` строит графы Graphviz (DOT/SVG) и D3.js (HTML/JSON) из логов и базы узлов в `graphGen/` (предпочитает SQLite, fallback — `nodeDb.txt`).
-- `meshTalk.py` — исследовательский прототип: best-effort P2P-обмен полезной нагрузкой с ACK поверх Meshtastic (Python API) с криптографическими примитивами.
-- Текстовые справки по каждому Python-файлу:
-  - `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+- `meshTalk.py`: исследовательский GUI-прототип best-effort P2P-обмена (ACK/повторы, обмен ключами, runtime-диагностика).
+- `meshLogger.py`: логгер traceroute/событий + SQLite-телеметрия (`meshLogger.db`).
+- `graphGen.py`: генерация карт/графов Graphviz + D3 из логов/БД.
+- `nodeDbUpdater.py`: legacy-обновление текстовой базы узлов (`nodeDb.txt`).
+- `meshtalk/`: внутренние модули протокола/хранилища (`protocol.py`, `storage.py`).
+- `meshtalk_utils.py`: общие утилиты парсинга/форматирования.
+- `message_text_compression.py`: пайплайн сжатия/нормализации текста payload.
+- Текстовые справки: `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+
+## Ключевые возможности
+
+- Best-effort доставка поверх Meshtastic с ACK/retry/backoff и статусами сообщений.
+- По-пировый обмен ключами (KR1/KR2), MT-WIRE AES-256-GCM и локальное запечатывание данных профиля.
+- Адаптивный rate/parallel (autopacing) и контроль очередей для снижения шумового трафика.
+- Интеграция traceroute в диалогах с выводом маршрута и диагностикой.
+- Сжатие с авто-выбором режима (`DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `ZSTD`) и обратимой нормализацией (`Token stream`, `SentencePiece vocab`).
+- Наблюдаемость runtime: цветной лог событий, health-сводки, статистика сжатия (`COMPRESS`/`COMPSTAT`).
 
 ## Требования
 
@@ -301,7 +358,7 @@ pip install -r requirements.txt
 Опционально для NLP-профилей сжатия:
 
 ```bash
-pip install -r requirements-ml.txt
+pip install -r requirements.txt
 ```
 
 Проверка, что утилиты доступны в PATH:
@@ -378,14 +435,18 @@ python meshTalk.py
 
 Сжатие применяется к байтам payload до запечатывания MT-WIRE и только если есть выигрыш по размеру.
 
-- Настройки сжатия скрыты из UI и работают автоматически.
+- Настройки сжатия настраиваются в Settings (рекомендуется AUTO).
 - Правило выбора: сравниваются все поддерживаемые режимы; сжатие включается только если лучший режим меньше обычного UTF-8.
 - Внешний транспортный протокол не меняется; сжатие работает внутри байтов payload.
 - Защита совместимости: сжатие включается для peer только после маркеров возможностей (`mc=1`, `mc_modes=...`) из валидированного трафика этого peer.
 - Первое сообщение неизвестному peer уходит как обычный текст; далее сжатие может включиться автоматически.
 - Табличные режимы `BYTE_DICT`/`FIXED_BITS` отключены для новых исходящих сообщений.
-- Дополнительно включены автоматические режимы: `NLTK`, `SPACY`, `TENSORFLOW`.
-- Эти NLP-профили реализованы как wire-level алиасы поверх встроенных кодеков, чтобы декодирование оставалось без обязательных внешних зависимостей.
+- Поддерживается `ZSTD` (`mc_zstd`). Зависимость `zstandard` включена в `requirements.txt`.
+- Нормализация (обратимая, перед бинарными кодеками) помогает лучше сжимать короткие чатовые тексты.
+  - `OFF`: без нормализации.
+  - `Token stream (базовый, обратимый)`: сериализация точных токенов (включая пробелы) перед сжатием.
+  - `SentencePiece vocab (обратимый)`: жадная токенизация по `meshtalk/sp_vocab.txt` перед сжатием.
+    `sentencepiece` используется только чтобы генерировать/обновлять vocab; на декодирование он не влияет.
 
 Формат сжатого блока (`compression=1`):
 
@@ -393,10 +454,10 @@ python meshTalk.py
 
 - `MAGIC`: `0x4D 0x43` (`"MC"`)
 - `VER`: `1`
-- `MODE`: для новых исходящих используются `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`), `6` (`NLTK`), `7` (`SPACY`), `8` (`TENSORFLOW`).
+- `MODE`: для новых исходящих используются `2` (`DEFLATE`), `3` (`ZLIB`), `4` (`BZ2`), `5` (`LZMA`), `9` (`ZSTD`).
 - Значения `0` (`BYTE_DICT`) и `1` (`FIXED_BITS`) оставлены только для декодирования legacy-сообщений.
 - `DICT_ID`: id статического словаря (`2`)
-- `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled
+- `FLAGS`: bit0 lowercase_used, bit1 preserve_case, bit2 punct_tokens_enabled, bit4 token_stream_payload
 - `CRC8`: контрольная сумма по header+data
 - Токенизация: слова + отдельные токены пунктуации `.,!?-:;()"'`.
 - Escape для неизвестного токена:

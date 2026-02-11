@@ -71,16 +71,19 @@ Contact list indicators
 - Above lock: `Last seen: N h` (peer last seen time in hours).
 
 Settings
-- Port, retry interval, max wait, max bytes, rate, parallel packets (how many packets can be sent within one rate window).
+- Port is auto-detected (USB/serial scan). UI does not expose port selection.
+- Retry interval, max wait, max bytes, rate, parallel packets (how many packets can be sent within one rate window).
 - Auto pacing (optional): tunes `rate`/`parallel` automatically from ACK attempts/timeouts when backlog exists.
 - Discovery: two checkboxes (`Send broadcast discovery`, `Reply to broadcast discovery`).
 - Default on first start: both ON.
 - Clear pending on profile switch.
 - Language, verbose events, runtime.log toggle.
 - Default on first start: `runtime.log` ON.
-- Compression settings are hidden from UI and work automatically.
-- For outgoing messages the app compares `DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `NLTK`, `SPACY`, `TENSORFLOW` and applies compression only if payload becomes smaller.
-- `NLTK`/`SPACY`/`TENSORFLOW` are wire-level compression profile aliases; decode path stays dependency-free.
+- Compression has its own Settings tab.
+  - Recommended: AUTO (picks the smallest supported mode, only if it reduces payload size).
+  - OFF disables payload compression (legacy chunking is still used).
+  - Force algorithm can be used for experiments.
+  - ZSTD (`mc_zstd`) is supported. Dependency: `zstandard` (see `requirements.txt`).
 - Hint labels in settings use a smaller font (`QLabel#hint`, 10px) to avoid looking like regular options.
 - `Full reset` button (red, with confirmation) removes profile config/state/history/incoming/runtime logs and key files, then regenerates local keys.
 
@@ -92,6 +95,7 @@ Auto key refresh
 Cryptography (where/when)
 - This project uses cryptographic primitives for payload sealing and local at-rest sealing.
   It does not claim or guarantee any specific security properties.
+- On startup the runtime log prints a `CRYPTO:` line with the active primitive set (MT-KEY, HKDF, MT-WIRE AEAD, at-rest sealing).
 - MT-KEY v1 (KR1/KR2 key exchange frames):
   - Format: plaintext UTF-8/ASCII with `|` separators.
   - Public key: X25519 public key (32 raw bytes, base64 in the frame).
@@ -103,6 +107,43 @@ Cryptography (where/when)
   - AEAD: AES-256-GCM.
   - Key file: `<node_id>/keyRings/storage.key` (32 bytes, base64; local-only).
   - Applied to sensitive fields in `history.log`, `state.json`, `incoming.json` (see `meshtalk/storage.py` and `meshtalk/storage.txt`).
+
+Session rekey (where/when)
+- Optional per-peer session key refresh runs inside the encrypted channel (`session_rekey`).
+- Control frames are carried inside MT-MSG plaintext:
+  - `RK1` (sender ephemeral pubkey)
+  - `RK2` (response ephemeral pubkey)
+  - `RK3` (final confirmation)
+- Rekey updates a per-peer AES session key derived from HKDF(static_shared || ephemeral_shared).
+- Rekey adds small extra control traffic and is intended for experiments.
+
+Wire protocol and packet structure (reference)
+- Full specification (versioned): `meshtalk/protocol.txt`.
+- Key exchange (plaintext, MT-KEY v1):
+  - `KR1|<sender_id>|<sender_pub_b64>|key=value|...`
+  - `KR2|<sender_id>|<sender_pub_b64>|key=value|...`
+- Cryptographic container (MT-WIRE v1, AES-256-GCM AEAD):
+  - `[ver=1][type=1|2][msg_id(8)][nonce(12)][ct||tag]`
+  - `type=1` MSG, `type=2` ACK
+- Message framing (inside MT-WIRE type=MSG):
+  - MT-MSG v2 (binary, prefix `M2`): header is 16 bytes, then chunk data.
+  - MT-MSG v1 (legacy UTF-8, prefix `T...`) remains decodable for compatibility.
+- ACK framing (inside MT-WIRE type=ACK): UTF-8 `ACK|mc=1|mc_modes=...|hops=<n>`.
+
+Runtime log event types and UI colors
+- This is only a UI aid for reading logs; colors do not imply severity guarantees.
+- `ERROR` (red, `#f92672`): exceptions/tracebacks, pinned key mismatch, decode errors.
+- `WARN` (orange, `#fd971f`): non-fatal warnings.
+- `KEY` / `CRYPTO` (yellow, `#ffd75f`): key exchange, rekey, crypto diagnostics.
+- `KEYOK` (yellow, `#ffd75f`): confirmed key exchange.
+- `TRACE` (cyan, `#66d9ef`): traceroute operations and responses.
+- `PACE` (green, `#a6e22e`): auto pacing suggestions and parameter changes.
+- `HEALTH` (mint, `#6be5b5`): periodic health summary.
+- `DISCOVERY` (violet, `#b894ff`): discovery scheduling/broadcast events.
+- `RADIO` (blue, `#74b2ff`): radio connect/disconnect and low-level issues.
+- `GUI` (light, `#e0e0e0`): GUI lifecycle events.
+- `QUEUE` (sand, `#c3b38a`): queue state changes/clears.
+- `COMPRESS` / `COMPSTAT` (default log color): compression decisions and periodic compression/normalization efficiency totals.
 
 Data files (per node)
 - `<node_id>/keyRings/`
@@ -132,7 +173,7 @@ Project files (repository / source-controlled)
 - `run_meshTalk.bat`: Windows launcher.
 - `build_meshTalk.bat`: Windows single-file build helper.
 - `requirements.txt`: Python dependencies.
-- `requirements-ml.txt`: optional NLP-related dependencies for additional compression profiles.
+- `requirements.txt`: Python dependencies (includes `zstandard` for ZSTD compression).
 - `README.md`: project-level usage and options.
 - `meshTalk.txt`: focused meshTalk behavior reference.
 - `meshLogger.txt`: focused meshLogger behavior reference.
@@ -235,16 +276,24 @@ RU
 - Над замком: `Last seen: N h` (сколько часов назад пир был замечен в сети).
 
 Настройки
-- Порт, повтор, макс ожидание, макс байт, минимальный интервал, параллельно (сколько пакетов можно отправить подряд в одном окне rate).
+- Порт выбирается автоматически (скан USB/serial). В UI выбора порта нет.
+- Повтор, макс ожидание, макс байт, минимальный интервал, параллельно (сколько пакетов можно отправить подряд в одном окне rate).
 - Автоподбор скорости (опционально): автоматически подбирает `интервал/параллельно` по попыткам ACK/таймаутам при наличии очереди.
 - Discovery: две галки (`Отправлять broadcast discovery`, `Отвечать на broadcast discovery`).
 - По умолчанию при первом запуске: обе ВКЛ.
 - Очистка очереди при смене профиля.
 - Язык, подробный лог, включение `runtime.log`.
 - По умолчанию при первом запуске: `runtime.log` ВКЛ.
-- Настройки сжатия скрыты из UI и работают автоматически.
-- Для исходящих сообщений приложение сравнивает `DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `NLTK`, `SPACY`, `TENSORFLOW` и применяет сжатие только если payload становится меньше.
-- `NLTK`/`SPACY`/`TENSORFLOW` это wire-level алиасы профилей сжатия; путь декодирования остается без обязательных внешних зависимостей.
+- Сжатие вынесено на отдельную вкладку в настройках.
+  - Рекомендуется: AUTO (выбирает самый выгодный поддерживаемый режим и включает сжатие только при выигрыше по размеру).
+  - OFF отключает сжатие (legacy разбиение на части при этом остается).
+  - Принудительный алгоритм нужен для экспериментов.
+  - ZSTD (`mc_zstd`) поддерживается. Зависимость: `zstandard` (см. `requirements.txt`).
+  - Нормализация (перед сжатием) обратима и влияет только на эффективность: получатель восстановит точный исходный текст.
+    - OFF: без нормализации.
+    - Token stream (базовый, обратимый): сериализация точных токенов (включая пробелы) перед бинарным сжатием.
+    - SentencePiece vocab (обратимый): жадная токенизация по `meshtalk/sp_vocab.txt` перед бинарным сжатием.
+      `sentencepiece` используется только чтобы генерировать/обновлять vocab; на декодирование он не влияет.
 - Подсказки в настройках показываются меньшим шрифтом (`QLabel#hint`, 10px), чтобы не выглядеть как обычные опции.
 - Кнопка `Полный сброс` (красная, с подтверждением) удаляет конфиг/очереди/историю/incoming/runtime.log и ключи профиля, затем создает новую пару локальных ключей.
 
@@ -255,6 +304,7 @@ RU
 
 Криптография (где/когда)
 - В проекте используются криптографические примитивы для запечатывания payload и локального запечатывания данных на диске.
+- При старте в runtime‑логе печатается строка `CRYPTO:` с набором активных примитивов (MT‑KEY, HKDF, MT‑WIRE AEAD, запечатывание на диске).
 - MT-KEY v1 (обмен ключами, кадры KR1/KR2):
   - Формат: plaintext UTF-8/ASCII с разделителем `|`.
   - Публичный ключ: X25519 public key (32 raw bytes, base64 внутри кадра).
@@ -266,6 +316,43 @@ RU
   - AEAD: AES-256-GCM.
   - Файл ключа: `<node_id>/keyRings/storage.key` (32 байта, base64; строго локальный).
   - Применяется к чувствительным полям `history.log`, `state.json`, `incoming.json` (см. `meshtalk/storage.py` и `meshtalk/storage.txt`).
+
+Rekey сессии (где/когда)
+- Опциональное обновление session key на каждого пира выполняется внутри зашифрованного канала (`session_rekey`).
+- Управляющие кадры передаются внутри MT-MSG plaintext:
+  - `RK1` (ephemeral pubkey отправителя)
+  - `RK2` (ответ ephemeral pubkey)
+  - `RK3` (финальное подтверждение)
+- Rekey обновляет per-peer AES session key, вычисленный как HKDF(static_shared || ephemeral_shared).
+- Rekey добавляет небольшой служебный трафик и предназначен для экспериментов.
+
+Wire протокол и структура пакетов (справка)
+- Полная спецификация (с версионированием): `meshtalk/protocol.txt`.
+- Обмен ключами (plaintext, MT-KEY v1):
+  - `KR1|<sender_id>|<sender_pub_b64>|key=value|...`
+  - `KR2|<sender_id>|<sender_pub_b64>|key=value|...`
+- Криптоконтейнер (MT-WIRE v1, AES-256-GCM AEAD):
+  - `[ver=1][type=1|2][msg_id(8)][nonce(12)][ct||tag]`
+  - `type=1` MSG, `type=2` ACK
+- Фрейминг сообщений (внутри MT-WIRE type=MSG):
+  - MT-MSG v2 (бинарный, префикс `M2`): заголовок 16 байт + chunk данные.
+  - MT-MSG v1 (legacy UTF-8, префикс `T...`) остается декодируемым для совместимости.
+- ACK (внутри MT-WIRE type=ACK): UTF-8 `ACK|mc=1|mc_modes=...|hops=<n>`.
+
+Типы событий runtime-лога и цвета в UI
+- Это только помощь для чтения логов; цвета не являются обещанием "важности".
+- `ERROR` (красный, `#f92672`): исключения/traceback, pinned key mismatch, decode errors.
+- `WARN` (оранжевый, `#fd971f`): предупреждения без падения.
+- `KEY` / `CRYPTO` (желтый, `#ffd75f`): обмен ключами, rekey, крипто‑диагностика.
+- `KEYOK` (желтый, `#ffd75f`): подтвержденный обмен ключами.
+- `TRACE` (голубой, `#66d9ef`): traceroute и его ответы.
+- `PACE` (зеленый, `#a6e22e`): автоподбор скорости и изменения параметров.
+- `HEALTH` (мятный, `#6be5b5`): периодическая health‑строка.
+- `DISCOVERY` (фиолетовый, `#b894ff`): discovery/broadcast события и планирование.
+- `RADIO` (синий, `#74b2ff`): подключение/отключение радио и низкоуровневые события.
+- `GUI` (светлый, `#e0e0e0`): события GUI.
+- `QUEUE` (песочный, `#c3b38a`): изменения очереди/очистка.
+- `COMPRESS` / `COMPSTAT` (цвет по умолчанию): решения по сжатию и периодическая сводка эффективности сжатия/нормализации.
 
 Файлы данных (на каждую ноду)
 - `<node_id>/keyRings/`
@@ -295,7 +382,7 @@ RU
 - `run_meshTalk.bat`: запуск на Windows.
 - `build_meshTalk.bat`: сборка single-file для Windows.
 - `requirements.txt`: Python-зависимости.
-- `requirements-ml.txt`: опциональные NLP-зависимости для дополнительных профилей сжатия.
+- `requirements.txt`: зависимости Python (включая `zstandard` для сжатия ZSTD).
 - `README.md`: общее использование проекта и параметры.
 - `meshTalk.txt`: целевая справка по поведению meshTalk.
 - `meshLogger.txt`: целевая справка по поведению meshLogger.

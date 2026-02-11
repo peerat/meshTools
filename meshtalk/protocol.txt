@@ -108,9 +108,7 @@ Mode IDs
 - 3: `mc_zlib`
 - 4: `mc_bz2`
 - 5: `mc_lzma`
-- 6: `mc_nltk` (wire-level alias of deflate)
-- 7: `mc_spacy` (wire-level alias of zlib)
-- 8: `mc_tensorflow` (wire-level alias of lzma)
+- 9: `mc_zstd` (zstandard)
 
 ========================
 RU
@@ -218,6 +216,4 @@ Mode IDs
 - 3: `mc_zlib`
 - 4: `mc_bz2`
 - 5: `mc_lzma`
-- 6: `mc_nltk` (wire-level алиас deflate)
-- 7: `mc_spacy` (wire-level алиас zlib)
-- 8: `mc_tensorflow` (wire-level алиас lzma)
+- 9: `mc_zstd` (zstandard)
