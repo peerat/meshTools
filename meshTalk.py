@@ -2861,7 +2861,20 @@ def main() -> int:
                     # Do not refresh unknown peers or Meshtastic-only nodes (reduces noise and privacy leakage).
                     if not bool(getattr(st, "key_ready", False)):
                         continue
-                    if not peer_used_meshtalk(peer_norm):
+                    # `peer_used_meshtalk()` is a GUI helper (defined later inside Qt scope).
+                    # Sender loop must be standalone, so we replicate the minimal "meshTalk-active" check here.
+                    try:
+                        seen_ts = float(getattr(st, "last_seen_ts", 0.0) or 0.0)
+                        offline_ts = float(getattr(st, "app_offline_ts", 0.0) or 0.0)
+                        if (
+                            offline_ts > 0.0
+                            and (now - offline_ts) <= float(CONTACT_STALE_SECONDS)
+                            and (seen_ts <= offline_ts)
+                        ):
+                            continue
+                        if not (seen_ts > 0.0 and (now - seen_ts) <= float(CONTACT_STALE_SECONDS)):
+                            continue
+                    except Exception:
                         continue
                     if st.next_key_refresh_ts <= 0.0:
                         st.next_key_refresh_ts = now + 3600.0 + random.uniform(0, 600)
