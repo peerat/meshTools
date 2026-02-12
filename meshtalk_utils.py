@@ -724,6 +724,7 @@ def format_meta_text(
     now_ts: Optional[float] = None,
     compression_name: Optional[str] = None,
     compression_eff_pct: Optional[float] = None,
+    compression_norm: Optional[str] = None,
 ) -> str:
     is_ru = (lang == "ru")
     dur = format_duration_mmss(delivery) if delivery is not None else None
@@ -768,22 +769,29 @@ def format_meta_text(
     cmp_name = str(compression_name or "").strip()
     cmp_name_l = cmp_name.lower()
     cmp_tail = ""
+    cmp_norm = str(compression_norm or "").strip().upper()
+    cmp_norm_l = cmp_norm.lower()
     if cmp_name and cmp_name_l not in ("none", "n/a", "-", "null"):
+        prefix = cmp_norm if cmp_norm and cmp_norm_l not in ("none", "n/a", "-", "null") else ""
         if compression_eff_pct is not None:
             eff = _fmt_num(float(compression_eff_pct))
             if is_ru:
-                details.append(f"сжатие {cmp_name} {eff}%")
-                cmp_tail = f", сжатие {cmp_name} {eff}%"
+                line = f"{prefix} сжатие {cmp_name} {eff}%".strip()
+                details.append(line)
+                cmp_tail = f", {line}"
             else:
-                details.append(f"compression {cmp_name} {eff}%")
-                cmp_tail = f", compression {cmp_name} {eff}%"
+                line = f"{prefix} compression {cmp_name} {eff}%".strip()
+                details.append(line)
+                cmp_tail = f", {line}"
         else:
             if is_ru:
-                details.append(f"сжатие {cmp_name}")
-                cmp_tail = f", сжатие {cmp_name}"
+                line = f"{prefix} сжатие {cmp_name}".strip()
+                details.append(line)
+                cmp_tail = f", {line}"
             else:
-                details.append(f"compression {cmp_name}")
-                cmp_tail = f", compression {cmp_name}"
+                line = f"{prefix} compression {cmp_name}".strip()
+                details.append(line)
+                cmp_tail = f", {line}"
     status_map_ru = {
         "timeout": "таймаут",
         "queue_limit": "лимит очереди",

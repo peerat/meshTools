@@ -10,6 +10,30 @@ Added
 Changed
 - (none)
 
+### 0.4.0 (2026-02-12)
+
+Added
+- Dedicated `Primary` dialog for Meshtastic public/broadcast text channel.
+- Explicit plain-channel telemetry in runtime log: `SENDSTD` / `RECVSTD` with text preview.
+- MeshTalk offline presence control frame (`KOF1|...`) sent on app shutdown.
+
+Changed
+- Meshtastic `TEXT_MESSAGE_APP` routing:
+  - broadcast/`^all` messages go to `group:Primary`,
+  - direct messages are routed to the corresponding contact dialog.
+- Sending from `group:Primary` now transmits broadcast Meshtastic text packets.
+- Plain-channel message status is simplified:
+  - outgoing: `sent at HH:MM`,
+  - incoming: `received at HH:MM`.
+- Contact status model updated:
+  - bright green = meshTalk online,
+  - dark green = meshTalk offline (<24h),
+  - yellow = Meshtastic-only online,
+  - dark yellow = Meshtastic-only offline (<24h),
+  - hidden after 24h without presence.
+- After receiving offline broadcast, peer is immediately routed through Meshtastic plain channel until new meshTalk traffic is seen.
+- `Primary` is now persistent in contacts and protected from rename/delete.
+
 ### 0.3.3 (2026-02-10)
 
 Added
@@ -29,7 +53,7 @@ Changed
 - Settings: log toggles moved to Log tab; Apply now updates retry/limits/rate/parallel immediately (no restart needed); new event type colorization (`PACE`, `HEALTH`, `DISCOVERY`, `RADIO`, `GUI`, `QUEUE`).
 - Compression: added `mc_zstd` mode id and reversible normalizations ("token stream", "SentencePiece vocab") before binary codecs.
 - Dependencies: `zstandard` is now included in `requirements.txt` (no separate optional requirements file).
-- Runtime log: added compression telemetry lines (`COMPRESS` per message and periodic `COMPSTAT` totals with gain/mode/normalization).
+- Runtime log: added compression telemetry lines (`COMPRESS` per message and periodic `COMPSTAT` totals with resulting size%/mode/normalization).
 - Settings UI: tab title contrast improved for Windows themes.
 
 ### 0.3.2 (2026-02-10)
@@ -127,6 +151,30 @@ Removed
 Изменено
 - (нет)
 
+### 0.4.0 (2026-02-12)
+
+Добавлено
+- Отдельный диалог `Primary` для публичного/broadcast канала Meshtastic.
+- Явная телеметрия обычного канала в runtime-логе: `SENDSTD` / `RECVSTD` с preview текста.
+- Служебный кадр офлайна meshTalk (`KOF1|...`) при закрытии приложения.
+
+Изменено
+- Маршрутизация Meshtastic `TEXT_MESSAGE_APP`:
+  - broadcast/`^all` сообщения идут в `group:Primary`,
+  - direct-сообщения идут в диалог соответствующего контакта.
+- Отправка из `group:Primary` теперь делает broadcast-передачу Meshtastic text.
+- Статус обычного канала упрощен:
+  - исходящее: `отправлено в HH:MM`,
+  - входящее: `пришло в HH:MM`.
+- Обновлена модель статусов контактов:
+  - ярко-зеленый = meshTalk online,
+  - темно-зеленый = meshTalk offline (<24ч),
+  - желтый = только Meshtastic online,
+  - темно-желтый = только Meshtastic offline (<24ч),
+  - статус скрывается после 24ч без присутствия.
+- После получения offline-broadcast пир сразу переводится на обычный Meshtastic-роутинг, пока не появится новый meshTalk-трафик.
+- `Primary` стал постоянным элементом списка контактов и защищен от переименования/удаления.
+
 ### 0.3.3 (2026-02-10)
 
 Добавлено
@@ -146,7 +194,7 @@ Removed
 - Settings: настройки лога перенесены на вкладку Log; Apply теперь применяет повтор/лимиты/rate/параллельно сразу (без перезапуска); добавлена цветовая разметка типов событий (`PACE`, `HEALTH`, `DISCOVERY`, `RADIO`, `GUI`, `QUEUE`).
 - Сжатие: добавлен режим `mc_zstd` и обратимые нормализации ("token stream", "SentencePiece vocab") перед бинарными кодеками.
 - Зависимости: `zstandard` включен в `requirements.txt` (без отдельного optional-файла зависимостей).
-- Runtime-лог: добавлены телеметрические строки по сжатию (`COMPRESS` на сообщение и периодический `COMPSTAT` с суммарным выигрышем/режимом/нормализацией).
+- Runtime-лог: добавлены телеметрические строки по сжатию (`COMPRESS` на сообщение и периодический `COMPSTAT` с итоговым size%/режимом/нормализацией).
 - UI настроек: повышен контраст заголовков вкладок для тем Windows.
 
 ### 0.3.2 (2026-02-10)

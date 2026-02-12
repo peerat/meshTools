@@ -1,6 +1,6 @@
-meshTalk v0.3.3
+meshTalk v0.4.0
 Author: Anton Vologzhanin (R3VAF)
-Updated: 2026-02-10
+Updated: 2026-02-12
 
 ========================
 EN
@@ -25,7 +25,7 @@ Project vision
 Main UI
 - Left: contacts/dialogs list.
 - Right: chat area.
-- Top: header status bar with `Client ID`, names, and masked `pub`.
+- Top: header status bar with `Client ID`, names, and masked `public key`.
   - Orange: initialization / transitional states (waiting for radio).
   - Dark green: connected, no unacknowledged errors.
   - Red: errors happened in log and require user attention (until Settings is opened).
@@ -40,9 +40,9 @@ Initialization
 - Multipart receive state is resumed after restart.
 
 Top row behavior
-- `Client ID: !xxxxxxxx <longname>[<shortname>] pub: 12345****67890`
+- `Client ID: !xxxxxxxx <longname>[<shortname>] public key: 12345****67890`
 - Left-click on top row copies Client ID.
-- Triple-click on `pub:` asks confirmation, regenerates local keys, broadcasts new key.
+- Triple-click on `public key:` asks confirmation, regenerates local keys, broadcasts new key.
 
 Message status examples
 - Outgoing in progress:
@@ -57,18 +57,25 @@ Message status examples
   `at 10:18 started receiving, elapsed 00:15 parts 2/5 attempts 1, hops 1`
 - Incoming completed:
   `sent at 10:18 received at 10:19 in 01:18, attempts 1, hops 1, parts 5/5`
+- Meshtastic plain outgoing (direct/Primary):
+  `sent at 10:19`
+- Meshtastic plain incoming (direct/Primary):
+  `received at 10:20`
 
 Contacts context menu
 - Pin/Unpin
 - Add to group
-- Request key
+- Send and request public key
 - Clear history
 - Delete contact
 
 Contact list indicators
-- Lock (`🔒`) is shown only after confirmed two-way key exchange.
-- Next to lock: hours since key exchange confirmation.
-- Above lock: `Last seen: N h` (peer last seen time in hours).
+- Bright green: meshTalk online (keys valid, recent app activity).
+- Dark green: meshTalk offline (seen by app in last 24h).
+- Yellow: Meshtastic-only online.
+- Dark yellow: Meshtastic-only offline (seen in last 24h).
+- Hidden indicator: no presence for >24h.
+- On app close, client sends offline broadcast (`KOF1|...`), so peers can switch presence/routing immediately.
 
 Settings
 - Port is auto-detected (USB/serial scan). UI does not expose port selection.
@@ -111,8 +118,8 @@ Cryptography (where/when)
 Session rekey (where/when)
 - Optional per-peer session key refresh runs inside the encrypted channel (`session_rekey`).
 - Control frames are carried inside MT-MSG plaintext:
-  - `RK1` (sender ephemeral pubkey)
-  - `RK2` (response ephemeral pubkey)
+  - `RK1` (sender ephemeral public key)
+  - `RK2` (response ephemeral public key)
   - `RK3` (final confirmation)
 - Rekey updates a per-peer AES session key derived from HKDF(static_shared || ephemeral_shared).
 - Rekey adds small extra control traffic and is intended for experiments.
@@ -176,8 +183,8 @@ Project files (repository / source-controlled)
 - `requirements.txt`: Python dependencies (includes `zstandard` for ZSTD compression).
 - `README.md`: project-level usage and options.
 - `meshTalk.txt`: focused meshTalk behavior reference.
-- `meshLogger.txt`: focused meshLogger behavior reference.
-- `graphGen.txt`: focused graphGen behavior reference.
+- `meshtools/meshLogger.txt`: focused meshLogger behavior reference.
+- `meshtools/graphGen.txt`: focused graphGen behavior reference.
 - `nodeDbUpdater.txt`: focused nodeDbUpdater behavior reference.
 - `meshtalk_utils.txt`: focused meshtalk_utils module reference.
 - `message_text_compression.txt`: focused text-compression module reference.
@@ -229,7 +236,7 @@ RU
 Основной UI
 - Слева: список контактов/диалогов.
 - Справа: окно чата.
-- Вверху: статусная строка `Client ID`, имена и маска `pub`.
+- Вверху: статусная строка `Client ID`, имена и маска `public key`.
   - Оранжевая: инициализация/переходные состояния (ожидание радио).
   - Темно‑зеленая: подключено, нет непросмотренных ошибок.
   - Красная: в логе были ошибки, требуется внимание (до открытия Настроек).
@@ -244,9 +251,9 @@ RU
 - Состояние приема многопакетных сообщений восстанавливается после перезапуска.
 
 Поведение верхней строки
-- `Client ID: !xxxxxxxx <longname>[<shortname>] pub: 12345****67890`
+- `Client ID: !xxxxxxxx <longname>[<shortname>] public key: 12345****67890`
 - ЛКМ по верхней строке копирует Client ID.
-- Тройной клик по `pub:` просит подтверждение, регенерирует ключи, делает broadcast нового ключа.
+- Тройной клик по `public key:` просит подтверждение, регенерирует ключи, делает broadcast нового ключа.
 
 Примеры статусов сообщений
 - Исходящее в процессе:
@@ -261,19 +268,26 @@ RU
   `в 10:18 начали прием, прошло 00:15 частей 2/5 с 1 попытки, хопов 1`
 - Входящее получено полностью:
   `отправлено в 10:18 получено в 10:19 за 01:18, попытки 1, хопов 1, части 5/5`
+- Обычный Meshtastic-канал, исходящее:
+  `отправлено в 10:19`
+- Обычный Meshtastic-канал, входящее:
+  `пришло в 10:20`
 
 Контекстное меню контакта
 - Pin/Unpin
 - Add to group
 - Traceroute request
-- Request key
+- Отправить и запросить public key
 - Clear history
 - Delete contact
 
 Индикаторы в списке контактов
-- Замок (`🔒`) показывается только после подтвержденного двухстороннего обмена ключами.
-- Рядом с замком: сколько часов прошло с подтверждения обмена ключами.
-- Над замком: `Last seen: N h` (сколько часов назад пир был замечен в сети).
+- Ярко-зеленый: meshTalk online (ключи валидны, есть недавняя активность приложения).
+- Темно-зеленый: meshTalk offline (приложение было видно в пределах 24ч).
+- Желтый: только Meshtastic online.
+- Темно-желтый: только Meshtastic offline (устройство было видно в пределах 24ч).
+- Без индикатора: отсутствует присутствие более 24ч.
+- При закрытии приложения отправляется offline-broadcast (`KOF1|...`), чтобы пиры сразу гасили app-online состояние и переключали роутинг.
 
 Настройки
 - Порт выбирается автоматически (скан USB/serial). В UI выбора порта нет.
@@ -320,8 +334,8 @@ RU
 Rekey сессии (где/когда)
 - Опциональное обновление session key на каждого пира выполняется внутри зашифрованного канала (`session_rekey`).
 - Управляющие кадры передаются внутри MT-MSG plaintext:
-  - `RK1` (ephemeral pubkey отправителя)
-  - `RK2` (ответ ephemeral pubkey)
+  - `RK1` (ephemeral public key отправителя)
+  - `RK2` (ответ ephemeral public key)
   - `RK3` (финальное подтверждение)
 - Rekey обновляет per-peer AES session key, вычисленный как HKDF(static_shared || ephemeral_shared).
 - Rekey добавляет небольшой служебный трафик и предназначен для экспериментов.
@@ -385,8 +399,8 @@ Wire протокол и структура пакетов (справка)
 - `requirements.txt`: зависимости Python (включая `zstandard` для сжатия ZSTD).
 - `README.md`: общее использование проекта и параметры.
 - `meshTalk.txt`: целевая справка по поведению meshTalk.
-- `meshLogger.txt`: целевая справка по поведению meshLogger.
-- `graphGen.txt`: целевая справка по поведению graphGen.
+- `meshtools/meshLogger.txt`: целевая справка по поведению meshLogger.
+- `meshtools/graphGen.txt`: целевая справка по поведению graphGen.
 - `nodeDbUpdater.txt`: целевая справка по поведению nodeDbUpdater.
 - `meshtalk_utils.txt`: целевая справка по модулю meshtalk_utils.
 - `message_text_compression.txt`: целевая справка по модулю сжатия текста.

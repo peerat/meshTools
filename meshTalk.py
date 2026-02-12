@@ -10,12 +10,15 @@ RU: Экспериментальный P2P обмен полезной нагр�
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
+import faulthandler
 import os
 import queue
 import sys
 import threading
 import time
+import traceback
 import hashlib
 import math
 import colorsys
@@ -84,6 +87,7 @@ from message_text_compression import (
     MODE_ZLIB,
     compress_text,
     mode_name,
+    normalization_stats,
 )
 
 
@@ -92,6 +96,7 @@ DEFAULT_PORTNUM = portnums_pb2.PortNum.PRIVATE_APP
 PAYLOAD_OVERHEAD = 1 + 1 + 8 + 12 + 16  # ver + type + msg_id + nonce + tag
 KEY_REQ_PREFIX = b"KR1|"
 KEY_RESP_PREFIX = b"KR2|"
+APP_OFFLINE_PREFIX = b"KOF1|"
 MSG_V2_PREFIX = b"M2"
 MSG_V2_HEADER_LEN = 16  # prefix(2) + ts(4) + group(4) + part(2) + total(2) + attempt(1) + meta(1)
 MAX_PENDING_PER_PEER = 128
@@ -108,6 +113,8 @@ REKEY_RETRY_BASE_SECONDS = 30.0
 REKEY_PREV_KEY_GRACE_SECONDS = 300.0
 REKEY_MIN_INTERVAL_SECONDS = 6 * 3600.0
 REKEY_MIN_MESSAGES = 50
+CONTACT_ONLINE_SECONDS = 30.0 * 60.0
+CONTACT_STALE_SECONDS = 24.0 * 3600.0
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_BASE_DIR = "meshTalk"
 DATA_DIR = BASE_DIR
@@ -126,6 +133,8 @@ _STORAGE = Storage(
     keydir=keydir,
 )
 COMPRESSION_MODES = (
+    int(MODE_BYTE_DICT),
+    int(MODE_FIXED_BITS),
     # Default local capabilities; actual supported modes are controlled by Settings and runtime dependencies.
     int(MODE_DEFLATE),
     int(MODE_ZLIB),
@@ -152,7 +161,14 @@ cfg: Dict[str, object] = {}
 def supported_mc_modes_for_config(cfg_obj: dict) -> tuple[int, ...]:
     """Return local MC mode IDs to advertise/use based on Settings and installed optional deps."""
     # ZSTD is now a required dependency, but keep runtime check for broken installs.
-    modes = [int(MODE_DEFLATE), int(MODE_ZLIB), int(MODE_BZ2), int(MODE_LZMA)]
+    modes = [
+        int(MODE_BYTE_DICT),
+        int(MODE_FIXED_BITS),
+        int(MODE_DEFLATE),
+        int(MODE_ZLIB),
+        int(MODE_BZ2),
+        int(MODE_LZMA),
+    ]
     if _ZSTD_AVAILABLE:
         modes.append(int(MODE_ZSTD))
     # Stable order for wire advertisement.
@@ -299,6 +315,66 @@ def infer_compact_cmp_label_from_parts(parts: object) -> Optional[str]:
     return infer_compact_cmp_label_from_chunk(chunk)
 
 
+def infer_compact_cmp_label_from_joined_parts(parts: object, total: object) -> Optional[str]:
+    if not isinstance(parts, dict):
+        return None
+    try:
+        total_i = int(total)
+    except Exception:
+        total_i = 0
+    if total_i <= 0:
+        return None
+    blob = bytearray()
+    for i in range(1, total_i + 1):
+        raw_part = parts.get(str(i))
+        if raw_part is None:
+            raw_part = parts.get(i)
+        if raw_part in (None, ""):
+            return None
+        try:
+            blob.extend(b64d(str(raw_part)))
+        except Exception:
+            return None
+    return infer_compact_cmp_label_from_chunk(bytes(blob))
+
+
+def infer_compact_norm_from_chunk(chunk: bytes) -> Optional[str]:
+    raw = bytes(chunk or b"")
+    if len(raw) < 6 or raw[:2] != b"MC":
+        return None
+    try:
+        flags = int(raw[5]) & 0xFF
+    except Exception:
+        return None
+    # message_text_compression.FLAG_TOKEN_STREAM
+    if (flags & (1 << 4)) != 0:
+        return "TOKEN_STREAM"
+    return "off"
+
+
+def infer_compact_norm_from_joined_parts(parts: object, total: object) -> Optional[str]:
+    if not isinstance(parts, dict):
+        return None
+    try:
+        total_i = int(total)
+    except Exception:
+        total_i = 0
+    if total_i <= 0:
+        return None
+    blob = bytearray()
+    for i in range(1, total_i + 1):
+        raw_part = parts.get(str(i))
+        if raw_part is None:
+            raw_part = parts.get(i)
+        if raw_part in (None, ""):
+            return None
+        try:
+            blob.extend(b64d(str(raw_part)))
+        except Exception:
+            return None
+    return infer_compact_norm_from_chunk(bytes(blob))
+
+
 def effective_payload_cmp_label(
     payload_cmp: object,
     compact_wire: bool,
@@ -442,6 +518,29 @@ def wire_id_from_norm(peer_id_norm: str) -> str:
     return norm_id_for_wire(peer_id_norm)
 
 
+def is_broadcast_dest(dest_id: object) -> bool:
+    try:
+        raw = str(dest_id or "").strip().lower()
+    except Exception:
+        raw = ""
+    if not raw:
+        return False
+    known = {
+        str(meshtastic.BROADCAST_ADDR).strip().lower(),
+        "^all",
+        "all",
+        "!ffffffff",
+        "ffffffff",
+    }
+    if raw in known:
+        return True
+    try:
+        norm = norm_id_for_filename(raw).lower()
+    except Exception:
+        norm = raw
+    return norm == "ffffffff"
+
+
 class PeerState:
     def __init__(self, peer_id_norm: str, aes: Optional[AESGCM] = None) -> None:
         self.peer_id_norm = peer_id_norm
@@ -462,6 +561,10 @@ class PeerState:
         self.last_rekey_ts = 0.0
         self.rekey_sent_msgs = 0
         self.last_seen_ts = 0.0
+        # Last explicit meshTalk-offline signal received from this peer.
+        self.app_offline_ts = 0.0
+        # Peer node was observed in mesh network (any packet / node DB signal).
+        self.device_seen_ts = 0.0
         # Set only after confirmed two-way key exchange (peer has our pub and we have peer pub).
         self.key_confirmed_ts = 0.0
         self.compression_capable = False
@@ -491,6 +594,7 @@ class PeerState:
         self.pinned_mismatch = False
         self.pinned_old_fp = ""
         self.pinned_new_fp = ""
+        self.pinned_new_pub_b64 = ""
         self.last_pinned_mismatch_log_ts = 0.0
 
     @property
@@ -560,6 +664,21 @@ def parse_key_frame(
         set(peer_msg) if peer_msg else None,
         set(peer_mc) if peer_mc else None,
     )
+
+
+def parse_app_offline_frame(payload: bytes) -> Optional[str]:
+    try:
+        raw = bytes(payload or b"")
+    except Exception:
+        return None
+    if not raw.startswith(APP_OFFLINE_PREFIX):
+        return None
+    try:
+        peer_raw = raw[len(APP_OFFLINE_PREFIX) :].split(b"|", 1)[0].decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    peer_norm = norm_id_for_filename(peer_raw)
+    return peer_norm if peer_norm else None
 
 
 def load_known_peers(keydir: str, self_id_norm: str) -> Dict[str, x25519.X25519PublicKey]:
@@ -650,6 +769,50 @@ def main() -> int:
     args = ap.parse_args()
     initial_port_arg = args.port
 
+    startup_crash_log = os.path.join(DATA_DIR, "startup_crash.log")
+    _crash_fh = None
+
+    def startup_log(msg: str) -> None:
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(startup_crash_log, "a", encoding="utf-8") as f:
+                f.write(f"{ts} {msg}\n")
+        except Exception:
+            pass
+
+    startup_log(f"BOOT: start v{VERSION} platform={sys.platform} port={args.port}")
+    try:
+        _crash_fh = open(startup_crash_log, "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+
+        def _close_crash_fh() -> None:
+            try:
+                if _crash_fh is not None:
+                    _crash_fh.flush()
+                    _crash_fh.close()
+            except Exception:
+                pass
+
+        atexit.register(_close_crash_fh)
+        startup_log("BOOT: faulthandler enabled")
+    except Exception as e:
+        startup_log(f"BOOT: faulthandler enable failed: {type(e).__name__}: {e}")
+
+    _prev_excepthook = sys.excepthook
+
+    def _startup_excepthook(exc_type, exc_value, exc_tb):
+        try:
+            startup_log("BOOT: unhandled exception:")
+            startup_log("".join(traceback.format_exception(exc_type, exc_value, exc_tb)).rstrip())
+        except Exception:
+            pass
+        try:
+            _prev_excepthook(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _startup_excepthook
+
     pacer = AdaptivePacer(
         rate_seconds=int(getattr(args, "rate_seconds", 30) or 30),
         parallel_sends=int(getattr(args, "parallel_sends", 1) or 1),
@@ -728,13 +891,26 @@ def main() -> int:
                     continue
                 long_name = user.get("longName") or user.get("longname") or node.get("longName")
                 short_name = user.get("shortName") or user.get("shortname") or node.get("shortName")
-                if long_name or short_name:
+                last_heard_ts = 0.0
+                try:
+                    lh = node.get("lastHeard")
+                    if isinstance(lh, (int, float)) and float(lh) > 0.0:
+                        last_heard_ts = float(lh)
+                except Exception:
+                    last_heard_ts = 0.0
+                if long_name or short_name or last_heard_ts > 0.0:
                     rec = {"long": str(long_name or ""), "short": str(short_name or "")}
+                    if last_heard_ts > 0.0:
+                        rec["last_heard_ts"] = float(last_heard_ts)
                     with peer_names_lock:
                         peer_names[norm] = rec
                         # Preserve original-case key too (if different), for UI lookups from user input/history.
                         if norm_raw != norm:
                             peer_names[norm_raw] = rec
+                    if last_heard_ts > 0.0:
+                        st = get_peer_state(norm)
+                        if st and float(last_heard_ts) > float(getattr(st, "device_seen_ts", 0.0) or 0.0):
+                            st.device_seen_ts = float(last_heard_ts)
         except Exception:
             return
 
@@ -834,6 +1010,10 @@ def main() -> int:
         if not subscriptions_registered:
             try:
                 pub.subscribe(on_receive, "meshtastic.receive.data")
+                try:
+                    pub.subscribe(on_receive, "meshtastic.receive")
+                except Exception:
+                    pass
 
                 def _on_conn_status(*_args, **_kwargs):
                     try:
@@ -981,6 +1161,7 @@ def main() -> int:
             st.pinned_mismatch = False
             st.pinned_old_fp = ""
             st.pinned_new_fp = ""
+            st.pinned_new_pub_b64 = ""
         return path
 
     def force_store_peer_pub(peer_id: str, pub_raw: bytes) -> str:
@@ -1005,6 +1186,7 @@ def main() -> int:
             st.pinned_mismatch = False
             st.pinned_old_fp = ""
             st.pinned_new_fp = ""
+            st.pinned_new_pub_b64 = ""
         return path
 
     def should_auto_accept_peer_key_rotation(peer_norm: str, st: Optional[PeerState]) -> tuple[bool, str]:
@@ -1121,8 +1303,71 @@ def main() -> int:
 
     def on_receive(packet, interface=None):
         nonlocal last_activity_ts
+        # Device presence signal: any packet from peer means node is present in mesh.
+        try:
+            now_seen = time.time()
+            from_id_any = packet.get("fromId")
+            peer_norm_any = norm_id_for_filename(from_id_any) if from_id_any else None
+            if peer_norm_any:
+                st_any = get_peer_state(peer_norm_any)
+                if st_any:
+                    st_any.device_seen_ts = now_seen
+        except Exception:
+            pass
         decoded = packet.get("decoded") or {}
         portnum = decoded.get("portnum")
+        # Standard Meshtastic text chat compatibility (for peers that never used meshTalk app).
+        is_text_port = False
+        if isinstance(portnum, str):
+            is_text_port = (portnum == "TEXT_MESSAGE_APP")
+        elif isinstance(portnum, int):
+            is_text_port = (portnum == int(portnums_pb2.PortNum.TEXT_MESSAGE_APP))
+        if is_text_port:
+            from_id_text = packet.get("fromId")
+            peer_norm_text = norm_id_for_filename(from_id_text) if from_id_text else None
+            if not peer_norm_text or peer_norm_text == self_id:
+                return
+            to_id_text = packet.get("toId") or packet.get("to")
+            dialog_id_text = "group:Primary" if is_broadcast_dest(to_id_text) else peer_norm_text
+            payload_text = parse_payload(decoded.get("payload"))
+            text_plain = ""
+            if isinstance(payload_text, (bytes, bytearray)) and payload_text:
+                try:
+                    text_plain = bytes(payload_text).decode("utf-8", errors="replace").strip()
+                except Exception:
+                    text_plain = ""
+            if not text_plain:
+                try:
+                    txt = decoded.get("text")
+                    if txt is None:
+                        txt = packet.get("text")
+                    text_plain = str(txt or "").strip()
+                except Exception:
+                    text_plain = ""
+            if not text_plain:
+                ui_emit("log", f"{ts_local()} RECVSTD: empty text payload from {peer_norm_text}")
+                return
+            packet_id = packet.get("id")
+            if isinstance(packet_id, int):
+                std_msg_id = f"mtxt:{int(packet_id) & 0xFFFFFFFF:08x}"
+            else:
+                try:
+                    rx_time = packet.get("rxTime")
+                    if rx_time is None:
+                        rx_time = decoded.get("rxTime")
+                    basis = "|".join(
+                        [
+                            str(peer_norm_text or ""),
+                            str(to_id_text or ""),
+                            str(rx_time or ""),
+                            str(text_plain or ""),
+                        ]
+                    ).encode("utf-8", errors="replace")
+                    std_msg_id = f"mtxt:{(zlib.crc32(basis) & 0xFFFFFFFF):08x}"
+                except Exception:
+                    std_msg_id = f"mtxt:{os.urandom(4).hex()}"
+            ui_emit("recv_plain", (peer_norm_text, text_plain, std_msg_id, dialog_id_text))
+            return
         if isinstance(portnum, str):
             if portnum != "PRIVATE_APP":
                 return
@@ -1133,17 +1378,35 @@ def main() -> int:
         if not payload:
             return
 
-        # Peer presence signal: any packet on our port counts as "seen".
-        try:
-            now_seen = time.time()
+        app_offline_peer = parse_app_offline_frame(payload)
+        if app_offline_peer:
             from_id_seen = packet.get("fromId")
-            peer_norm_seen = norm_id_for_filename(from_id_seen) if from_id_seen else None
-            if peer_norm_seen:
-                st_seen = get_peer_state(peer_norm_seen)
-                if st_seen:
-                    st_seen.last_seen_ts = now_seen
-        except Exception:
-            pass
+            from_norm = norm_id_for_filename(from_id_seen) if from_id_seen else None
+            peer_norm = app_offline_peer
+            if from_norm and from_norm != peer_norm:
+                ui_emit(
+                    "log",
+                    f"{ts_local()} PRESENCE: ignored offline frame id mismatch from={from_norm} payload={peer_norm}",
+                )
+                return
+            st_off = get_peer_state(peer_norm)
+            now_seen = time.time()
+            if st_off:
+                st_off.last_seen_ts = 0.0
+                st_off.app_offline_ts = now_seen
+                st_off.await_key_confirm = False
+                st_off.force_key_req = False
+                st_off.next_key_req_ts = float("inf")
+            try:
+                rec = peer_meta.setdefault(peer_norm, {})
+                if isinstance(rec, dict):
+                    rec["last_seen_ts"] = 0.0
+                    rec["app_offline_ts"] = now_seen
+            except Exception:
+                pass
+            ui_emit("refresh", None)
+            ui_emit("log", f"{ts_local()} PRESENCE: app offline broadcast from {peer_norm}")
+            return
 
         # Key exchange frames are plaintext
         key_frame = parse_key_frame(payload)
@@ -1174,6 +1437,13 @@ def main() -> int:
             if not accepted_frame:
                 ui_emit("log", f"{ts_local()} KEY: reject frame from {peer_id}.")
                 return
+            try:
+                st_seen = get_peer_state(peer_norm)
+                if st_seen:
+                    st_seen.last_seen_ts = time.time()
+                    st_seen.app_offline_ts = 0.0
+            except Exception:
+                pass
             try:
                 store_peer_pub(peer_id, pub_raw)
             except PeerKeyPinnedError as ex:
@@ -1242,6 +1512,7 @@ def main() -> int:
                     st.pinned_mismatch = True
                     st.pinned_old_fp = str(ex.old_fp or "")
                     st.pinned_new_fp = str(ex.new_fp or "")
+                    st.pinned_new_pub_b64 = b64e(bytes(pub_raw))
                     st.force_key_req = False
                     st.await_key_confirm = False
                     st.next_key_req_ts = float("inf")
@@ -1254,11 +1525,13 @@ def main() -> int:
                             "log",
                             f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required {auto_why}",
                         )
+                    ui_emit("key_conflict", (peer_norm, str(ex.old_fp or ""), str(ex.new_fp or "")))
                 else:
                     ui_emit(
                         "log",
                         f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required {auto_why}",
                     )
+                    ui_emit("key_conflict", (peer_norm, str(ex.old_fp or ""), str(ex.new_fp or "")))
                 return
             except ValueError:
                 ui_emit("log", f"{ts_local()} KEY: reject invalid key frame from {peer_id}.")
@@ -1450,6 +1723,11 @@ def main() -> int:
             return
         if status != "ok" or msg_type is None or msg_id is None:
             return
+        try:
+            st.last_seen_ts = time.time()
+            st.app_offline_ts = 0.0
+        except Exception:
+            pass
         # If peer already started using the candidate session key, switch implicitly to avoid churn.
         try:
             if (
@@ -1906,7 +2184,16 @@ def main() -> int:
     )
 
     if interface is not None:
-        pub.subscribe(on_receive, "meshtastic.receive.data")
+        if not subscriptions_registered:
+            try:
+                pub.subscribe(on_receive, "meshtastic.receive.data")
+                try:
+                    pub.subscribe(on_receive, "meshtastic.receive")
+                except Exception:
+                    pass
+                subscriptions_registered = True
+            except Exception:
+                pass
 
     def regenerate_keys() -> None:
         nonlocal priv, pub_self, pub_self_raw
@@ -2055,6 +2342,22 @@ def main() -> int:
             ui_emit("radio_lost", None)
             return
 
+    def send_app_offline_broadcast() -> None:
+        if not radio_ready or interface is None:
+            return
+        payload = APP_OFFLINE_PREFIX + self_id.encode("utf-8")
+        try:
+            interface.sendData(
+                payload,
+                destinationId=meshtastic.BROADCAST_ADDR,
+                wantAck=False,
+                portNum=DEFAULT_PORTNUM,
+                channelIndex=(args.channel if args.channel is not None else 0),
+            )
+            ui_emit("log", f"{ts_local()} PRESENCE: app offline broadcast")
+        except Exception:
+            pass
+
     def split_bytes(data: bytes, max_bytes: int) -> list[bytes]:
         if max_bytes <= 0:
             return [data]
@@ -2081,7 +2384,8 @@ def main() -> int:
             return None
         if plain <= 0 or packed < 0:
             return None
-        return ((float(plain) - float(packed)) / float(plain)) * 100.0
+        # Unified metric everywhere: resulting packed size as % of original.
+        return (float(packed) / float(plain)) * 100.0
 
     def normalize_compression_name(raw_name: Optional[str]) -> Optional[str]:
         name = str(raw_name or "").strip()
@@ -2105,7 +2409,7 @@ def main() -> int:
         }
         return aliases.get(low, name)
 
-    def queue_message(peer_norm: str, text: str) -> Optional[tuple[str, int, Optional[str], Optional[float]]]:
+    def queue_message(peer_norm: str, text: str) -> Optional[tuple[str, int, Optional[str], Optional[float], Optional[str]]]:
         nonlocal last_activity_ts
         peer_norm = norm_id_for_filename(peer_norm)
         st = get_peer_state(peer_norm)
@@ -2151,7 +2455,8 @@ def main() -> int:
         if compression_policy != "off" and peer_supports_mc and peer_supports_msg_v2 and (not plain_fits_one_packet):
             best_blob: Optional[bytes] = None
             best_mode: Optional[int] = None
-            normalize_mode = str(cfg.get("compression_normalize", "off") or "off").strip().lower()
+            best_norm_mode = "off"
+            compression_normalize = str(cfg.get("compression_normalize", "auto") or "auto").strip().lower()
             if compression_policy == "force":
                 if compression_force_mode in peer_supported_modes:
                     mode_order = [compression_force_mode]
@@ -2163,29 +2468,51 @@ def main() -> int:
                     )
             else:
                 mode_order = list(peer_supported_modes)
-            for mode_try in mode_order:
-                if best_mode is not None and mode_try == best_mode:
-                    continue
+            # Full auto only when BOTH selectors are AUTO.
+            if compression_policy == "auto" and compression_normalize == "auto":
+                norm_order = ["off", "tokens", "sp_vocab"]
+            elif compression_normalize in ("off", "tokens", "sp_vocab"):
+                norm_order = [compression_normalize]
+            else:
+                norm_order = ["off"]
+            for normalize_mode in norm_order:
                 try:
-                    candidate = compress_text(text, mode=mode_try, preserve_case=True, normalize=normalize_mode)
+                    norm_stat = normalization_stats(text, normalize=normalize_mode)
+                    plain_n = int(norm_stat.get("plain_bytes", 0) or 0)
+                    norm_n = int(norm_stat.get("normalized_bytes", 0) or 0)
+                    norm_size_pct = (100.0 * norm_n / max(1, plain_n))
+                    ui_emit(
+                        "log",
+                        f"{ts_local()} NORM: group={group_id} mode={norm_stat.get('mode')} "
+                        f"plain={plain_n} "
+                        f"normalized={norm_n} "
+                        f"tokens={int(norm_stat.get('tokens', 0) or 0)} "
+                        f"size={norm_size_pct:.1f}%",
+                    )
                 except Exception:
-                    continue
-                if (best_blob is None) or (len(candidate) < len(best_blob)):
-                    best_blob = candidate
-                    best_mode = mode_try
+                    pass
+                for mode_try in mode_order:
+                    try:
+                        candidate = compress_text(text, mode=mode_try, preserve_case=True, normalize=normalize_mode)
+                    except Exception:
+                        continue
+                    if (best_blob is None) or (len(candidate) < len(best_blob)):
+                        best_blob = candidate
+                        best_mode = mode_try
+                        best_norm_mode = normalize_mode
             if best_blob is not None and len(best_blob) < (len(text_bytes) - int(AUTO_MIN_GAIN_BYTES)):
                 payload_blob = best_blob
                 use_compact_wire = True
                 compression_flag = 1
                 cmp_label = mode_name(int(best_mode))
-                cmp_norm_label = normalize_mode
+                cmp_norm_label = best_norm_mode
                 packed_blob_len = len(best_blob)
                 cmp_eff_pct = compression_efficiency_pct(len(text_bytes), len(best_blob))
                 ui_emit(
                     "log",
                     f"{ts_local()} COMPRESS: group={group_id} mode={normalize_compression_name(cmp_label) or cmp_label} "
                     f"norm={cmp_norm_label} plain={len(text_bytes)} packed={packed_blob_len} "
-                    f"gain={(cmp_eff_pct if cmp_eff_pct is not None else 0.0):.1f}%",
+                    f"size={(cmp_eff_pct if cmp_eff_pct is not None else 0.0):.1f}%",
                 )
         if use_compact_wire:
             max_chunk = max(1, max_plain - MSG_V2_HEADER_LEN)
@@ -2273,7 +2600,7 @@ def main() -> int:
             print(f"WAITING KEY: queued for {peer_norm} id={group_id}")
         ui_emit("queued", (peer_norm, group_id, len(text_bytes), int(total), str(cmp_label)))
         tracked_peers.add(peer_norm)
-        return (group_id, total, normalize_compression_name(cmp_label), cmp_eff_pct)
+        return (group_id, total, normalize_compression_name(cmp_label), cmp_eff_pct, str(cmp_norm_label or "off").upper())
 
     send_window_start_ts = 0.0
     send_window_count = 0
@@ -2625,7 +2952,7 @@ def main() -> int:
                     comp_msgs = int(comp_stats.get("compressed_msgs", 0) or 0)
                     plain_total = int(comp_stats.get("plain_bytes_total", 0) or 0)
                     packed_total = int(comp_stats.get("packed_bytes_total", 0) or 0)
-                    gain_pct = compression_efficiency_pct(plain_total, packed_total)
+                    size_pct = compression_efficiency_pct(plain_total, packed_total)
                     by_mode = dict(comp_stats.get("by_mode", {}) or {})
                     by_norm = dict(comp_stats.get("by_norm", {}) or {})
                     top_mode = "-"
@@ -2639,7 +2966,7 @@ def main() -> int:
                         f"{ts_local()} COMPSTAT: total={total_msgs} compressed={comp_msgs} "
                         f"ratio={(100.0 * comp_msgs / max(1, total_msgs)):.1f}% "
                         f"plain={plain_total} packed={packed_total} "
-                        f"gain={(gain_pct if gain_pct is not None else 0.0):.1f}% "
+                        f"size={(size_pct if size_pct is not None else 0.0):.1f}% "
                         f"top_mode={top_mode} top_norm={top_norm}",
                     )
                 except Exception:
@@ -2693,6 +3020,16 @@ def main() -> int:
             return -1
 
         nonlocal security_policy, session_rekey_enabled
+        if sys.platform.startswith("win"):
+            # Some Windows + Qt + GPU driver combinations crash on startup in native GL paths.
+            # Force software backend for startup stability.
+            os.environ.setdefault("QT_OPENGL", "software")
+            os.environ.setdefault("QT_QUICK_BACKEND", "software")
+            os.environ.setdefault("QSG_RHI_BACKEND", "software")
+            try:
+                QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseSoftwareOpenGL, True)
+            except Exception:
+                pass
         app = QtWidgets.QApplication(sys.argv)
         win = QtWidgets.QWidget()
         win.setWindowTitle(f"meshTalk v{VERSION}")
@@ -2718,8 +3055,10 @@ def main() -> int:
                 "settings": "⚙",
                 "settings_title": "Settings",
                 "tab_general": "General",
+                "tab_contacts": "Contacts",
                 "tab_security": "Security",
                 "tab_compression": "Compression",
+                "tab_theme": "Themes",
                 "tab_log": "Log",
                 "tab_about": "About",
                 "language": "Language",
@@ -2744,14 +3083,23 @@ def main() -> int:
                 "recent": "Contact list",
                 "last_seen": "Last seen",
                 "key_age": "Key",
+                "status_device_online": "device online",
+                "status_app_online": "meshTalk online",
                 "peer_delete": "Delete contact",
                 "peer_delete_confirm": "Delete contact '{name}'?",
                 "clear_history": "Clear history",
                 "clear_history_confirm": "Clear chat history with '{name}'?",
                 "group_add": "Add selected to group",
                 "actions": "Actions",
-                "key_request": "Request key",
+                "key_request": "Send and request public key",
                 "key_reset": "Reset key",
+                "key_conflict_title": "Key conflict detected",
+                "key_conflict_text": "Pinned key mismatch for {peer}. Stored: {old_fp}, received: {new_fp}.",
+                "key_conflict_replace": "accept",
+                "key_conflict_paranoid": "ignore",
+                "key_conflict_header_notice": "ID: {peer}{peer_name} sent a new public key",
+                "key_conflict_header_replace_tip": "Accept new key",
+                "key_conflict_header_ignore_tip": "Keep current pinned key",
                 "settings_runtime": "Runtime settings",
                 "port": "Port",
                 "channel": "Channel",
@@ -2777,12 +3125,28 @@ def main() -> int:
                 "hint_discovery_send": "Sends discovery broadcasts (extra traffic).",
                 "hint_discovery_reply": "Replies to discovery broadcasts (extra traffic).",
                 "hint_clear_pending": "Clears pending queue when switching profile/dialog.",
+                "contacts_visibility": "Contacts visibility",
+                "contacts_visibility_all": "Show all devices",
+                "contacts_visibility_online": "Show online",
+                "contacts_visibility_app": "Show meshTalk contacts",
+                "contacts_visibility_device": "Show Meshtastic-only",
+                "hint_contacts_visibility_all": "Show all known contacts, regardless of online status.",
+                "hint_contacts_visibility_online": "Show only contacts currently online.",
+                "hint_contacts_visibility_app": "Show contacts seen by meshTalk app traffic (online or recently offline).",
+                "hint_contacts_visibility_device": "Show contacts seen only by Meshtastic device traffic.",
+                "contacts_status_legend_title": "Status legend",
+                "hint_status_green": "Green: app active within last 30 minutes and keys are valid.",
+                "hint_status_blue": "Dark green: meshTalk contact is temporarily offline (seen within last 24 hours).",
+                "hint_status_yellow": "Yellow: Meshtastic-only contact is currently online.",
+                "hint_status_orange": "Dark yellow: Meshtastic-only contact is offline (seen within last 24 hours).",
+                "hint_status_none": "No status: empty.",
                 "security": "Security",
                 "security_policy": "Key rotation policy",
                 "security_policy_auto": "AUTO (recommended)",
                 "security_policy_strict": "STRICT",
                 "security_policy_always": "ALWAYS ACCEPT",
                 "security_policy_hint": "Controls what happens when a peer key changes (TOFU).",
+                "security_crypto_summary": "Transport: MT-WIREv1 (AES-256-GCM AEAD). Key exchange: KR1/KR2 with X25519 public key. Key derivation: HKDF-SHA256. Local profile storage: AES-256-GCM.",
                 "session_rekey": "Session rekey (ephemeral)",
                 "session_rekey_hint": "When enabled, periodically refreshes the session key using ephemeral X25519 inside the encrypted channel. This reduces impact of long-term key compromise, but increases control traffic slightly.",
                 "compression_title": "Compression",
@@ -2792,6 +3156,7 @@ def main() -> int:
                 "compression_policy_force": "Force algorithm",
                 "compression_force_algo": "Algorithm",
                 "compression_normalize": "Normalization (preprocess)",
+                "compression_normalize_auto": "AUTO (recommended)",
                 "compression_normalize_off": "OFF",
                 "compression_normalize_tokens": "Token stream (basic, reversible)",
                 "compression_normalize_sp_vocab": "SentencePiece vocab (reversible)",
@@ -2800,6 +3165,11 @@ def main() -> int:
                 "compression_allow_zstd": "Zstandard (ZSTD)",
                 "compression_allow_zstd_hint": "Zstandard is a required dependency (requirements.txt).",
                 "compression_force_hint": "Force is applied only when peer supports MC+MSGv2; otherwise AUTO/plain is used.",
+                "theme_title": "Color theme",
+                "theme_select": "Theme",
+                "theme_ubuntu_style": "ubuntu style",
+                "theme_brutal_man": "brutal man",
+                "theme_hint": "Applies immediately to the main window and settings dialog.",
                 "security_auto_stale_hours": "Auto accept if key age, h",
                 "security_auto_seen_minutes": "Auto accept if seen within, min",
                 "security_auto_mode": "Auto rule",
@@ -2812,8 +3182,11 @@ def main() -> int:
                 "full_reset_unavailable": "Full reset is available after node/profile initialization.",
                 "copy_log": "Copy log",
                 "clear_log": "Clear log",
+                "ack_alerts": "Acknowledge alerts",
+                "alerts_show": "Show alert",
                 "msg_ctx_copy": "Copy",
                 "msg_ctx_route": "Traceroute request",
+                "meta_std_text": "Meshtastic text",
                 "msg_route_title": "Message route",
                 "msg_route_na": "Route information is not available yet for this message.",
                 "msg_route_hops": "Hops",
@@ -2844,8 +3217,10 @@ def main() -> int:
                 "settings": "⚙",
                 "settings_title": "Настройки",
                 "tab_general": "Общие",
+                "tab_contacts": "Контакты",
                 "tab_security": "Безопасность",
                 "tab_compression": "Сжатие",
+                "tab_theme": "Темы",
                 "tab_log": "Лог",
                 "tab_about": "О программе",
                 "language": "Язык",
@@ -2870,14 +3245,23 @@ def main() -> int:
                 "recent": "Список контактов",
                 "last_seen": "В сети",
                 "key_age": "Ключ",
+                "status_device_online": "device online",
+                "status_app_online": "meshTalk online",
                 "peer_delete": "Удалить собеседника",
                 "peer_delete_confirm": "Удалить собеседника '{name}'?",
                 "clear_history": "Очистить историю",
                 "clear_history_confirm": "Очистить историю чата с '{name}'?",
                 "group_add": "Добавить выделенных в группу",
                 "actions": "Действия",
-                "key_request": "Запросить ключ",
+                "key_request": "Отправить и запросить public key",
                 "key_reset": "Сбросить ключ",
+                "key_conflict_title": "Обнаружен конфликт ключа",
+                "key_conflict_text": "Конфликт закрепленного ключа для {peer}. В базе: {old_fp}, получен: {new_fp}.",
+                "key_conflict_replace": "принять",
+                "key_conflict_paranoid": "отклонить",
+                "key_conflict_header_notice": "ID: {peer}{peer_name} прислал новый public key",
+                "key_conflict_header_replace_tip": "Заменить ключ в базе",
+                "key_conflict_header_ignore_tip": "Оставить текущий закрепленный ключ",
                 "settings_runtime": "Параметры запуска",
                 "port": "Порт",
                 "channel": "Канал",
@@ -2903,12 +3287,28 @@ def main() -> int:
                 "hint_discovery_send": "Отправляет discovery broadcasts (доп. трафик).",
                 "hint_discovery_reply": "Отвечает на discovery broadcasts (доп. трафик).",
                 "hint_clear_pending": "Очищает очередь при переключении профиля/диалога.",
+                "contacts_visibility": "Отображение контактов",
+                "contacts_visibility_all": "Показывать все устройства",
+                "contacts_visibility_online": "Показывать онлайн",
+                "contacts_visibility_app": "Показывать meshTalk контакты",
+                "contacts_visibility_device": "Показывать только Meshtastic",
+                "hint_contacts_visibility_all": "Показывает все известные контакты, даже если сейчас нет онлайн-сигнала.",
+                "hint_contacts_visibility_online": "Показывает только контакты, которые сейчас онлайн.",
+                "hint_contacts_visibility_app": "Показывает контакты, замеченные по трафику meshTalk (онлайн или недавно оффлайн).",
+                "hint_contacts_visibility_device": "Показывает контакты, замеченные только по трафику Meshtastic устройства.",
+                "contacts_status_legend_title": "Подсказки по статусам",
+                "hint_status_green": "Зеленый: приложение активно за последние 30 минут и ключи валидны.",
+                "hint_status_blue": "Темно-зеленый: meshTalk контакт временно оффлайн (был замечен за последние 24 часа).",
+                "hint_status_yellow": "Желтый: контакт без meshTalk, но устройство сейчас онлайн.",
+                "hint_status_orange": "Темно-желтый: контакт без meshTalk, устройство оффлайн (было замечено за последние 24 часа).",
+                "hint_status_none": "Без статуса: пустой.",
                 "security": "Безопасность",
                 "security_policy": "Политика смены ключа",
                 "security_policy_auto": "AUTO (рекомендуется)",
                 "security_policy_strict": "STRICT",
                 "security_policy_always": "ALWAYS ACCEPT",
                 "security_policy_hint": "Определяет поведение при смене публичного ключа пира (TOFU).",
+                "security_crypto_summary": "Транспорт: MT-WIREv1 (AES-256-GCM AEAD). Обмен ключами: KR1/KR2 с X25519 public key. Вывод ключа: HKDF-SHA256. Локальное хранение профиля: AES-256-GCM.",
                 "session_rekey": "Rekey сессии (ephemeral)",
                 "session_rekey_hint": "Если включено, периодически обновляет ключ сессии через ephemeral X25519 внутри зашифрованного канала. Это снижает эффект компрометации долгоживущего ключа, но чуть увеличивает служебный трафик.",
                 "compression_title": "Сжатие",
@@ -2918,6 +3318,7 @@ def main() -> int:
                 "compression_policy_force": "Принудительный алгоритм",
                 "compression_force_algo": "Алгоритм",
                 "compression_normalize": "Нормализация (подготовка)",
+                "compression_normalize_auto": "AUTO (рекомендуется)",
                 "compression_normalize_off": "OFF",
                 "compression_normalize_tokens": "Token stream (базовый, обратимый)",
                 "compression_normalize_sp_vocab": "SentencePiece vocab (обратимый)",
@@ -2926,6 +3327,11 @@ def main() -> int:
                 "compression_allow_zstd": "Zstandard (ZSTD)",
                 "compression_allow_zstd_hint": "Zstandard теперь обязательная зависимость (requirements.txt).",
                 "compression_force_hint": "Принудительный режим применяется только при поддержке peer MC+MSGv2; иначе используется AUTO/plain.",
+                "theme_title": "Цветовая тема",
+                "theme_select": "Тема",
+                "theme_ubuntu_style": "ubuntu style",
+                "theme_brutal_man": "brutal man",
+                "theme_hint": "Применяется сразу к главному окну и окну настроек.",
                 "security_auto_stale_hours": "Автопринять если ключ старше, ч",
                 "security_auto_seen_minutes": "Автопринять если был в сети, мин",
                 "security_auto_mode": "Правило AUTO",
@@ -2938,8 +3344,11 @@ def main() -> int:
                 "full_reset_unavailable": "Полный сброс доступен после инициализации ноды/профиля.",
                 "copy_log": "Копировать лог",
                 "clear_log": "Очистить лог",
+                "ack_alerts": "Подтвердить тревоги",
+                "alerts_show": "Показать тревогу",
                 "msg_ctx_copy": "Копировать",
-                "msg_ctx_route": "Запрос трассировки",
+                "msg_ctx_route": "Запрос traceroute",
+                "meta_std_text": "Meshtastic text",
                 "msg_route_title": "Маршрут сообщения",
                 "msg_route_na": "Информация о маршруте для этого сообщения пока недоступна.",
                 "msg_route_hops": "Хопов",
@@ -2977,6 +3386,9 @@ def main() -> int:
         security_policy = str(cfg.get("security_key_rotation_policy", security_policy) or "auto").strip().lower()
         if security_policy not in ("auto", "strict", "always"):
             security_policy = "auto"
+        contacts_visibility = str(cfg.get("contacts_visibility", "all") or "all").strip().lower()
+        if contacts_visibility not in ("all", "online", "app", "device"):
+            contacts_visibility = "all"
         last_pacing_save_ts = 0.0
         pinned_dialogs = set(cfg.get("pinned_dialogs", []))
         hidden_contacts = set(cfg.get("hidden_contacts", []))
@@ -3012,10 +3424,13 @@ def main() -> int:
         set_mono(search_field)
         search_field.setPlaceholderText(tr("search"))
         search_field.setFixedHeight(32)
+        search_click_state = {"last_ts": 0.0, "count": 0}
         items_list = QtWidgets.QListWidget()
+        items_list.setObjectName("contactsList")
         set_mono(items_list)
-        items_list.setIconSize(QtCore.QSize(36, 36))
+        items_list.setIconSize(QtCore.QSize(44, 44))
         items_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        items_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         items_list.setSpacing(0)
         items_list.setUniformItemSizes(False)
         items_list.setContentsMargins(0, 0, 0, 0)
@@ -3043,27 +3458,95 @@ def main() -> int:
         chat_label.setObjectName("section")
         set_mono(chat_label, 13)
         chat_label.setFixedHeight(32)
-        chat_label.setAlignment(QtCore.Qt.AlignCenter)
+        chat_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        chat_label.setContentsMargins(8, 0, 0, 0)
         chat_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         chat_label.setTextInteractionFlags(QtCore.Qt.NoTextInteraction)
         chat_label.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         settings_spacer = QtWidgets.QSpacerItem(10, 10, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
+        key_renew_btn = QtWidgets.QPushButton("Renew")
+        key_renew_btn.setFixedSize(108, 32)
+        key_renew_btn.setStyleSheet("QPushButton { background:#2f5f3a; color:#ecfff0; font-weight:600; border:1px solid #4f8a60; } QPushButton:hover { background:#3c7449; }")
+        key_renew_btn.hide()
+        key_ignore_btn = QtWidgets.QPushButton("Ignore")
+        key_ignore_btn.setFixedSize(108, 32)
+        key_ignore_btn.setStyleSheet("QPushButton { background:#5f3a2f; color:#fff2ec; font-weight:600; border:1px solid #8a5f4f; } QPushButton:hover { background:#74493c; }")
+        key_ignore_btn.hide()
+        alert_btn = QtWidgets.QPushButton("!")
+        alert_btn.setFixedSize(32, 32)
+        alert_btn.setToolTip(tr("alerts_show"))
+        alert_btn.hide()
         settings_btn = QtWidgets.QPushButton(tr("settings"))
         settings_btn.setFixedHeight(32)
         header_layout.addWidget(chat_label, 1)
         header_layout.addItem(settings_spacer)
+        header_layout.addWidget(key_renew_btn, 0)
+        header_layout.addWidget(key_ignore_btn, 0)
+        header_layout.addWidget(alert_btn, 0)
         header_layout.addWidget(settings_btn, 0)
         header_bar.setFixedHeight(32)
         settings_row.addWidget(header_bar, 1)
+        alert_overlay = QtWidgets.QFrame(header_bar)
+        alert_overlay.hide()
+        alert_overlay.raise_()
+        alert_overlay.setFixedHeight(32)
+        alert_overlay.setStyleSheet("background:#7a1e1e;border:none;")
+        alert_overlay_layout = QtWidgets.QHBoxLayout(alert_overlay)
+        alert_overlay_layout.setContentsMargins(10, 0, 10, 0)
+        alert_overlay_layout.setSpacing(0)
+        alert_overlay_label = QtWidgets.QLabel("")
+        set_mono(alert_overlay_label, 11)
+        alert_overlay_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        alert_overlay_label.setStyleSheet("color:#fff2f2;font-weight:600;")
+        alert_overlay_layout.addWidget(alert_overlay_label, 1)
+        alert_anim = QtCore.QPropertyAnimation(alert_overlay, b"pos")
+        alert_anim.setDuration(220)
+        alert_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        alert_overlay_visible = False
+        _orig_header_resize_event = header_bar.resizeEvent
+        def _header_resize_event(e):
+            try:
+                w = max(1, header_bar.width())
+                h = header_bar.height()
+                alert_overlay.setFixedWidth(w)
+                alert_overlay.setFixedHeight(h)
+                if alert_overlay_visible:
+                    alert_overlay.move(0, 0)
+                else:
+                    alert_overlay.move(w, 0)
+            except Exception:
+                pass
+            try:
+                _orig_header_resize_event(e)
+            except Exception:
+                pass
+        header_bar.resizeEvent = _header_resize_event
         right_col.addLayout(settings_row, 0)
-        chat_text = QtWidgets.QTextEdit()
-        chat_text.setReadOnly(True)
+        chat_text = QtWidgets.QListWidget()
+        chat_text.setObjectName("chatList")
         set_mono(chat_text)
+        chat_text.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        chat_text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        chat_text.setSpacing(1)
+        chat_text.setUniformItemSizes(False)
         chat_text.setContentsMargins(0, 0, 0, 0)
-        chat_text.setViewportMargins(0, 0, 0, 0)
-        chat_text.document().setDocumentMargin(0)
         chat_text.setFrameShape(QtWidgets.QFrame.NoFrame)
         right_col.addWidget(chat_text, 4)
+        _orig_chat_resize_event = chat_text.resizeEvent
+        _chat_layout_state = {"viewport_w": -1}
+        def _chat_resize_event(e):
+            try:
+                _orig_chat_resize_event(e)
+            except Exception:
+                pass
+            try:
+                vpw = int(chat_text.viewport().width())
+                if vpw != int(_chat_layout_state.get("viewport_w", -1)):
+                    _chat_layout_state["viewport_w"] = vpw
+                    relayout_chat_items(chat_text)
+            except Exception:
+                pass
+        chat_text.resizeEvent = _chat_resize_event
 
         class InputBox(QtWidgets.QTextEdit):
             def __init__(self, *args, **kwargs):
@@ -3110,8 +3593,169 @@ def main() -> int:
             max_h = max(32, int(win.height() / 3))
             msg_entry.setFixedHeight(min(content_h, max_h))
 
+        def adjust_contacts_panel_width() -> None:
+            try:
+                fm = QtGui.QFontMetrics(items_list.font())
+                max_line = 0
+                for i in range(items_list.count()):
+                    it = items_list.item(i)
+                    if it is None:
+                        continue
+                    txt = str(it.text() or "")
+                    for ln in (txt.splitlines() or [txt]):
+                        max_line = max(max_line, int(fm.horizontalAdvance(ln)))
+                # icon + paddings + status marker reserve
+                needed = max(260, max_line + 44 + 42)
+                cap = max(280, int(win.width() * 0.48))
+                target = min(needed, cap)
+                list_group.setMinimumWidth(target)
+            except Exception:
+                pass
+
         msg_entry.textChanged.connect(adjust_input_height)
-        win.resizeEvent = (lambda e, _orig=win.resizeEvent: (_orig(e), adjust_input_height()))
+        _orig_win_resize_event = win.resizeEvent
+        def _win_resize_event(e):
+            try:
+                _orig_win_resize_event(e)
+            except Exception:
+                pass
+            try:
+                adjust_input_height()
+            except Exception:
+                pass
+            try:
+                adjust_contacts_panel_width()
+            except Exception:
+                pass
+        win.resizeEvent = _win_resize_event
+
+        peer_logo_cache: Dict[Tuple[str, int], "QtGui.QPixmap"] = {}
+
+        def _peer_logo_pixmap(peer_id: str, side: int) -> "QtGui.QPixmap":
+            s = max(16, int(side))
+            key = (str(peer_id or ""), s)
+            cached = peer_logo_cache.get(key)
+            if cached is not None:
+                return cached
+            token = str(key[0]).encode("utf-8", errors="ignore")
+            digest = hashlib.blake2s(token, digest_size=32).digest()
+            base_h = (digest[0] / 255.0) % 1.0
+            sat = 0.18 + (digest[1] / 255.0) * 0.12
+            lum = 0.40 + (digest[2] / 255.0) * 0.10
+
+            def _col(h_off: float, l_off: float, s_mul: float = 1.0) -> "QtGui.QColor":
+                h = (base_h + h_off) % 1.0
+                l = min(0.82, max(0.16, lum + l_off))
+                s_local = max(0.08, min(0.50, sat * s_mul))
+                r, g, b = colorsys.hls_to_rgb(h, l, s_local)
+                return QtGui.QColor(int(r * 255), int(g * 255), int(b * 255))
+
+            c_bg = _col(0.00, -0.16, 0.7)
+            c_line = _col(0.00, 0.06, 1.0)
+            c_line.setAlpha(118)
+
+            pm = QtGui.QPixmap(s, s)
+            pm.fill(QtCore.Qt.transparent)
+            p = QtGui.QPainter(pm)
+            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+
+            outer = QtCore.QRectF(0.5, 0.5, float(s - 1), float(s - 1))
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(c_bg)
+            p.drawRoundedRect(outer, max(2.0, s * 0.22), max(2.0, s * 0.22))
+
+            # Deterministic RNG-like values from digest.
+            vals = []
+            ctr = 0
+            while len(vals) < 96:
+                block = hashlib.blake2s(token + ctr.to_bytes(2, "big"), digest_size=32).digest()
+                vals.extend(block)
+                ctr += 1
+            vi = 0
+
+            def _v01() -> float:
+                nonlocal vi
+                b = vals[vi % len(vals)]
+                vi += 1
+                return float(b) / 255.0
+
+            cx = outer.center().x()
+            cy = outer.center().y()
+            rad = min(outer.width(), outer.height()) * 0.42
+
+            # One continuous "finger signature" stroke with a few loops.
+            freq1 = 0.9 + _v01() * 1.3
+            freq2 = 1.2 + _v01() * 1.6
+            phase1 = _v01() * math.pi * 2.0
+            phase2 = _v01() * math.pi * 2.0
+            amp_x = rad * (0.78 + _v01() * 0.30)
+            amp_y = rad * (0.58 + _v01() * 0.26)
+            drift_x = (-0.28 + _v01() * 0.56) * rad
+            drift_y = (-0.18 + _v01() * 0.36) * rad
+            width_base = max(2.0, s * (0.105 + _v01() * 0.075))
+            width_jitter = width_base * 0.30
+            steps = 56
+
+            def _stroke_point(t: float) -> "QtCore.QPointF":
+                # Short compact signature-like motion with 2-4 soft loops.
+                t2 = t - 0.5
+                x = cx + drift_x * t2
+                y = cy + drift_y * t2
+                x += amp_x * (
+                    0.70 * math.sin((freq1 * 2.0 * math.pi * t) + phase1)
+                    + 0.22 * math.sin((freq2 * 2.0 * math.pi * t) + phase2)
+                    + 0.08 * math.sin(((freq2 + 1.4) * 2.0 * math.pi * t) + (phase1 * 0.6))
+                )
+                y += amp_y * (
+                    0.66 * math.sin(((freq1 + 0.45) * 2.0 * math.pi * t) + (phase2 * 0.85))
+                    + 0.24 * math.sin(((freq2 + 0.25) * 2.0 * math.pi * t) + (phase1 * 1.1))
+                    + 0.10 * math.sin(((freq2 + 1.00) * 2.0 * math.pi * t) + (phase2 * 0.7))
+                )
+                # Keep stroke open: soften center over-crossing density.
+                center_soft = 0.82 + (0.18 * abs((t * 2.0) - 1.0))
+                x = cx + (x - cx) * center_soft
+                y = cy + (y - cy) * center_soft
+                return QtCore.QPointF(x, y)
+
+            prev_pt = _stroke_point(0.0)
+            for st_i in range(1, steps + 1):
+                t = float(st_i) / float(steps)
+                cur_pt = _stroke_point(t)
+                tx = cur_pt.x() - prev_pt.x()
+                ty = cur_pt.y() - prev_pt.y()
+                tl = max(1e-6, math.hypot(tx, ty))
+                jnx = -ty / tl
+                jny = tx / tl
+                jitter_amp = rad * (0.007 + _v01() * 0.016)
+                j = (-0.5 + _v01()) * 2.0 * jitter_amp
+                cur_pt = QtCore.QPointF(cur_pt.x() + (jnx * j), cur_pt.y() + (jny * j))
+                # Finger-pressure profile: gentle attack -> peak -> release.
+                if t < 0.25:
+                    pressure_shape = 0.86 + (t / 0.25) * 0.22
+                elif t < 0.70:
+                    pressure_shape = 1.08 - ((t - 0.25) / 0.45) * 0.06
+                else:
+                    pressure_shape = 1.02 - ((t - 0.70) / 0.30) * 0.34
+                pressure = pressure_shape + ((-0.5 + _v01()) * 0.14) + (0.07 * math.sin((2.0 * math.pi * t) + (phase1 * 0.45)))
+                w = max(1.0, (width_base + ((-0.5 + _v01()) * 2.0 * width_jitter)) * pressure)
+                # Keep stroke translucent with subtle alpha changes along the gesture.
+                # Slightly stronger color drift along the stroke path.
+                h_drift = (-0.070 + (0.140 * t))
+                l_drift = (-0.090 + (0.200 * t))
+                s_drift = 0.78 + (0.38 * t)
+                col = _col(h_drift, l_drift, s_drift)
+                alpha = int(80 + max(0.0, min(1.0, pressure - 0.64)) * 110)
+                col.setAlpha(max(66, min(182, alpha)))
+                pen = QtGui.QPen(col, w, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
+                p.setPen(pen)
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.drawLine(prev_pt, cur_pt)
+                prev_pt = cur_pt
+
+            p.end()
+            peer_logo_cache[key] = pm
+            return pm
 
         class ContactDelegate(QtWidgets.QStyledItemDelegate):
             def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex) -> None:
@@ -3119,62 +3763,98 @@ def main() -> int:
                 data = index.data(QtCore.Qt.UserRole)
                 if not isinstance(data, dict):
                     return
-                lock_state = data.get("lock")
                 unread = int(data.get("unread", 0) or 0)
                 rect = option.rect
                 pad = 4
                 selected = bool(option.state & QtWidgets.QStyle.State_Selected)
+                panel_size = max(8, int(rect.height() / 5))
+                icon_w = int(option.decorationSize.width()) if option.decorationSize.isValid() else 44
+                icon_h = int(option.decorationSize.height()) if option.decorationSize.isValid() else 44
+                icon_side = max(16, min(max(icon_w, icon_h), max(16, rect.height() - 8)))
+                icon_left = rect.left() + 6
+                icon_top = rect.top() + max(2, int((rect.height() - icon_side) / 2))
+                panel_left = icon_left + icon_side - panel_size
+                panel_top = icon_top + icon_side - panel_size
+                panel_left = min(max(rect.left(), panel_left), max(rect.left(), rect.right() - panel_size))
+                panel_top = min(max(rect.top(), panel_top), max(rect.top(), rect.bottom() - panel_size))
+                panel_rect = QtCore.QRect(panel_left, panel_top, panel_size, panel_size)
+                text_rect = QtCore.QRect(rect.left() + pad, rect.top(), max(1, rect.width() - (pad * 2)), rect.height())
                 painter.save()
-                if unread > 0:
-                    dot = 8
-                    dot_x = rect.right() - dot - pad - 2
-                    dot_y = rect.top() + pad + 2
+                status_code = str(data.get("status_code", "") or "")
+                panel_color = None
+                if status_code == "app_online":
+                    panel_color = QtGui.QColor("#2bbf66")
+                elif status_code == "app_offline":
+                    panel_color = QtGui.QColor("#1f6b3f")
+                elif status_code == "mesh_online":
+                    panel_color = QtGui.QColor("#d9b233")
+                elif status_code == "mesh_offline":
+                    panel_color = QtGui.QColor("#8f6f18")
+                if panel_color is not None:
                     painter.setPen(QtCore.Qt.NoPen)
-                    painter.setBrush(QtGui.QColor("#ff9800"))
-                    painter.drawEllipse(QtCore.QRect(dot_x, dot_y, dot, dot))
-                fg = QtGui.QColor("#2b0a22") if selected else QtGui.QColor("#8a7f8b")
-                painter.setPen(fg)
-                font = painter.font()
-                font.setPointSize(8)
-                painter.setFont(font)
-                fm = QtGui.QFontMetrics(font)
-                line_h = int(max(10, fm.height()))
-                y = rect.bottom() - pad - line_h
-                try:
-                    key_h = int(data.get("key_h")) if data.get("key_h") is not None else None
-                except Exception:
-                    key_h = None
-                try:
-                    seen_h = int(data.get("seen_h")) if data.get("seen_h") is not None else None
-                except Exception:
-                    seen_h = None
-                if key_h is not None:
-                    lock_text = f"🔒 {key_h} h" if lock_state == "ok" else f"{tr('key_age')}: {key_h} h"
-                    painter.drawText(
-                        QtCore.QRect(rect.left() + pad, y, rect.width() - pad * 2, line_h),
-                        int(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter),
-                        lock_text,
+                    painter.setBrush(panel_color)
+                    r = max(1.5, panel_size * 0.18)
+                    painter.drawRoundedRect(QtCore.QRectF(panel_rect), r, r)
+                if unread > 0:
+                    # Unread counter is rendered in a separate pink square at the bottom-right of contact row.
+                    badge_size = max(11, int(icon_side * 0.34))
+                    badge_left = rect.right() - badge_size - 4
+                    badge_top = rect.bottom() - badge_size - 4
+                    badge_rect = QtCore.QRect(
+                        int(max(rect.left(), min(badge_left, rect.right() - badge_size))),
+                        int(max(rect.top(), min(badge_top, rect.bottom() - badge_size))),
+                        int(badge_size),
+                        int(badge_size),
                     )
-                    y -= line_h
-                seen_text = f"{tr('last_seen')}: {seen_h} h" if seen_h is not None else f"{tr('last_seen')}: -"
-                painter.drawText(
-                    QtCore.QRect(rect.left() + pad, y, rect.width() - pad * 2, line_h),
-                    int(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter),
-                    seen_text,
-                )
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(QtGui.QColor("#e1499a"))
+                    rr = max(1.5, badge_size * 0.20)
+                    painter.drawRoundedRect(QtCore.QRectF(badge_rect), rr, rr)
+                    txt = str(int(unread)) if int(unread) <= 99 else "99+"
+                    f = painter.font()
+                    f.setBold(True)
+                    f.setPointSize(max(6, int(badge_size * 0.52)))
+                    painter.setFont(f)
+                    painter.setPen(QtGui.QColor("#fff6fb"))
+                    painter.drawText(badge_rect, int(QtCore.Qt.AlignCenter), txt)
+                    # Left of unread badge: last received message time (and date when day differs).
+                    try:
+                        rx_ts = float(data.get("last_rx_ts", 0.0) or 0.0)
+                    except Exception:
+                        rx_ts = 0.0
+                    if rx_ts > 0.0:
+                        try:
+                            dt = datetime.fromtimestamp(rx_ts)
+                            now_dt = datetime.now()
+                            if dt.date() == now_dt.date():
+                                rx_text = dt.strftime("%H:%M")
+                            else:
+                                rx_text = dt.strftime("%d.%m %H:%M")
+                            tf = painter.font()
+                            tf.setBold(False)
+                            tf.setPointSize(max(7, int(badge_size * 0.45)))
+                            painter.setFont(tf)
+                            painter.setPen(QtGui.QColor("#bcaec0"))
+                            tw = int(painter.fontMetrics().horizontalAdvance(rx_text))
+                            tx = int(max(rect.left() + 2, badge_rect.left() - tw - 6))
+                            ty = int(badge_rect.top() + badge_rect.height() - 1)
+                            painter.drawText(tx, ty, rx_text)
+                        except Exception:
+                            pass
                 painter.restore()
 
         items_list.setItemDelegate(ContactDelegate(items_list))
 
-        # Ubuntu terminal-like theme (flat, no frames)
-        win.setStyleSheet(
-            """
+        THEME_UBUNTU_STYLE = """
             QWidget { background: #300a24; color: #eeeeec; }
             QGroupBox { border: 0; margin-top: 0; font-weight: 600; }
             QGroupBox::title { subcontrol-origin: margin; left: 4px; color: #cfcfcf; }
             QGroupBox#listGroup::title { height: 0px; }
             QGroupBox#listGroup { margin-top: 0px; }
             QListWidget { background: #2b0a22; border: 1px solid #3c0f2e; padding: 0px; }
+            QListWidget#chatList::item { background: transparent; border: none; padding: 2px 0px; }
+            QListWidget#chatList::item:selected { background: transparent; }
+            QListWidget#chatList::item:selected:!active { background: transparent; }
             QTextEdit { background: #2b0a22; border: 1px solid #3c0f2e; padding: 0px; }
             QLineEdit { background: #2b0a22; border: 1px solid #6f4a7a; padding: 6px; }
             QPushButton { background: #5c3566; border: 1px solid #6f4a7a; padding: 6px 10px; }
@@ -3207,14 +3887,132 @@ def main() -> int:
             QWidget#headerBar { background: #c24f00; }
             QWidget#headerBar QLabel { background: transparent; font-weight: 600; color: #2b0a22; }
             QWidget#headerBar[mtStatus="ok"] { background: #0b3d1f; }
-            QWidget#headerBar[mtStatus="ok"] QLabel { color: #eaffea; }
+            QWidget#headerBar[mtStatus="ok"] QLabel { color: #fffff0; }
+            QWidget#headerBar[mtStatus="warn"] { background: #8a5a00; }
+            QWidget#headerBar[mtStatus="warn"] QLabel { color: #fff7df; }
             QWidget#headerBar[mtStatus="error"] { background: #6b1d1d; }
             QWidget#headerBar[mtStatus="error"] QLabel { color: #ffecec; }
-            QListWidget::item { padding: 8px 0px; }
-            QListWidget::item:selected { background: #ff9800; color: #2b0a22; }
-            QListWidget::item:selected:!active { background: #ff9800; color: #2b0a22; }
+            QListWidget#contactsList::item { padding: 8px 0px; }
+            QListWidget#contactsList::item:selected { background: #4d351f; }
+            QListWidget#contactsList::item:selected:!active { background: #4d351f; }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                margin: 0px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(210, 170, 220, 0.42);
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(230, 190, 240, 0.62);
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+                border: none;
+                background: transparent;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
             """
-        )
+        THEME_BRUTAL_MAN = """
+            QWidget { background: #101214; color: #e8e8e8; }
+            QGroupBox { border: 0; margin-top: 0; font-weight: 700; }
+            QGroupBox::title { subcontrol-origin: margin; left: 4px; color: #c9c9c9; }
+            QGroupBox#listGroup::title { height: 0px; }
+            QGroupBox#listGroup { margin-top: 0px; }
+            QListWidget { background: #15181b; border: 1px solid #3a3f46; padding: 0px; }
+            QListWidget#chatList::item { background: transparent; border: none; padding: 2px 0px; }
+            QListWidget#chatList::item:selected { background: transparent; }
+            QListWidget#chatList::item:selected:!active { background: transparent; }
+            QTextEdit { background: #15181b; border: 1px solid #3a3f46; padding: 0px; }
+            QLineEdit { background: #15181b; border: 1px solid #5a6069; padding: 6px; }
+            QPushButton { background: #2b3036; border: 1px solid #5a6069; padding: 6px 10px; color:#f0f0f0; }
+            QPushButton:hover { background: #383e45; }
+            QTabWidget::pane { border: 1px solid #5a6069; top: -1px; }
+            QTabBar::tab {
+                background: #242a30;
+                color: #d6d6d6;
+                border: 1px solid #5a6069;
+                border-bottom: 0;
+                padding: 6px 12px;
+                margin-right: 2px;
+                min-height: 22px;
+            }
+            QTabBar::tab:selected {
+                background: #f05d23;
+                color: #111417;
+                font-weight: 800;
+            }
+            QTabBar::tab:!selected:hover { background: #2f353c; color: #ffffff; }
+            QMenu { background: #15181b; border: 1px solid #5a6069; padding: 2px; }
+            QMenu::item { padding: 6px 14px; color: #e8e8e8; }
+            QMenu::item:selected { background: #f05d23; color: #101214; }
+            QLabel#muted { color: #b8b8b8; }
+            QLabel#hint { color: #999fa8; font-size: 10px; }
+            QLabel#section { color: #b8b8b8; font-size: 13px; font-weight: 500; }
+            QWidget#headerBar { background: #f05d23; }
+            QWidget#headerBar QLabel { background: transparent; font-weight: 700; color: #101214; }
+            QWidget#headerBar[mtStatus="ok"] { background: #1f5f2f; }
+            QWidget#headerBar[mtStatus="ok"] QLabel { color: #fffff0; }
+            QWidget#headerBar[mtStatus="warn"] { background: #8a5a00; }
+            QWidget#headerBar[mtStatus="warn"] QLabel { color: #fff7df; }
+            QWidget#headerBar[mtStatus="error"] { background: #7a1e1e; }
+            QWidget#headerBar[mtStatus="error"] QLabel { color: #ffecec; }
+            QListWidget#contactsList::item { padding: 8px 0px; }
+            QListWidget#contactsList::item:selected { background: #3e2a24; }
+            QListWidget#contactsList::item:selected:!active { background: #3e2a24; }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                margin: 0px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(170, 175, 185, 0.45);
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(200, 205, 215, 0.62);
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+                border: none;
+                background: transparent;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            """
+        THEME_STYLES = {
+            "ubuntu_style": THEME_UBUNTU_STYLE,
+            "brutal_man": THEME_BRUTAL_MAN,
+        }
+        current_theme = str(cfg.get("ui_theme", "ubuntu_style") or "ubuntu_style").strip().lower()
+        if current_theme not in THEME_STYLES:
+            current_theme = "ubuntu_style"
+
+        def apply_theme(theme_id: str) -> None:
+            nonlocal current_theme
+            tid = str(theme_id or "ubuntu_style").strip().lower()
+            if tid not in THEME_STYLES:
+                tid = "ubuntu_style"
+            current_theme = tid
+            win.setStyleSheet(THEME_STYLES[tid])
+            try:
+                win.update()
+            except Exception:
+                pass
+
+        apply_theme(current_theme)
 
         class _NoCtrlWheelZoom(QtCore.QObject):
             def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
@@ -3243,21 +4041,265 @@ def main() -> int:
             pass
 
         header_status = "init"
-        errors_need_ack = False
+        errors_need_ack = False  # backward compatibility flag; derived from unseen_error_count
+        unseen_error_count = 0
+        unseen_warn_count = 0
+        last_error_summary = ""
+        last_warn_summary = ""
+        last_error_ts = 0.0
+        last_warn_ts = 0.0
+        current_alert_level = ""
+        current_alert_text = ""
+        key_conflict_peer: str = ""
+        key_conflict_notice: str = ""
+        key_conflict_sig: str = ""
+        key_conflict_ignored: Dict[str, Dict[str, object]] = {}
+        key_conflict_hidden_log_ts: Dict[str, float] = {}
         header_bar.setProperty("mtStatus", header_status)
+        try:
+            chat_label.setStyleSheet("color:#c0b7c2;")
+        except Exception:
+            pass
+
+        def _set_key_conflict_header(peer_norm: str, conflict_sig: str = "") -> None:
+            nonlocal key_conflict_peer, key_conflict_notice, key_conflict_sig
+            p = norm_id_for_filename(peer_norm)
+            if not re.fullmatch(r"[0-9a-fA-F]{8}", p):
+                return
+            key_conflict_peer = p
+            key_conflict_sig = str(conflict_sig or "")
+            long_name, short_name = _peer_name_parts(p)
+            peer_name = long_name
+            if short_name:
+                peer_name = f"{peer_name}[{short_name}]" if peer_name else f"[{short_name}]"
+            peer_name_text = f" {peer_name}" if peer_name else ""
+            key_conflict_notice = tr("key_conflict_header_notice").format(
+                peer=norm_id_for_wire(p),
+                peer_name=peer_name_text,
+            )
+            key_renew_btn.show()
+            key_ignore_btn.show()
+            key_renew_btn.setText(tr("key_conflict_replace"))
+            key_ignore_btn.setText(tr("key_conflict_paranoid"))
+            key_renew_btn.setToolTip(tr("key_conflict_header_replace_tip"))
+            key_ignore_btn.setToolTip(tr("key_conflict_header_ignore_tip"))
+            alert_btn.hide()
+
+        def _clear_key_conflict_header() -> None:
+            nonlocal key_conflict_peer, key_conflict_notice, key_conflict_sig
+            key_conflict_peer = ""
+            key_conflict_sig = ""
+            key_conflict_notice = ""
+            key_renew_btn.hide()
+            key_ignore_btn.hide()
+
+        def _strip_log_prefix(s: str) -> str:
+            txt = str(s or "").strip()
+            m = re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+", txt)
+            if m:
+                txt = txt[m.end() :].strip()
+            return txt
+
+        def _alert_summary(s: str, limit: int = 78) -> str:
+            txt = _strip_log_prefix(s)
+            if len(txt) > limit:
+                return txt[: max(0, limit - 1)] + "..."
+            return txt
+
+        def _human_alert_text(raw_text: str, level: str) -> str:
+            raw = _strip_log_prefix(raw_text)
+            low = raw.lower()
+
+            # User-facing bilingual summaries (RU / EN)
+            if "pinned key mismatch" in low:
+                peer_txt = ""
+                try:
+                    m_peer = re.search(r"\bpeer=(!?[0-9a-fA-F]{8})\b", raw)
+                    if m_peer:
+                        peer_norm = norm_id_for_filename(m_peer.group(1))
+                        peer_wire = norm_id_for_wire(peer_norm)
+                        peer_txt = f" ({peer_wire})"
+                except Exception:
+                    peer_txt = ""
+                return f"Конфликт ключа контакта{peer_txt} / Contact key mismatch"
+            if "decrypt failed" in low:
+                return "Не удалось расшифровать сообщение / Failed to decrypt message"
+            if "reject invalid public key" in low or "reject invalid key frame" in low:
+                return "Некорректный ключевой пакет / Invalid key frame"
+            if "radio: disconnected" in low:
+                return "Радиомодуль отключен / Radio disconnected"
+            if "radio: protobuf decode error" in low:
+                return "Ошибка данных радиомодуля / Radio decode error"
+            if "trace: done" in low and "timeout" in low:
+                return "Трассировка не ответила вовремя / Traceroute timed out"
+            if "send failed" in low:
+                return "Ошибка отправки пакета / Packet send failed"
+            if "drop:" in low and "timeout" in low:
+                return "Пакет не доставлен вовремя / Packet delivery timeout"
+            if "exception" in low or "traceback" in low:
+                return "Внутренняя ошибка приложения / Internal application error"
+            if low.startswith("warn:"):
+                return "Предупреждение системы / System warning"
+
+            # Fallback: short readable raw event + bilingual marker.
+            short = _alert_summary(raw, limit=64)
+            if str(level or "").lower() == "error":
+                return f"Ошибка: {short} / Error: {short}"
+            return f"Предупреждение: {short} / Warning: {short}"
+
+        def _compose_header_title() -> str:
+            if key_conflict_notice:
+                return key_conflict_notice
+            return self_title()
+
+        def _apply_alert_visual(level: str) -> None:
+            lv = str(level or "").strip().lower()
+            if lv == "error":
+                alert_btn.setStyleSheet(
+                    "QPushButton { background:#8f1d1d; border:1px solid #c85a5a; color:#fff2f2; font-weight:700; }"
+                    "QPushButton:hover { background:#a82424; }"
+                )
+                alert_overlay.setStyleSheet("background:#7a1e1e;border:none;")
+                alert_overlay_label.setStyleSheet("color:#fff2f2;font-weight:600;")
+            elif lv == "warn":
+                alert_btn.setStyleSheet(
+                    "QPushButton { background:#8a5a00; border:1px solid #d3a33d; color:#fff7df; font-weight:700; }"
+                    "QPushButton:hover { background:#a36b00; }"
+                )
+                alert_overlay.setStyleSheet("background:#8a5a00;border:none;")
+                alert_overlay_label.setStyleSheet("color:#fff7df;font-weight:600;")
+            else:
+                alert_btn.setStyleSheet("")
+
+        def _hide_alert_overlay() -> None:
+            nonlocal alert_overlay_visible
+            if not alert_overlay_visible:
+                return
+            alert_overlay_visible = False
+            try:
+                alert_anim.stop()
+            except Exception:
+                pass
+            start_pos = QtCore.QPoint(max(0, header_bar.width() - alert_overlay.width()), 0)
+            end_pos = QtCore.QPoint(header_bar.width(), 0)
+            try:
+                alert_overlay.move(start_pos)
+            except Exception:
+                pass
+            def _after_hide():
+                if not alert_overlay_visible:
+                    alert_overlay.hide()
+                    if current_alert_level:
+                        alert_btn.show()
+            try:
+                alert_anim.finished.disconnect()
+            except Exception:
+                pass
+            alert_anim.finished.connect(_after_hide)
+            alert_anim.setStartValue(start_pos)
+            alert_anim.setEndValue(end_pos)
+            alert_anim.start()
+
+        def _show_alert_overlay() -> None:
+            nonlocal alert_overlay_visible
+            if not current_alert_text:
+                return
+            alert_overlay_visible = True
+            alert_btn.hide()
+            alert_overlay_label.setText(current_alert_text)
+            w = max(1, header_bar.width())
+            h = header_bar.height()
+            alert_overlay.setFixedWidth(w)
+            alert_overlay.setFixedHeight(h)
+            alert_overlay.show()
+            alert_overlay.raise_()
+            try:
+                alert_anim.stop()
+            except Exception:
+                pass
+            start_pos = QtCore.QPoint(w, 0)
+            end_pos = QtCore.QPoint(0, 0)
+            alert_overlay.move(start_pos)
+            try:
+                alert_anim.finished.disconnect()
+            except Exception:
+                pass
+            alert_anim.setStartValue(start_pos)
+            alert_anim.setEndValue(end_pos)
+            alert_anim.start()
+
+        def _update_alert_indicator() -> None:
+            nonlocal current_alert_level, current_alert_text
+            if unseen_error_count > 0:
+                current_alert_level = "error"
+                current_alert_text = _human_alert_text(last_error_summary or "error", "error")
+            elif unseen_warn_count > 0:
+                current_alert_level = "warn"
+                current_alert_text = _human_alert_text(last_warn_summary or "warning", "warn")
+            else:
+                current_alert_level = ""
+                current_alert_text = ""
+            if current_alert_level:
+                _apply_alert_visual(current_alert_level)
+                cnt = int(unseen_error_count if current_alert_level == "error" else unseen_warn_count)
+                if cnt <= 0:
+                    cnt = 1
+                alert_btn.setText(str(cnt if cnt < 100 else "99+"))
+                if key_conflict_peer:
+                    alert_btn.hide()
+                elif not alert_overlay_visible:
+                    alert_btn.show()
+                if alert_overlay_visible:
+                    alert_overlay_label.setText(current_alert_text)
+                    _apply_alert_visual(current_alert_level)
+            else:
+                alert_btn.setText("!")
+                alert_btn.hide()
+                _hide_alert_overlay()
 
         def set_header_status(status: str) -> None:
             nonlocal header_status
             st = str(status or "init").strip().lower()
-            if st not in ("init", "ok", "error"):
+            if st not in ("init", "ok", "warn", "error"):
                 st = "init"
+            # Warning/error must not repaint the whole header bar:
+            # base bar reflects only connection/init state.
+            if st in ("warn", "error"):
+                st = "ok" if (radio_ready and not initializing) else "init"
+
+            def _header_text_color_for(st_local: str) -> str:
+                # Keep high contrast against current theme/status background.
+                if st_local == "ok":
+                    return "#fffff0"  # ivory on dark green
+                if st_local == "error":
+                    return "#ffecec"
+                if st_local == "warn":
+                    return "#fff7df"
+                # init color depends on theme's orange header shade
+                if str(current_theme or "") == "brutal_man":
+                    return "#101214"
+                return "#2b0a22"
             if st == header_status:
+                try:
+                    chat_label.setStyleSheet(f"color:{_header_text_color_for(st)};")
+                    chat_label.setText(_compose_header_title())
+                except Exception:
+                    pass
                 return
             header_status = st
             header_bar.setProperty("mtStatus", st)
             try:
                 header_bar.style().unpolish(header_bar)
                 header_bar.style().polish(header_bar)
+            except Exception:
+                pass
+            # Force header title color explicitly (QLabel#section rule may override theme selectors).
+            try:
+                chat_label.setStyleSheet(f"color:{_header_text_color_for(st)};")
+            except Exception:
+                pass
+            try:
+                chat_label.setText(_compose_header_title())
             except Exception:
                 pass
             header_bar.update()
@@ -3293,15 +4335,23 @@ def main() -> int:
                     "discovery_send": discovery_send,
                     "discovery_reply": discovery_reply,
                     "clear_pending_on_switch": clear_pending_on_switch,
+                    "contacts_visibility": contacts_visibility,
+                    "ui_theme": current_theme,
                     "peer_meta": peer_meta,
                 }
             )
 
         def apply_language() -> None:
             list_group.setTitle("")
-            chat_label.setText(self_title())
+            update_status()
             msg_entry.setPlaceholderText(tr("message"))
             settings_btn.setText(tr("settings"))
+            key_renew_btn.setText(tr("key_conflict_replace"))
+            key_ignore_btn.setText(tr("key_conflict_paranoid"))
+            key_renew_btn.setToolTip(tr("key_conflict_header_replace_tip"))
+            key_ignore_btn.setToolTip(tr("key_conflict_header_ignore_tip"))
+            if key_conflict_peer:
+                _set_key_conflict_header(key_conflict_peer, key_conflict_sig)
             send_btn.setText(tr("send"))
             search_field.setPlaceholderText(tr("search"))
 
@@ -3320,6 +4370,11 @@ def main() -> int:
                 if float(st.last_seen_ts) > (prev + 1.0):
                     rec["last_seen_ts"] = float(st.last_seen_ts)
                     changed = True
+            if float(getattr(st, "device_seen_ts", 0.0) or 0.0) > 0.0:
+                prev = float(rec.get("device_seen_ts", 0.0) or 0.0)
+                if float(st.device_seen_ts) > (prev + 1.0):
+                    rec["device_seen_ts"] = float(st.device_seen_ts)
+                    changed = True
             if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) > 0.0:
                 prev = float(rec.get("key_confirmed_ts", 0.0) or 0.0)
                 if float(st.key_confirmed_ts) > (prev + 1.0):
@@ -3333,6 +4388,7 @@ def main() -> int:
         settings_rate_edit: Optional["QtWidgets.QLineEdit"] = None
         settings_parallel_edit: Optional["QtWidgets.QLineEdit"] = None
         settings_auto_pacing_cb: Optional["QtWidgets.QCheckBox"] = None
+        settings_panel_widget: Optional["QtWidgets.QDialog"] = None
 
         def open_settings() -> None:
             nonlocal current_lang
@@ -3342,11 +4398,19 @@ def main() -> int:
             nonlocal settings_rate_edit, settings_parallel_edit, settings_auto_pacing_cb
             nonlocal discovery_send, discovery_reply
             nonlocal clear_pending_on_switch
+            nonlocal contacts_visibility
             nonlocal security_policy
             nonlocal session_rekey_enabled
             nonlocal errors_need_ack
-            errors_need_ack = False
-            update_status()
+            nonlocal settings_panel_widget
+
+            if settings_panel_widget is not None:
+                try:
+                    settings_panel_widget.raise_()
+                    settings_panel_widget.activateWindow()
+                except Exception:
+                    pass
+                return
 
             # Rebuild the dialog when language changes so all labels/hints are translated.
             while True:
@@ -3354,11 +4418,12 @@ def main() -> int:
                 dlg.setWindowTitle(tr("settings_title"))
                 dlg.resize(820, 600)
                 dlg.setMinimumSize(760, 560)
-                # Prevent minimizing a modal Settings dialog: a minimized modal can "steal" focus and block the main UI.
+                # Embedded settings panel in-place (inside the main window).
                 try:
-                    dlg.setWindowFlags(dlg.windowFlags() & ~QtCore.Qt.WindowMinimizeButtonHint)
+                    dlg.setWindowFlags(QtCore.Qt.Widget)
                 except Exception:
                     pass
+                dlg.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
                 try:
                     class _NoMinimizeSettings(QtCore.QObject):
                         def eventFilter(self, obj, event):  # type: ignore[override]
@@ -3590,7 +4655,138 @@ def main() -> int:
                 discovery_v.addWidget(clear_pending_hint)
 
                 right_panel.addWidget(discovery_group)
+
                 right_panel.addStretch(1)
+
+                # -------------------
+                # Contacts tab
+                # -------------------
+                tab_contacts = QtWidgets.QWidget()
+                tabs.addTab(tab_contacts, tr("tab_contacts"))
+                contacts_root = QtWidgets.QVBoxLayout(tab_contacts)
+                contacts_root.setContentsMargins(14, 12, 14, 10)
+                contacts_root.setSpacing(12)
+
+                visibility_title = QtWidgets.QLabel(tr("contacts_visibility"))
+                visibility_title.setObjectName("muted")
+                visibility_title.setStyleSheet("font-weight:600;")
+                visibility_title.setContentsMargins(6, 8, 0, 0)
+                contacts_root.addWidget(visibility_title)
+
+                visibility_group = QtWidgets.QGroupBox("")
+                visibility_v = QtWidgets.QVBoxLayout(visibility_group)
+                contacts_visibility_combo = QtWidgets.QComboBox()
+                contacts_visibility_combo.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+                try:
+                    contacts_visibility_combo.setFixedHeight(28)
+                except Exception:
+                    pass
+                contacts_visibility_combo.addItem(tr("contacts_visibility_all"), "all")
+                contacts_visibility_combo.addItem(tr("contacts_visibility_online"), "online")
+                contacts_visibility_combo.addItem(tr("contacts_visibility_app"), "app")
+                contacts_visibility_combo.addItem(tr("contacts_visibility_device"), "device")
+                _vis_idx = contacts_visibility_combo.findData(str(contacts_visibility or "all"))
+                contacts_visibility_combo.setCurrentIndex(_vis_idx if _vis_idx >= 0 else 0)
+                visibility_v.addWidget(contacts_visibility_combo)
+
+                visibility_hint_all = QtWidgets.QLabel(tr("hint_contacts_visibility_all"))
+                visibility_hint_all.setObjectName("hint")
+                visibility_hint_all.setWordWrap(True)
+                visibility_v.addWidget(visibility_hint_all)
+
+                visibility_hint_online = QtWidgets.QLabel(tr("hint_contacts_visibility_online"))
+                visibility_hint_online.setObjectName("hint")
+                visibility_hint_online.setWordWrap(True)
+                visibility_v.addWidget(visibility_hint_online)
+
+                visibility_hint_app = QtWidgets.QLabel(tr("hint_contacts_visibility_app"))
+                visibility_hint_app.setObjectName("hint")
+                visibility_hint_app.setWordWrap(True)
+                visibility_v.addWidget(visibility_hint_app)
+
+                visibility_hint_device = QtWidgets.QLabel(tr("hint_contacts_visibility_device"))
+                visibility_hint_device.setObjectName("hint")
+                visibility_hint_device.setWordWrap(True)
+                visibility_v.addWidget(visibility_hint_device)
+
+                contacts_root.addWidget(visibility_group)
+
+                status_title = QtWidgets.QLabel(tr("contacts_status_legend_title"))
+                status_title.setObjectName("muted")
+                status_title.setStyleSheet("font-weight:600;")
+                status_title.setContentsMargins(6, 8, 0, 0)
+                contacts_root.addWidget(status_title)
+
+                status_group = QtWidgets.QGroupBox("")
+                status_v = QtWidgets.QVBoxLayout(status_group)
+                def _status_hint_label(text: str, color: Optional[str] = None, empty: bool = False) -> QtWidgets.QLabel:
+                    lbl = QtWidgets.QLabel()
+                    lbl.setObjectName("hint")
+                    lbl.setWordWrap(True)
+                    if color:
+                        mark = "□" if empty else "■"
+                        lbl.setTextFormat(QtCore.Qt.RichText)
+                        lbl.setText(f"<span style='color:{color};font-weight:700;'>{mark}</span> {text}")
+                    else:
+                        lbl.setText(text)
+                    return lbl
+
+                status_hint_green = _status_hint_label(tr("hint_status_green"), "#2bbf66")
+                status_v.addWidget(status_hint_green)
+                status_hint_blue = _status_hint_label(tr("hint_status_blue"), "#1f6b3f")
+                status_v.addWidget(status_hint_blue)
+                status_hint_yellow = _status_hint_label(tr("hint_status_yellow"), "#d9b233")
+                status_v.addWidget(status_hint_yellow)
+                status_hint_orange = _status_hint_label(tr("hint_status_orange"), "#8f6f18")
+                status_v.addWidget(status_hint_orange)
+                status_hint_none = _status_hint_label(tr("hint_status_none"), "#8a7f8b", empty=True)
+                status_v.addWidget(status_hint_none)
+                contacts_root.addWidget(status_group)
+                contacts_root.addStretch(1)
+
+                # -------------------
+                # Theme tab
+                # -------------------
+                tab_theme = QtWidgets.QWidget()
+                tabs.addTab(tab_theme, tr("tab_theme"))
+                theme_root = QtWidgets.QVBoxLayout(tab_theme)
+                theme_root.setContentsMargins(14, 12, 14, 10)
+                theme_root.setSpacing(12)
+
+                theme_title = QtWidgets.QLabel(tr("theme_title"))
+                theme_title.setObjectName("muted")
+                theme_title.setStyleSheet("font-weight:600;")
+                theme_title.setContentsMargins(6, 8, 0, 0)
+                theme_root.addWidget(theme_title)
+
+                theme_group = QtWidgets.QGroupBox("")
+                theme_layout = QtWidgets.QFormLayout(theme_group)
+                theme_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+                theme_layout.setFormAlignment(QtCore.Qt.AlignTop)
+                theme_layout.setVerticalSpacing(8)
+                theme_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
+                try:
+                    theme_layout.setContentsMargins(10, 10, 10, 10)
+                except Exception:
+                    pass
+
+                theme_combo = QtWidgets.QComboBox()
+                theme_combo.addItem(tr("theme_ubuntu_style"), "ubuntu_style")
+                theme_combo.addItem(tr("theme_brutal_man"), "brutal_man")
+                try:
+                    idx = theme_combo.findData(current_theme)
+                    theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
+                except Exception:
+                    pass
+                compact_field(theme_combo, width=320)
+                theme_layout.addRow(tr("theme_select"), theme_combo)
+                theme_hint = QtWidgets.QLabel(tr("theme_hint"))
+                theme_hint.setObjectName("hint")
+                theme_hint.setWordWrap(True)
+                theme_layout.addRow("", theme_hint)
+
+                theme_root.addWidget(theme_group)
+                theme_root.addStretch(1)
 
                 # -------------------
                 # Security tab
@@ -3635,6 +4831,11 @@ def main() -> int:
                 sec_policy_hint.setObjectName("hint")
                 sec_policy_hint.setWordWrap(True)
                 sec_layout.addRow("", sec_policy_hint)
+
+                sec_crypto_hint = QtWidgets.QLabel(tr("security_crypto_summary"))
+                sec_crypto_hint.setObjectName("hint")
+                sec_crypto_hint.setWordWrap(True)
+                sec_layout.addRow("", sec_crypto_hint)
 
                 cb_rekey = QtWidgets.QCheckBox(tr("session_rekey"))
                 cb_rekey.setChecked(bool(session_rekey_enabled))
@@ -3694,8 +4895,9 @@ def main() -> int:
 
                 compression_policy = str(cfg.get("compression_policy", "auto") or "auto").strip().lower()
                 compression_force_mode = int(cfg.get("compression_force_mode", int(MODE_DEFLATE)) or int(MODE_DEFLATE))
-                compression_normalize = str(cfg.get("compression_normalize", "off") or "off").strip().lower()
+                compression_normalize = str(cfg.get("compression_normalize", "auto") or "auto").strip().lower()
                 cmp_norm = QtWidgets.QComboBox()
+                cmp_norm.addItem(tr("compression_normalize_auto"), "auto")
                 cmp_norm.addItem(tr("compression_normalize_off"), "off")
                 cmp_norm.addItem(tr("compression_normalize_tokens"), "tokens")
                 cmp_norm.addItem(tr("compression_normalize_sp_vocab"), "sp_vocab")
@@ -3715,6 +4917,8 @@ def main() -> int:
                 cmp_choice = QtWidgets.QComboBox()
                 cmp_choice.addItem(tr("compression_policy_auto"), "auto")
                 cmp_choice.addItem(tr("compression_policy_off"), "off")
+                cmp_choice.addItem("BYTE_DICT", int(MODE_BYTE_DICT))
+                cmp_choice.addItem("FIXED_BITS", int(MODE_FIXED_BITS))
                 cmp_choice.addItem("DEFLATE", int(MODE_DEFLATE))
                 cmp_choice.addItem("ZLIB", int(MODE_ZLIB))
                 cmp_choice.addItem("BZ2", int(MODE_BZ2))
@@ -3800,8 +5004,10 @@ def main() -> int:
                 copy_row = QtWidgets.QHBoxLayout()
                 copy_row.setContentsMargins(0, 0, 0, 0)
                 copy_row.addStretch(1)
+                btn_ack = QtWidgets.QPushButton(tr("ack_alerts"))
                 btn_clear = QtWidgets.QPushButton(tr("clear_log"))
                 btn_copy = QtWidgets.QPushButton(tr("copy_log"))
+                copy_row.addWidget(btn_ack)
                 copy_row.addWidget(btn_clear)
                 copy_row.addWidget(btn_copy)
                 tab_log_l.addLayout(copy_row)
@@ -3883,8 +5089,9 @@ def main() -> int:
 
                 def apply_settings(close_dialog: bool) -> None:
                     nonlocal verbose_log, runtime_log_file, auto_pacing, discovery_send, discovery_reply, clear_pending_on_switch
+                    nonlocal contacts_visibility
                     nonlocal security_policy, session_rekey_enabled
-                    nonlocal max_plain, current_lang, last_limits_logged
+                    nonlocal max_plain, current_lang, last_limits_logged, current_theme
                     verbose_log = cb_verbose.isChecked()
                     runtime_log_file = cb_runtime_log.isChecked()
                     auto_pacing = cb_auto_pacing.isChecked()
@@ -3915,6 +5122,18 @@ def main() -> int:
                     cfg["discovery_reply"] = discovery_reply
                     cfg["runtime_log_file"] = runtime_log_file
                     cfg["clear_pending_on_switch"] = clear_pending_on_switch
+                    contacts_visibility = str(contacts_visibility_combo.currentData() or "all").strip().lower()
+                    if contacts_visibility not in ("all", "online", "app", "device"):
+                        contacts_visibility = "all"
+                    cfg["contacts_visibility"] = contacts_visibility
+
+                    # Theme settings
+                    next_theme = str(theme_combo.currentData() or "ubuntu_style").strip().lower()
+                    if next_theme not in THEME_STYLES:
+                        next_theme = "ubuntu_style"
+                    cfg["ui_theme"] = next_theme
+                    if next_theme != current_theme:
+                        apply_theme(next_theme)
 
                     # Compression settings
                     choice = cmp_choice.currentData()
@@ -3928,7 +5147,7 @@ def main() -> int:
                             cfg["compression_force_mode"] = int(choice)
                         except Exception:
                             cfg["compression_force_mode"] = int(MODE_DEFLATE)
-                    cfg["compression_normalize"] = str(cmp_norm.currentData() or "off").strip().lower()
+                    cfg["compression_normalize"] = str(cmp_norm.currentData() or "auto").strip().lower()
                     # ZSTD is a required dependency; keep no per-user toggle.
 
                     # Apply numeric settings immediately.
@@ -3989,6 +5208,7 @@ def main() -> int:
                         pass
 
                     save_gui_config()
+                    refresh_list()
                     if discovery_send and not prev_send:
                         reset_discovery_schedule()
                         ui_emit("log", f"{ts_local()} DISCOVERY: enabled (burst)")
@@ -4036,6 +5256,15 @@ def main() -> int:
                     except Exception:
                         pass
 
+                def on_ack_alerts():
+                    nonlocal unseen_error_count, unseen_warn_count, last_error_summary, last_warn_summary, errors_need_ack
+                    unseen_error_count = 0
+                    unseen_warn_count = 0
+                    last_error_summary = ""
+                    last_warn_summary = ""
+                    errors_need_ack = False
+                    update_status()
+
                 def on_full_reset():
                     nonlocal current_lang, verbose_log, runtime_log_file
                     nonlocal discovery_send, discovery_reply, clear_pending_on_switch
@@ -4062,6 +5291,8 @@ def main() -> int:
                         seen_msgs.clear()
                         seen_parts.clear()
                     key_response_last_ts.clear()
+                    key_conflict_ignored.clear()
+                    key_conflict_hidden_log_ts.clear()
                     tracked_peers.clear()
                     known_peers.clear()
                     peer_states.clear()
@@ -4109,11 +5340,12 @@ def main() -> int:
                     # Reset runtime options to defaults.
                     current_lang = "ru"
                     verbose_log = True
-                    runtime_log_file = False
+                    runtime_log_file = True
                     auto_pacing = True
-                    discovery_send = False
-                    discovery_reply = False
+                    discovery_send = True
+                    discovery_reply = True
                     clear_pending_on_switch = True
+                    contacts_visibility = "all"
                     _STORAGE.set_runtime_log_enabled(runtime_log_file)
                     try:
                         args.retry_seconds = 30
@@ -4136,6 +5368,13 @@ def main() -> int:
                     apply_language()
                     select_dialog(None)
                     refresh_list()
+                    if discovery_send:
+                        try:
+                            reset_discovery_schedule()
+                            send_discovery_broadcast()
+                            log_line(f"{ts_local()} DISCOVERY: enabled (after reset)", "info")
+                        except Exception:
+                            pass
                     log_line(f"{ts_local()} RESET: full profile reset completed", "warn")
                     QtWidgets.QMessageBox.information(win, "meshTalk", tr("full_reset_done"))
                     dlg.accept()
@@ -4143,22 +5382,72 @@ def main() -> int:
                 btn_ok.clicked.connect(on_accept)
                 btn_cancel.clicked.connect(dlg.reject)
                 btn_apply.clicked.connect(on_apply)
+                btn_ack.clicked.connect(on_ack_alerts)
                 btn_copy.clicked.connect(on_copy)
                 btn_clear.clicked.connect(on_clear)
                 btn_full_reset.clicked.connect(on_full_reset)
 
-                dlg.exec()
+                def _close_inplace_settings(*_args):
+                    nonlocal settings_panel_widget
+                    nonlocal settings_log_view, settings_rate_edit, settings_parallel_edit, settings_auto_pacing_cb
+                    settings_log_view = None
+                    settings_rate_edit = None
+                    settings_parallel_edit = None
+                    settings_auto_pacing_cb = None
+                    try:
+                        right_col.removeWidget(dlg)
+                    except Exception:
+                        pass
+                    try:
+                        dlg.hide()
+                        dlg.deleteLater()
+                    except Exception:
+                        pass
+                    settings_panel_widget = None
+                    try:
+                        list_group.show()
+                        header_bar.show()
+                        root_layout.setStretch(0, 1)
+                        root_layout.setStretch(1, 2)
+                        chat_text.show()
+                        msg_entry.show()
+                        send_btn.show()
+                    except Exception:
+                        pass
+                    if reopen["flag"]:
+                        reopen["flag"] = False
+                        QtCore.QTimer.singleShot(0, open_settings)
 
-                settings_log_view = None
-                settings_rate_edit = None
-                settings_parallel_edit = None
-                settings_auto_pacing_cb = None
+                try:
+                    dlg.finished.connect(_close_inplace_settings)
+                except Exception:
+                    pass
 
-                if reopen["flag"]:
-                    continue
-                break
+                settings_panel_widget = dlg
+                try:
+                    list_group.hide()
+                    header_bar.hide()
+                    root_layout.setStretch(0, 0)
+                    root_layout.setStretch(1, 1)
+                    chat_text.hide()
+                    msg_entry.hide()
+                    send_btn.hide()
+                except Exception:
+                    pass
+                right_col.insertWidget(1, dlg, 1)
+                dlg.show()
+                return
 
         settings_btn.clicked.connect(open_settings)
+        def _toggle_alert_overlay() -> None:
+            if not current_alert_level:
+                return
+            if alert_overlay_visible:
+                _hide_alert_overlay()
+            else:
+                _show_alert_overlay()
+
+        alert_btn.clicked.connect(_toggle_alert_overlay)
         click_state = {"last_ts": 0.0, "count": 0}
 
         def _header_text_left_x(text: str) -> float:
@@ -4176,7 +5465,11 @@ def main() -> int:
             if e.button() != QtCore.Qt.LeftButton:
                 return
             text = chat_label.text()
-            pub_idx = text.find("pub:")
+            pub_idx = text.find("public key ")
+            if pub_idx < 0:
+                pub_idx = text.find("pubkey ")
+            if pub_idx < 0:
+                pub_idx = text.find("pub:")
             if pub_idx >= 0:
                 fm = QtGui.QFontMetrics(chat_label.font())
                 left_text = text[:pub_idx]
@@ -4218,61 +5511,8 @@ def main() -> int:
             )
 
         def make_avatar_pixmap(seed: str, size: int) -> QtGui.QPixmap:
-            palette = [
-                "#ff6b6b", "#ffa94d", "#ffd43b", "#a9e34b",
-                "#4cd4b0", "#38d9a9", "#63e6be", "#4dabf7",
-                "#74c0fc", "#9775fa", "#b197fc", "#f783ac",
-                "#ff8787", "#ffc078", "#8ce99a", "#5c7cfa",
-            ]
-            h = hashlib.sha256(seed.encode("utf-8")).digest()
-            pm = QtGui.QPixmap(size, size)
-            pm.fill(QtCore.Qt.transparent)
-            painter = QtGui.QPainter(pm)
-            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-            idx0 = h[0] % len(palette)
-            idx1 = (idx0 + 3 + (h[1] % 6)) % len(palette)
-            idx2 = (idx1 + 5 + (h[2] % 5)) % len(palette)
-            idx3 = (idx2 + 7 + (h[3] % 4)) % len(palette)
-            colors = [
-                QtGui.QColor(palette[idx0]),
-                QtGui.QColor(palette[idx1]),
-                QtGui.QColor(palette[idx2]),
-                QtGui.QColor(palette[idx3]),
-            ]
-            rotate = h[7] % 4
-            colors = colors[rotate:] + colors[:rotate]
-            def solid_brush(c: QtGui.QColor) -> QtGui.QBrush:
-                # PySide6 compatibility: avoid QBrush(QColor) ctor path on older builds.
-                b = QtGui.QBrush()
-                b.setStyle(QtCore.Qt.SolidPattern)
-                b.setColor(c)
-                return b
-            painter.setBrush(solid_brush(colors[0]))
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.drawEllipse(0, 0, size, size)
-            cx = size / 2.0
-            cy = size / 2.0
-            r = size / 2.0 - 2.0
-            base_angle = (h[4] % 360) * math.pi / 180.0
-            weights = [1 + (h[8 + i] % 7) for i in range(4)]
-            total = float(sum(weights))
-            angle = base_angle
-            for i in range(4):
-                span = (weights[i] / total) * (2.0 * math.pi)
-                angle0 = angle
-                angle1 = angle + span
-                p0 = QtCore.QPointF(cx + r * math.cos(angle0), cy + r * math.sin(angle0))
-                p1 = QtCore.QPointF(cx + r * math.cos(angle1), cy + r * math.sin(angle1))
-                poly = QtGui.QPolygonF([QtCore.QPointF(cx, cy), p0, p1])
-                painter.setBrush(solid_brush(colors[i]))
-                painter.drawPolygon(poly)
-                angle += span
-            ring = QtGui.QPen(QtGui.QColor(255, 255, 255, 60), 1)
-            painter.setPen(ring)
-            painter.setBrush(QtCore.Qt.NoBrush)
-            painter.drawEllipse(1, 1, size - 2, size - 2)
-            painter.end()
-            return pm
+            # Use the same deterministic logo generator everywhere (list + dialogs).
+            return _peer_logo_pixmap(seed, size)
 
         def avatar_base_color(seed: str) -> str:
             palette = [
@@ -4298,14 +5538,17 @@ def main() -> int:
         def color_pair_for_id(seed: str) -> Tuple[str, str]:
             base_bg = "#35102a"  # dialog background
             accent = avatar_base_color(seed)
-            # Blend toward base background, keep a subtle hint of avatar color
-            bg_hex = mix_hex(base_bg, accent, 0.12)
-            # Text is a lighter blend toward accent
-            tx_hex = mix_hex("#eeeeec", accent, 0.35)
+            # Contact list cards: deliberately muted tint.
+            bg_hex = mix_hex(base_bg, accent, 0.05)
+            tx_hex = mix_hex("#e8e0e8", accent, 0.16)
             return (bg_hex, tx_hex)
 
         def color_pair_for_message(seed: str) -> Tuple[str, str]:
-            return color_pair_for_id(seed)
+            base_bg = "#35102a"
+            accent = avatar_base_color(seed)
+            bg_hex = mix_hex(base_bg, accent, 0.12)
+            tx_hex = mix_hex("#eeeeec", accent, 0.35)
+            return (bg_hex, tx_hex)
 
         avatar_cache: Dict[Tuple[str, int], str] = {}
 
@@ -4324,24 +5567,34 @@ def main() -> int:
             avatar_cache[key] = uri
             return uri
 
-        def append_html(view: QtWidgets.QTextEdit, text: str, color: str) -> None:
-            view.moveCursor(QtGui.QTextCursor.End)
-            view.insertHtml(f"<span style='color:{color}'>" + html_escape(text) + "</span><br>")
-            view.moveCursor(QtGui.QTextCursor.End)
+        def append_html(view: QtWidgets.QListWidget, text: str, color: str) -> None:
+            row_wrap = QtWidgets.QWidget()
+            row_wrap.setStyleSheet("background: transparent; border: none;")
+            row_l = QtWidgets.QHBoxLayout(row_wrap)
+            row_l.setContentsMargins(4, 1, 4, 1)
+            row_l.setSpacing(0)
+            lbl = QtWidgets.QLabel(str(text))
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(f"color:{color};")
+            row_l.addWidget(lbl, 1)
+            row_wrap.setMinimumWidth(max(100, int(view.viewport().width()) - 4))
+            item = QtWidgets.QListWidgetItem()
+            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            item.setData(QtCore.Qt.UserRole, -1)
+            item.setSizeHint(QtCore.QSize(max(100, int(view.viewport().width()) - 4), row_wrap.sizeHint().height()))
+            view.addItem(item)
+            view.setItemWidget(item, row_wrap)
 
         def append_chat_entry(
-            view: QtWidgets.QTextEdit,
+            view: QtWidgets.QListWidget,
             text: str,
             peer_id: str,
             outgoing: bool,
             row_index: int,
             meta: str = "",
+            actions: Optional[List[Dict[str, str]]] = None,
         ) -> None:
-            try:
-                msg_href = f"mtmsg:{int(row_index)}"
-            except Exception:
-                msg_href = "mtmsg:0"
-            icon = avatar_data_uri(peer_id, 36)
+            del actions  # Action buttons are handled in header/context flow.
             bg, tx = color_pair_for_message(peer_id)
             if " " in text and len(text) >= 6:
                 ts = text[:5]
@@ -4349,7 +5602,6 @@ def main() -> int:
             else:
                 ts = ""
                 msg = text
-            ts_html = ""
             if meta:
                 meta_l = meta.lower().strip()
                 if (
@@ -4378,68 +5630,188 @@ def main() -> int:
                 or ("elapsed " in combined_l)
                 or ("прошло " in combined_l)
             )
-            m_old = re.search(r"\bp(\d+)/(\d+)\b", combined_l)
-            if m_old:
-                try:
-                    if int(m_old.group(1)) < int(m_old.group(2)):
-                        pending = True
-                except Exception:
-                    pass
-            m_parts = re.search(r"(?:\bparts\b|\bчасти\b|\bчастей\b)\s+(\d+)\s*/\s*(\d+)", combined_l)
-            if m_parts:
-                try:
-                    if int(m_parts.group(1)) < int(m_parts.group(2)):
-                        pending = True
-                except Exception:
-                    pass
-            ts_html = html_escape(combined)
-            failed = (
-                ("failed (" in combined_l)
-                or ("ошибка (" in combined_l)
-            )
-            text_color = tx
-            tag_color = tx
+            failed = (("failed (" in combined_l) or ("ошибка (" in combined_l))
             ts_color = "#ff5a5f" if failed else ("#ff9800" if pending else "#8a7f8b")
             tag = short_tag(peer_id)
-            tag_html = html_escape(tag) if tag else "&nbsp;"
-            msg_align = "left"
-            avatar_cell = (
-                f"<td width='46' align='center' valign='top' style='padding:0;' rowspan='2'>"
-                f"<div style='display:flex;flex-direction:column;align-items:center;gap:2px;'>"
-                f"<a href='{msg_href}' style='text-decoration:none;'>"
-                f"<img src='{icon}' width='36' height='36'>"
-                f"<div style='color:{tag_color};font-size:13px;font-weight:600;line-height:1.0;text-align:center;'>{tag_html}</div>"
-                f"</a>"
-                f"</div>"
-                f"</td>"
+
+            row_wrap = QtWidgets.QWidget()
+            row_wrap.setStyleSheet("background: transparent; border: none;")
+            row_l = QtWidgets.QHBoxLayout(row_wrap)
+            row_l.setContentsMargins(4, 1, 4, 1)
+            row_l.setSpacing(0)
+            if outgoing:
+                row_l.addStretch(1)
+
+            bubble = QtWidgets.QFrame()
+            bubble.setObjectName("chatBubble")
+            bubble.setProperty("peer_id", str(peer_id))
+            bubble.setStyleSheet(
+                f"QFrame#chatBubble {{ background:{bg}; border:1px solid rgba(255,255,255,0.10); border-radius:9px; }}"
             )
-            msg_text_cell = (
-                f"<td width='100%' align='{msg_align}' valign='top' style='padding:4px 8px 0 4px;color:{text_color};text-align:{msg_align};line-height:1.25;margin:0;height:100%;'>"
-                f"<a href='{msg_href}' style='text-decoration:none;'><span style='color:{text_color}'>{html_escape(msg)}</span></a>"
-                f"</td>"
-            )
-            ts_cell = (
-                f"<td width='100%' align='right' valign='bottom' style='padding:0 6px 1px 0;color:{ts_color};font-size:10px;line-height:1.0;margin:0;text-align:right;'>"
-                f"<a href='{msg_href}' style='text-decoration:none;'><span style='color:{ts_color}'>{ts_html}</span></a>"
-                f"</td>"
-            )
-            bubble_align = "right" if outgoing else "left"
-            bubble_pad = "padding-left:40px;padding-right:0;" if outgoing else "padding-right:40px;padding-left:0;"
-            row = (
-                f"<table width='100%' style='margin:0;padding:0;border-collapse:collapse;' cellpadding='0' cellspacing='0'>"
-                f"<tr><td style='padding:0 0 2px 0;{bubble_pad}'>"
-                f"<table width='100%' align='{bubble_align}' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
-                f"<tr><td style='background:{bg};padding:6px 0;'>"
-                f"<table width='100%' cellpadding='0' cellspacing='0' style='margin:0;padding:0;border-collapse:collapse;height:100%;'>"
-                f"<tr>{avatar_cell}{msg_text_cell}</tr>"
-                f"<tr>{ts_cell}</tr>"
-                f"</table>"
-                f"</td></tr></table>"
-                f"</td></tr></table>"
-            )
-            view.moveCursor(QtGui.QTextCursor.End)
-            view.insertHtml(row)
-            view.moveCursor(QtGui.QTextCursor.End)
+            bubble_l = QtWidgets.QVBoxLayout(bubble)
+            bubble_l.setContentsMargins(8, 6, 10, 6)
+            bubble_l.setSpacing(4)
+
+            top_row = QtWidgets.QHBoxLayout()
+            top_row.setContentsMargins(0, 0, 0, 0)
+            top_row.setSpacing(6)
+            av_col = QtWidgets.QVBoxLayout()
+            av_col.setContentsMargins(0, 0, 0, 0)
+            av_col.setSpacing(2)
+            av = QtWidgets.QLabel()
+            av.setFixedSize(42, 42)
+            av.setStyleSheet("background: transparent; border: none;")
+            av.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+            av.setAlignment(QtCore.Qt.AlignCenter)
+            av.setScaledContents(False)
+            av.setPixmap(make_avatar_pixmap(peer_id, 42))
+            av_col.addWidget(av, 0, QtCore.Qt.AlignHCenter)
+            if tag:
+                tag_lbl = QtWidgets.QLabel(tag)
+                tag_lbl.setObjectName("chatAvatarTag")
+                tag_lbl.setFixedWidth(42)
+                tag_lbl.setStyleSheet(f"background: transparent; border: none; color:{tx}; font-size:11px; font-weight:600; padding-top:1px;")
+                tag_lbl.setAlignment(QtCore.Qt.AlignHCenter)
+                av_col.addWidget(tag_lbl, 0, QtCore.Qt.AlignHCenter)
+            else:
+                av_col.addSpacing(14)
+            top_row.addLayout(av_col, 0)
+
+            msg_lbl = QtWidgets.QLabel(msg)
+            msg_lbl.setObjectName("chatMessage")
+            msg_lbl.setWordWrap(True)
+            msg_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            msg_lbl.setStyleSheet(f"background: transparent; border: none; color:{tx};")
+            msg_lbl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+            top_row.addWidget(msg_lbl, 1)
+            bubble_l.addLayout(top_row, 1)
+
+            meta_lbl = QtWidgets.QLabel(combined)
+            meta_lbl.setObjectName("chatMeta")
+            meta_lbl.setStyleSheet(f"background: transparent; border: none; color:{ts_color}; font-size:10px;")
+            meta_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            meta_lbl.setWordWrap(False)
+            meta_lbl.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+            meta_lbl.setProperty("full_meta", combined)
+            bubble_l.addWidget(meta_lbl, 0, QtCore.Qt.AlignRight)
+
+            row_wrap.setMinimumWidth(max(100, int(view.viewport().width()) - 2))
+            # Prefer width that fits both message and full delivery-status line.
+            max_w = max(360, int(view.viewport().width()) - 12)
+            try:
+                fm_msg = msg_lbl.fontMetrics()
+                msg_lines = [ln for ln in str(msg).splitlines() if ln] or [str(msg)]
+                msg_px = max(fm_msg.horizontalAdvance(ln) for ln in msg_lines)
+            except Exception:
+                msg_px = int(len(msg) * 7)
+            try:
+                fm_meta = meta_lbl.fontMetrics()
+                meta_px = fm_meta.horizontalAdvance(combined)
+            except Exception:
+                meta_px = int(len(combined) * 6)
+            # +70 for avatar column and inner paddings.
+            min_visual = max(300, int(view.viewport().width() * 0.70))
+            preferred = max(min_visual, int(msg_px + 62), int(meta_px + 10))
+            preferred = min(max_w, preferred)
+            bubble.setMinimumWidth(min(220, preferred))
+            bubble.setMaximumWidth(preferred)
+            bubble.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
+            try:
+                meta_max = max(90, preferred - 18)
+                meta_lbl.setMinimumWidth(meta_max)
+                meta_lbl.setMaximumWidth(meta_max)
+                fm = meta_lbl.fontMetrics()
+                fitted = fm.elidedText(combined, QtCore.Qt.ElideRight, meta_max)
+                meta_lbl.setText(fitted)
+                if fitted != combined:
+                    meta_lbl.setToolTip(combined)
+                else:
+                    meta_lbl.setToolTip("")
+            except Exception:
+                pass
+            row_l.addWidget(bubble, 0)
+            if not outgoing:
+                row_l.addStretch(1)
+
+            item = QtWidgets.QListWidgetItem()
+            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            item.setData(QtCore.Qt.UserRole, int(row_index))
+            try:
+                row_wrap.layout().activate()
+                row_wrap.adjustSize()
+            except Exception:
+                pass
+            h = max(row_wrap.sizeHint().height(), row_wrap.minimumSizeHint().height()) + 16
+            item.setSizeHint(QtCore.QSize(max(100, int(view.viewport().width()) - 4), h))
+            view.addItem(item)
+            view.setItemWidget(item, row_wrap)
+            try:
+                view.doItemsLayout()
+            except Exception:
+                pass
+            view.scrollToBottom()
+
+        def relayout_chat_items(view: QtWidgets.QListWidget) -> None:
+            try:
+                target_w = max(100, int(view.viewport().width()) - 2)
+                for i in range(view.count()):
+                    item = view.item(i)
+                    if item is None:
+                        continue
+                    w = view.itemWidget(item)
+                    if w is not None:
+                        try:
+                            w.setFixedWidth(target_w)
+                        except Exception:
+                            pass
+                        try:
+                            bubble = w.findChild(QtWidgets.QFrame, "chatBubble")
+                            if bubble is not None:
+                                max_w = max(360, int(view.viewport().width()) - 12)
+                                bubble.setMaximumWidth(max_w)
+                                meta_lbl = bubble.findChild(QtWidgets.QLabel, "chatMeta")
+                                msg_lbl = bubble.findChild(QtWidgets.QLabel, "chatMessage")
+                                if meta_lbl is not None:
+                                    full_meta = str(meta_lbl.property("full_meta") or meta_lbl.toolTip() or meta_lbl.text() or "")
+                                else:
+                                    full_meta = ""
+                                if msg_lbl is not None and full_meta:
+                                    try:
+                                        fm_msg = msg_lbl.fontMetrics()
+                                        msg_lines = [ln for ln in str(msg_lbl.text()).splitlines() if ln] or [str(msg_lbl.text())]
+                                        msg_px = max(fm_msg.horizontalAdvance(ln) for ln in msg_lines)
+                                    except Exception:
+                                        msg_px = int(len(str(msg_lbl.text())) * 7)
+                                    try:
+                                        fm_meta = meta_lbl.fontMetrics() if meta_lbl is not None else None
+                                        meta_px = fm_meta.horizontalAdvance(full_meta) if fm_meta is not None else int(len(full_meta) * 6)
+                                    except Exception:
+                                        meta_px = int(len(full_meta) * 6)
+                                    min_visual = max(300, int(view.viewport().width() * 0.70))
+                                    preferred = min(max_w, max(min_visual, int(msg_px + 62), int(meta_px + 10)))
+                                    bubble.setMaximumWidth(preferred)
+                                    if meta_lbl is not None:
+                                        fm = meta_lbl.fontMetrics()
+                                        meta_max = max(90, preferred - 18)
+                                        meta_lbl.setMinimumWidth(meta_max)
+                                        meta_lbl.setMaximumWidth(meta_max)
+                                        fitted = fm.elidedText(full_meta, QtCore.Qt.ElideRight, meta_max)
+                                        meta_lbl.setText(fitted)
+                                        if fitted != full_meta:
+                                            meta_lbl.setToolTip(full_meta)
+                                        else:
+                                            meta_lbl.setToolTip("")
+                        except Exception:
+                            pass
+                        try:
+                            w.layout().activate()
+                            w.adjustSize()
+                            h = max(w.sizeHint().height(), w.minimumSizeHint().height()) + 16
+                            item.setSizeHint(QtCore.QSize(target_w, h))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         def dialog_title(dialog_id: str) -> str:
             if dialog_id.startswith("group:"):
@@ -4471,7 +5843,7 @@ def main() -> int:
                     second = f"{second}[{short_name}]" if second else f"[{short_name}]"
             pub_full = b64e(pub_self_raw) if pub_self_raw else "-----"
             pub_mask = f"{pub_full[:5]}****{pub_full[-5:]}" if len(pub_full) > 10 else pub_full
-            return f"Client ID: {wire} {second} pub: {pub_mask}".strip()
+            return f"Client ID: {wire} {second} public key: {pub_mask}".strip()
 
         def update_dialog(dialog_id: str, text: str, recv: bool = False) -> None:
             rec = dialogs.get(dialog_id) or {}
@@ -4502,66 +5874,129 @@ def main() -> int:
                     meta = str(entry.get("meta", "") or "")
                     meta_data = entry.get("meta_data")
                     if isinstance(meta_data, dict):
-                        row_hhmm = text[:5] if (len(text) >= 5 and text[2] == ":" and text[5:6] == " ") else None
-                        packets = None
-                        packets_raw = meta_data.get("packets")
-                        if isinstance(packets_raw, (tuple, list)) and len(packets_raw) >= 2:
+                        if direction != "out" and dialog_id.startswith("group:"):
                             try:
-                                packets = (int(packets_raw[0]), int(packets_raw[1]))
+                                from_peer = norm_id_for_filename(str(meta_data.get("from_peer", "") or ""))
                             except Exception:
-                                packets = None
-                        status_raw = meta_data.get("status")
-                        status = str(status_raw).strip() if status_raw is not None else ""
-                        done_raw = meta_data.get("done")
-                        done = bool(done_raw) if done_raw is not None else None
-                        meta = format_meta(
-                            as_float(meta_data.get("delivery")),
-                            as_float(meta_data.get("attempts")),
-                            as_float(meta_data.get("forward_hops")),
-                            as_float(meta_data.get("ack_hops")),
-                            packets,
-                            status=status or None,
-                            delivered_at_ts=as_float(meta_data.get("delivered_at_ts")),
-                            incoming=bool(meta_data.get("incoming", direction != "out")),
-                            done=done,
-                            row_time_hhmm=row_hhmm,
-                            received_at_ts=as_float(meta_data.get("received_at_ts")),
-                            sent_at_ts=as_float(meta_data.get("sent_at_ts")),
-                            incoming_started_ts=as_float(meta_data.get("incoming_started_ts")),
-                            compression_name=(str(meta_data.get("compression_name", "") or "") or None),
-                            compression_eff_pct=as_float(meta_data.get("compression_eff_pct")),
-                        )
+                                from_peer = ""
+                            if from_peer:
+                                peer_id = from_peer
+                        if str(meta_data.get("transport", "") or "") == "meshtastic_text":
+                            meta = format_plain_transport_meta(
+                                incoming=bool(meta_data.get("incoming", direction != "out")),
+                                sent_at_ts=as_float(meta_data.get("sent_at_ts")),
+                                received_at_ts=as_float(meta_data.get("received_at_ts")),
+                            )
+                        else:
+                            row_hhmm = text[:5] if (len(text) >= 5 and text[2] == ":" and text[5:6] == " ") else None
+                            packets = None
+                            packets_raw = meta_data.get("packets")
+                            if isinstance(packets_raw, (tuple, list)) and len(packets_raw) >= 2:
+                                try:
+                                    packets = (int(packets_raw[0]), int(packets_raw[1]))
+                                except Exception:
+                                    packets = None
+                            status_raw = meta_data.get("status")
+                            status = str(status_raw).strip() if status_raw is not None else ""
+                            done_raw = meta_data.get("done")
+                            done = bool(done_raw) if done_raw is not None else None
+                            meta = format_meta(
+                                as_float(meta_data.get("delivery")),
+                                as_float(meta_data.get("attempts")),
+                                as_float(meta_data.get("forward_hops")),
+                                as_float(meta_data.get("ack_hops")),
+                                packets,
+                                status=status or None,
+                                delivered_at_ts=as_float(meta_data.get("delivered_at_ts")),
+                                incoming=bool(meta_data.get("incoming", direction != "out")),
+                                done=done,
+                                row_time_hhmm=row_hhmm,
+                                received_at_ts=as_float(meta_data.get("received_at_ts")),
+                                sent_at_ts=as_float(meta_data.get("sent_at_ts")),
+                                incoming_started_ts=as_float(meta_data.get("incoming_started_ts")),
+                                compression_name=(str(meta_data.get("compression_name", "") or "") or None),
+                                compression_eff_pct=as_float(meta_data.get("compression_eff_pct")),
+                                compression_norm=(str(meta_data.get("compression_norm", "") or "") or None),
+                            )
                         entry["meta"] = meta
-                    append_chat_entry(chat_text, text, peer_id, direction == "out", idx, meta=meta)
+                    entry_actions = entry.get("actions")
+                    actions = entry_actions if isinstance(entry_actions, list) else None
+                    append_chat_entry(chat_text, text, peer_id, direction == "out", idx, meta=meta, actions=actions)
                 else:
                     line = str(entry)
                     append_html(chat_text, line, "#66d9ef")
+            relayout_chat_items(chat_text)
 
         def _mtmsg_index_at_pos(pos: "QtCore.QPoint") -> Optional[int]:
             try:
-                cursor = chat_text.cursorForPosition(pos)
+                idx = chat_text.indexAt(pos)
             except Exception:
-                cursor = None
-            if cursor is None:
                 return None
-            href = ""
             try:
-                href = str(cursor.charFormat().anchorHref() or "")
+                return int(idx.row()) if idx.isValid() else None
             except Exception:
-                href = ""
-            if not href:
+                return None
+
+        def _handle_mt_action(href: str) -> bool:
+            nonlocal unseen_error_count, last_error_summary, errors_need_ack
+            if not href.startswith("mtact:"):
+                return False
+            parts = href.split(":", 3)
+            if len(parts) < 4:
+                return False
+            _tag, scope, action, peer_id = parts[0], parts[1], parts[2], parts[3]
+            peer_norm = norm_id_for_filename(peer_id)
+            if scope != "key" or not re.fullmatch(r"[0-9a-fA-F]{8}", peer_norm):
+                return False
+            if action == "replace":
+                accept_pinned_mismatch_key(peer_norm)
+                # Suppress duplicate conflict events already queued for the same key signature.
+                if key_conflict_sig:
+                    key_conflict_ignored[peer_norm] = {
+                        "sig": key_conflict_sig,
+                        "until": float(time.time() + 30.0),
+                    }
+                key_conflict_hidden_log_ts.pop(peer_norm, None)
+                # Clear current red alert if it was exactly this key-mismatch event.
                 try:
-                    cursor2 = QtGui.QTextCursor(cursor)
-                    cursor2.movePosition(QtGui.QTextCursor.Left, QtGui.QTextCursor.MoveAnchor, 1)
-                    href = str(cursor2.charFormat().anchorHref() or "")
+                    low = str(last_error_summary or "").lower()
+                    if ("pinned key mismatch" in low) and (peer_norm.lower() in low):
+                        unseen_error_count = 0
+                        last_error_summary = ""
+                        errors_need_ack = False
+                        _update_alert_indicator()
                 except Exception:
-                    href = ""
-            if not href.startswith("mtmsg:"):
-                return None
-            try:
-                return int(href.split(":", 1)[1])
-            except Exception:
-                return None
+                    pass
+                if key_conflict_peer == peer_norm:
+                    _clear_key_conflict_header()
+                return True
+            if action == "ignore":
+                log_line(f"{ts_local()} KEY: mismatch ignored by user for {peer_norm}", "warn")
+                if key_conflict_peer == peer_norm and key_conflict_sig:
+                    key_conflict_ignored[peer_norm] = {
+                        "sig": key_conflict_sig,
+                        "until": float(time.time() + 30.0),
+                    }
+                    key_conflict_hidden_log_ts.pop(peer_norm, None)
+                if key_conflict_peer == peer_norm:
+                    _clear_key_conflict_header()
+                return True
+            return False
+
+        def _on_key_header_replace() -> None:
+            if not key_conflict_peer:
+                return
+            _handle_mt_action(f"mtact:key:replace:{key_conflict_peer}")
+            update_status()
+
+        def _on_key_header_ignore() -> None:
+            if not key_conflict_peer:
+                return
+            _handle_mt_action(f"mtact:key:ignore:{key_conflict_peer}")
+            update_status()
+
+        key_renew_btn.clicked.connect(_on_key_header_replace)
+        key_ignore_btn.clicked.connect(_on_key_header_ignore)
 
         def _fmt_ctx_num(value: object) -> Optional[str]:
             if value is None:
@@ -4629,13 +6064,7 @@ def main() -> int:
             QtWidgets.QMessageBox.information(win, tr("msg_route_title"), body)
 
         def _show_chat_default_menu(pos: "QtCore.QPoint") -> None:
-            try:
-                menu = chat_text.createStandardContextMenu()
-                if menu is None:
-                    return
-                menu.exec(chat_text.viewport().mapToGlobal(pos))
-            except Exception:
-                pass
+            _ = pos
 
         def _on_chat_context_menu(pos: "QtCore.QPoint") -> None:
             idx = _mtmsg_index_at_pos(pos)
@@ -4655,16 +6084,10 @@ def main() -> int:
                 _copy_message_entry(entry)
 
         def _on_chat_context_menu_widget(pos: "QtCore.QPoint") -> None:
-            try:
-                vp_pos = chat_text.viewport().mapFrom(chat_text, pos)
-            except Exception:
-                vp_pos = pos
-            _on_chat_context_menu(vp_pos)
+            _on_chat_context_menu(pos)
 
         chat_text.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         chat_text.customContextMenuRequested.connect(_on_chat_context_menu_widget)
-        chat_text.viewport().setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        chat_text.viewport().customContextMenuRequested.connect(_on_chat_context_menu)
 
         def select_dialog(dialog_id: Optional[str]) -> None:
             nonlocal current_dialog
@@ -4682,9 +6105,10 @@ def main() -> int:
             return
 
         def refresh_list() -> None:
+            nonlocal current_dialog
             items_list.clear()
             now_ts = time.time()
-            KEY_VALID_SECONDS = 24.0 * 3600.0
+            visibility_mode = str(contacts_visibility or "all").strip().lower()
             ordered = sorted(
                 dialogs.items(),
                 key=lambda kv: float(kv[1].get("last_rx_ts", kv[1].get("last_ts", 0.0))),
@@ -4694,10 +6118,14 @@ def main() -> int:
             filter_text = search_field.text().strip().lower()
             known = (set(known_peers.keys()) | set(peer_states.keys())) - set(hidden_contacts)
             groups_all = set(groups.keys())
+            groups_all.add("Primary")
             seen = set()
 
             def make_avatar(seed: str) -> QtGui.QIcon:
-                return QtGui.QIcon(make_avatar_pixmap(seed, 36))
+                try:
+                    return QtGui.QIcon(_peer_logo_pixmap(seed, 44))
+                except Exception:
+                    return QtGui.QIcon(make_avatar_pixmap(seed, 44))
 
             def add_header(title: str) -> None:
                 item = QtWidgets.QListWidgetItem(title)
@@ -4709,42 +6137,13 @@ def main() -> int:
                 items_list.addItem(item)
                 list_index.append(None)
 
-            def lock_state_for_item(item_id: str) -> Optional[str]:
-                if item_id.startswith("group:"):
-                    return None
-                st = get_peer_state(item_id)
-                if not st or not st.key_ready:
-                    return None
-                # Apply persisted peer metadata (if any) to in-memory state for UI purposes.
-                meta = peer_meta.get(item_id, {})
-                if isinstance(meta, dict):
-                    try:
-                        ls = meta.get("last_seen_ts")
-                        if float(getattr(st, "last_seen_ts", 0.0) or 0.0) <= 0.0 and isinstance(ls, (int, float)) and float(ls) > 0.0:
-                            st.last_seen_ts = float(ls)
-                    except Exception:
-                        pass
-                    try:
-                        kc = meta.get("key_confirmed_ts")
-                        if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) <= 0.0 and isinstance(kc, (int, float)) and float(kc) > 0.0:
-                            st.key_confirmed_ts = float(kc)
-                    except Exception:
-                        pass
-                # Show lock only after confirmed two-way exchange.
-                if bool(getattr(st, "await_key_confirm", False)):
-                    return None
-                key_ts = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0)
-                if key_ts > 0.0 and (float(now_ts) - key_ts) <= float(KEY_VALID_SECONDS):
-                    return "ok"
-                return None
-
             def add_item(item_id: str, last_text: str = "") -> None:
                 title = dialog_title(item_id)
                 if filter_text and filter_text not in title.lower():
                     return
                 item = QtWidgets.QListWidgetItem(title)
                 size = item.sizeHint()
-                base_h = max(64, int(size.height()) + 24)
+                base_h = max(74, int(size.height()) + 30)
                 item.setSizeHint(QtCore.QSize(size.width(), base_h))
                 if item_id.startswith("group:"):
                     font = item.font()
@@ -4760,33 +6159,104 @@ def main() -> int:
                 item.setForeground(QtGui.QColor(tx_hex))
                 item.setIcon(make_avatar(item_id))
                 unread = int(dialogs.get(item_id, {}).get("unread", 0) or 0)
-                lock_state = lock_state_for_item(item_id)
-                seen_h = None
-                key_h = None
+                status_code: Optional[str] = None
+                app_recent = False
+                app_seen_any = False
+                device_recent = False
+                app_seen_fresh = False
+                device_seen_fresh = False
                 if not item_id.startswith("group:"):
                     st = peer_states.get(item_id)
+                    # Apply persisted peer metadata (if any) to in-memory state for UI purposes.
+                    if st is not None:
+                        meta = peer_meta.get(item_id, {})
+                        if isinstance(meta, dict):
+                            try:
+                                ls = meta.get("last_seen_ts")
+                                if float(getattr(st, "last_seen_ts", 0.0) or 0.0) <= 0.0 and isinstance(ls, (int, float)) and float(ls) > 0.0:
+                                    st.last_seen_ts = float(ls)
+                            except Exception:
+                                pass
+                            try:
+                                ds = meta.get("device_seen_ts")
+                                if float(getattr(st, "device_seen_ts", 0.0) or 0.0) <= 0.0 and isinstance(ds, (int, float)) and float(ds) > 0.0:
+                                    st.device_seen_ts = float(ds)
+                            except Exception:
+                                pass
+                            try:
+                                kc = meta.get("key_confirmed_ts")
+                                if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) <= 0.0 and isinstance(kc, (int, float)) and float(kc) > 0.0:
+                                    st.key_confirmed_ts = float(kc)
+                            except Exception:
+                                pass
+                    seen_ts = 0.0
+                    device_ts = 0.0
                     if st:
                         try:
                             seen_ts = float(getattr(st, "last_seen_ts", 0.0) or 0.0)
                         except Exception:
                             seen_ts = 0.0
-                        if seen_ts > 0.0:
-                            seen_h = int(max(0.0, (float(now_ts) - float(seen_ts)) // 3600.0))
                         try:
-                            key_ts = float(getattr(st, "key_confirmed_ts", 0.0) or 0.0)
+                            device_ts = float(getattr(st, "device_seen_ts", 0.0) or 0.0)
                         except Exception:
-                            key_ts = 0.0
-                        if key_ts > 0.0:
-                            key_h = int(max(0.0, (float(now_ts) - float(key_ts)) // 3600.0))
+                            device_ts = 0.0
+                    if seen_ts > 0.0:
+                        app_seen_any = True
+                        app_age_s = float(now_ts) - float(seen_ts)
+                        app_recent = app_age_s <= float(CONTACT_ONLINE_SECONDS)
+                        app_seen_fresh = app_age_s <= float(CONTACT_STALE_SECONDS)
+                    if device_ts > 0.0:
+                        dev_age_s = float(now_ts) - float(device_ts)
+                        device_recent = dev_age_s <= float(CONTACT_ONLINE_SECONDS)
+                        device_seen_fresh = dev_age_s <= float(CONTACT_STALE_SECONDS)
+                    keys_ok = False
+                    if st:
+                        try:
+                            keys_ok = bool(
+                                st.key_ready
+                                and not bool(getattr(st, "await_key_confirm", False))
+                                and not bool(getattr(st, "pinned_mismatch", False))
+                                and float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) > 0.0
+                            )
+                        except Exception:
+                            keys_ok = False
+                    if app_seen_any and keys_ok:
+                        if app_recent:
+                            status_code = "app_online"
+                        elif app_seen_fresh:
+                            status_code = "app_offline"
+                        else:
+                            status_code = None
+                    elif not app_seen_any:
+                        if device_recent:
+                            status_code = "mesh_online"
+                        elif device_seen_fresh:
+                            status_code = "mesh_offline"
+                        else:
+                            status_code = None
+                    else:
+                        # App was seen, but keys are not valid now (e.g. mismatch/reset):
+                        # keep device presence indicator instead of hiding status completely.
+                        if device_recent:
+                            status_code = "mesh_online"
+                        elif device_seen_fresh:
+                            status_code = "mesh_offline"
+                        else:
+                            status_code = None
+                    if visibility_mode == "online" and status_code not in ("app_online", "mesh_online"):
+                        return
+                    if visibility_mode == "app" and status_code not in ("app_online", "app_offline"):
+                        return
+                    if visibility_mode == "device" and status_code not in ("mesh_online", "mesh_offline"):
+                        return
                 item.setData(
                     QtCore.Qt.UserRole,
                     {
                         "id": item_id,
                         "pinned": item_id in pinned_dialogs,
                         "unread": unread,
-                        "lock": lock_state,
-                        "seen_h": seen_h,
-                        "key_h": key_h,
+                        "last_rx_ts": float(dialogs.get(item_id, {}).get("last_rx_ts", 0.0) or 0.0),
+                        "status_code": status_code,
                     },
                 )
                 items_list.addItem(item)
@@ -4810,14 +6280,31 @@ def main() -> int:
                 gid = f"group:{g}"
                 if gid not in seen:
                     add_item(gid, "")
-            update_status()
-            chat_label.setText(self_title())
-            # Keep current dialog visibly highlighted after list rebuild.
+            # Keep one dialog always selected. If current selection disappeared, pick first available dialog.
+            selected_dialog: Optional[str] = None
             if current_dialog and current_dialog in list_index:
+                selected_dialog = current_dialog
+            else:
+                for did in list_index:
+                    if did:
+                        selected_dialog = did
+                        break
+            if selected_dialog and selected_dialog in list_index:
+                row_sel = list_index.index(selected_dialog)
+                prev_dialog = current_dialog
+                current_dialog = selected_dialog
+                old_block = items_list.blockSignals(True)
                 try:
-                    items_list.setCurrentRow(list_index.index(current_dialog))
-                except Exception:
-                    pass
+                    items_list.setCurrentRow(row_sel)
+                finally:
+                    items_list.blockSignals(old_block)
+                if prev_dialog != selected_dialog:
+                    render_chat(selected_dialog)
+            else:
+                current_dialog = None
+                chat_text.clear()
+            adjust_contacts_panel_width()
+            update_status()
 
         def set_language(lang: str, persist: bool = False) -> None:
             nonlocal current_lang
@@ -4830,13 +6317,9 @@ def main() -> int:
             apply_language()
             refresh_list()
             render_chat(current_dialog)
-            app.processEvents()
-            for w in win.findChildren(QtWidgets.QWidget):
-                w.update()
-                w.repaint()
+            # Avoid forced repaint of all child widgets: on some Qt/KDE Breeze stacks
+            # it can trigger cross-thread style-engine warnings.
             win.update()
-            win.repaint()
-            app.processEvents()
             if changed:
                 print(f"GUI: lang={current_lang}")
 
@@ -4854,7 +6337,7 @@ def main() -> int:
             update_dialog(peer_norm, "new chat")
             tracked_peers.add(peer_norm)
             st = get_peer_state(peer_norm)
-            if peer_norm != self_id and st and not st.key_ready:
+            if peer_norm != self_id and st and not st.key_ready and peer_used_meshtalk(peer_norm):
                 st.force_key_req = True
                 st.next_key_req_ts = 0.0
                 send_key_request(peer_norm, require_confirm=True, reason="dialog_open")
@@ -5041,10 +6524,40 @@ def main() -> int:
                 st.pinned_mismatch = False
                 st.pinned_old_fp = ""
                 st.pinned_new_fp = ""
+                st.pinned_new_pub_b64 = ""
                 st.force_key_req = True
                 st.next_key_req_ts = 0.0
             send_key_request(peer_id, require_confirm=True, reason="reset_key")
             log_line(f"{ts_local()} KEY: reset for {peer_id}", "warn")
+
+        def accept_pinned_mismatch_key(peer_id: str) -> None:
+            if not peer_id or peer_id.startswith("group:"):
+                return
+            if not re.fullmatch(r"[0-9a-fA-F]{8}", peer_id):
+                log_line(f"KEY: invalid peer id '{peer_id}'", "warn")
+                return
+            st = get_peer_state(peer_id)
+            pending_b64 = str(getattr(st, "pinned_new_pub_b64", "") or "").strip() if st else ""
+            if not pending_b64:
+                log_line(f"{ts_local()} KEY: no pending mismatched key for {peer_id}", "warn")
+                return
+            try:
+                pub_raw = b64d(pending_b64)
+                force_store_peer_pub(peer_id, pub_raw)
+            except Exception as ex:
+                log_line(f"{ts_local()} KEY: failed to replace pinned key for {peer_id} ({type(ex).__name__})", "error")
+                return
+            st2 = get_peer_state(peer_id)
+            if st2:
+                st2.pinned_mismatch = False
+                st2.pinned_old_fp = ""
+                st2.pinned_new_fp = ""
+                st2.pinned_new_pub_b64 = ""
+                st2.force_key_req = True
+                st2.await_key_confirm = True
+                st2.next_key_req_ts = 0.0
+            send_key_request(peer_id, require_confirm=True, reason="replace_pinned_key")
+            log_line(f"{ts_local()} KEY: pinned key replaced for {peer_id}, confirmation requested", "info")
 
         trace_inflight: set[str] = set()
         trace_lock = threading.Lock()
@@ -5277,15 +6790,37 @@ def main() -> int:
 
                         def _send_req() -> None:
                             try:
-                                iface.sendData(
-                                    req,
-                                    destinationId=dest,
-                                    portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
-                                    wantResponse=True,
-                                    onResponse=_on_resp,
-                                    channelIndex=(args.channel if args.channel is not None else 0),
-                                    hopLimit=hop_limit,
-                                )
+                                ch_idx = int(args.channel if args.channel is not None else 0)
+                                # Meshtastic API differs between releases/bundles; try modern call first,
+                                # then progressively degrade to older signatures.
+                                try:
+                                    iface.sendData(
+                                        req,
+                                        destinationId=dest,
+                                        portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                        wantResponse=True,
+                                        onResponse=_on_resp,
+                                        channelIndex=ch_idx,
+                                        hopLimit=hop_limit,
+                                    )
+                                except TypeError:
+                                    try:
+                                        iface.sendData(
+                                            req,
+                                            destinationId=dest,
+                                            portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                            wantResponse=True,
+                                            onResponse=_on_resp,
+                                            channelIndex=ch_idx,
+                                        )
+                                    except TypeError:
+                                        iface.sendData(
+                                            req,
+                                            destinationId=dest,
+                                            portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                            wantResponse=True,
+                                            onResponse=_on_resp,
+                                        )
                             except BaseException as ex:
                                 send_err.append(ex)
                             finally:
@@ -5302,7 +6837,11 @@ def main() -> int:
                             done.set()
                             break
                         if send_err:
-                            ui_emit("log", f"{ts_local()} TRACE: send failed ({type(send_err[0]).__name__}), retry later {peer_norm}")
+                            err = send_err[0]
+                            ui_emit(
+                                "log",
+                                f"{ts_local()} TRACE: send failed ({type(err).__name__}: {err}), retry later {peer_norm}",
+                            )
                             next_retry_at = time.time() + retry_delay_seconds(float(args.retry_seconds), int(attempt))
                             continue
                         ui_emit("log", f"{ts_local()} TRACE: send ok dt={(time.time() - t0):.2f}s {peer_norm}")
@@ -5385,6 +6924,9 @@ def main() -> int:
                             entry["meta"] = meta
                         if meta_data is not None:
                             entry["meta_data"] = dict(meta_data)
+                            acts = meta_data.get("actions") if isinstance(meta_data, dict) else None
+                            if isinstance(acts, list):
+                                entry["actions"] = acts
                         if msg_id:
                             entry["msg_id"] = msg_id
                         update_dialog(dialog_id, line, recv=not outgoing)
@@ -5399,6 +6941,9 @@ def main() -> int:
                 entry["meta"] = meta
             if meta_data is not None:
                 entry["meta_data"] = dict(meta_data)
+                acts = meta_data.get("actions") if isinstance(meta_data, dict) else None
+                if isinstance(acts, list):
+                    entry["actions"] = acts
             history.append(entry)
             update_dialog(dialog_id, line, recv=not outgoing)
             if not outgoing and current_dialog != dialog_id:
@@ -5409,7 +6954,9 @@ def main() -> int:
             if current_dialog == dialog_id:
                 peer_id = self_id if outgoing else dialog_id
                 idx = len(chat_history.get(dialog_id, [])) - 1
-                append_chat_entry(chat_text, line, peer_id, outgoing, idx, meta=meta)
+                entry_actions = entry.get("actions")
+                actions = entry_actions if isinstance(entry_actions, list) else None
+                append_chat_entry(chat_text, line, peer_id, outgoing, idx, meta=meta, actions=actions)
             update_status()
 
         def history_has_msg(dialog_id: str, msg_id: str) -> bool:
@@ -5441,6 +6988,7 @@ def main() -> int:
                             "created": 0.0,
                             "compression_name": None,
                             "compression_eff_pct": None,
+                            "compression_norm": None,
                             "compressed_size": 0,
                         },
                     )
@@ -5478,6 +7026,9 @@ def main() -> int:
                         cmp_name_now = normalize_compression_name(str(rec.get("cmp", "") or ""))
                         if cmp_name_now and not grouped_rec.get("compression_name"):
                             grouped_rec["compression_name"] = cmp_name_now
+                        cmp_norm_now = str(rec.get("cmp_norm", "") or "").strip()
+                        if cmp_norm_now and not grouped_rec.get("compression_norm"):
+                            grouped_rec["compression_norm"] = cmp_norm_now.upper()
                         try:
                             eff_now = float(rec.get("cmp_eff_pct"))
                         except Exception:
@@ -5514,6 +7065,7 @@ def main() -> int:
                     compression_name = normalize_compression_name(
                         str(grouped_rec.get("compression_name", "") or "")
                     )
+                    compression_norm = str(grouped_rec.get("compression_norm", "") or "").strip().upper() or None
                     compression_eff_pct = None
                     try:
                         raw_eff = grouped_rec.get("compression_eff_pct")
@@ -5535,6 +7087,7 @@ def main() -> int:
                         "done": False,
                         "compression_name": compression_name,
                         "compression_eff_pct": compression_eff_pct,
+                        "compression_norm": compression_norm,
                     }
                     if sent_at_ts is not None:
                         meta_data_out["sent_at_ts"] = sent_at_ts
@@ -5547,6 +7100,7 @@ def main() -> int:
                         sent_at_ts=sent_at_ts,
                         compression_name=compression_name,
                         compression_eff_pct=compression_eff_pct,
+                        compression_norm=compression_norm,
                     )
                     chat_line(
                         peer_norm,
@@ -5624,7 +7178,16 @@ def main() -> int:
                     legacy_codec=legacy_codec,
                     parts=parts,
                 )
+                try:
+                    inferred_exact = infer_compact_cmp_label_from_joined_parts(parts, total)
+                except Exception:
+                    inferred_exact = None
+                if inferred_exact:
+                    cmp_raw = inferred_exact
                 compression_name = normalize_compression_name(cmp_raw)
+                compression_norm = infer_compact_norm_from_joined_parts(parts, total)
+                if compression_norm:
+                    compression_norm = str(compression_norm).upper()
                 compression_eff_pct = None
                 if compression_name and compact and done_now and decode_ok:
                     compressed_size = 0
@@ -5657,6 +7220,7 @@ def main() -> int:
                     incoming_started_ts=incoming_started_ts,
                     compression_name=compression_name,
                     compression_eff_pct=compression_eff_pct,
+                    compression_norm=compression_norm,
                 )
                 meta_data_in: Dict[str, object] = {
                     "delivery": rec.get("delivery"),
@@ -5671,6 +7235,7 @@ def main() -> int:
                     "incoming_started_ts": incoming_started_ts,
                     "compression_name": compression_name,
                     "compression_eff_pct": compression_eff_pct,
+                    "compression_norm": compression_norm,
                 }
                 chat_line(
                     peer_norm,
@@ -5698,35 +7263,35 @@ def main() -> int:
             append_runtime_log(line_norm)
 
         def log_append_view(view: QtWidgets.QTextEdit, text: str, level: str) -> None:
+            # Severity palette:
+            # - red: critical
+            # - orange: needs attention
+            # - yellow: informational
+            # - green: success/healthy
             if level == "error":
                 color = "#f92672"
-            elif level == "pace":
-                color = "#a6e22e"
-            elif level == "keyok":
-                color = "#ffd75f"
-            elif level == "key":
-                # Crypto request/response events (key exchange) are highlighted.
-                color = "#ffd75f"
-            elif level == "trace":
-                color = "#66d9ef"
-            elif level == "warn":
+            elif level in ("warn", "key"):
                 color = "#fd971f"
-            elif level == "health":
+            elif level == "keyok":
                 color = "#6be5b5"
-            elif level == "discovery":
-                color = "#b894ff"
-            elif level == "radio":
-                color = "#74b2ff"
-            elif level == "gui":
-                color = "#e0e0e0"
-            elif level == "queue":
-                color = "#c3b38a"
             else:
-                color = "#8a7f8b"
-            append_html(view, text, color)
+                color = "#ffd75f"
+            try:
+                esc = html_escape(str(text))
+            except Exception:
+                esc = str(text)
+            try:
+                view.append(f"<span style='color:{color};'>{esc}</span>")
+            except Exception:
+                # Fallback to plain text if rich append fails.
+                try:
+                    view.append(str(text))
+                except Exception:
+                    pass
 
         def log_line(text: str, level: str = "info") -> None:
-            nonlocal errors_need_ack
+            nonlocal errors_need_ack, unseen_error_count, unseen_warn_count
+            nonlocal last_error_summary, last_warn_summary, last_error_ts, last_warn_ts
             try:
                 # Avoid touching Qt widgets from non-GUI threads.
                 if QtCore.QThread.currentThread() != app.thread():
@@ -5763,15 +7328,28 @@ def main() -> int:
                     lvl = "queue"
                 if ("pinned key mismatch" in low) or ("reject invalid public key" in low):
                     lvl = "error"
-                elif ("error" in low) or ("exception" in low) or ("traceback" in low):
-                    # Keep it simple: treat traceback/exception/error keywords as errors.
+                elif ("exception" in low) or ("traceback" in low):
+                    # Explicit crash/exception markers only (avoid false positives from plain text).
                     lvl = "error"
+                elif low.startswith("error:"):
+                    lvl = "error"
+                elif low.startswith("warn:"):
+                    lvl = "warn"
                 elif "keyok:" in low:
                     lvl = "keyok"
                 elif ("key:" in low) or ("crypto:" in low):
                     lvl = "key"
-            if lvl == "error" and settings_log_view is None:
-                errors_need_ack = True
+            now_ts = time.time()
+            if settings_log_view is None:
+                if lvl == "error":
+                    unseen_error_count += 1
+                    last_error_summary = _alert_summary(text)
+                    last_error_ts = now_ts
+                elif lvl == "warn":
+                    unseen_warn_count += 1
+                    last_warn_summary = _alert_summary(text)
+                    last_warn_ts = now_ts
+            errors_need_ack = bool(unseen_error_count > 0)
             log_buffer.append((text, lvl))
             append_runtime_log(text)
             if settings_log_view is not None:
@@ -5803,6 +7381,7 @@ def main() -> int:
             incoming_started_ts: Optional[float] = None,
             compression_name: Optional[str] = None,
             compression_eff_pct: Optional[float] = None,
+            compression_norm: Optional[str] = None,
         ) -> str:
             return format_meta_text(
                 current_lang,
@@ -5821,7 +7400,25 @@ def main() -> int:
                 incoming_started_ts=incoming_started_ts,
                 compression_name=compression_name,
                 compression_eff_pct=compression_eff_pct,
+                compression_norm=compression_norm,
             )
+
+        def format_plain_transport_meta(
+            incoming: bool,
+            sent_at_ts: Optional[float] = None,
+            received_at_ts: Optional[float] = None,
+        ) -> str:
+            try:
+                ts_val = float(received_at_ts if incoming else sent_at_ts)
+            except Exception:
+                ts_val = 0.0
+            if ts_val <= 0.0:
+                ts_val = time.time()
+            hhmm = time.strftime("%H:%M", time.localtime(ts_val))
+            is_ru = (current_lang == "ru")
+            if incoming:
+                return f"пришло в {hhmm}" if is_ru else f"received at {hhmm}"
+            return f"отправлено в {hhmm}" if is_ru else f"sent at {hhmm}"
 
         def update_sent_delivery(
             dialog_id: str,
@@ -5862,6 +7459,7 @@ def main() -> int:
                 sent_at_ts = None
                 compression_name = None
                 compression_eff_pct = None
+                compression_norm = None
                 old_meta_data = entry.get("meta_data")
                 if isinstance(old_meta_data, dict):
                     try:
@@ -5877,6 +7475,11 @@ def main() -> int:
                             compression_eff_pct = float(raw_eff)
                     except Exception:
                         compression_eff_pct = None
+                    try:
+                        raw_norm = str(old_meta_data.get("compression_norm", "") or "").strip()
+                        compression_norm = raw_norm.upper() if raw_norm else None
+                    except Exception:
+                        compression_norm = None
                 entry["meta"] = format_meta(
                     delivery,
                     attempts,
@@ -5890,6 +7493,7 @@ def main() -> int:
                     sent_at_ts=sent_at_ts,
                     compression_name=compression_name,
                     compression_eff_pct=compression_eff_pct,
+                    compression_norm=compression_norm,
                 )
                 meta_data_out: Dict[str, object] = {
                     "delivery": delivery,
@@ -5900,6 +7504,7 @@ def main() -> int:
                     "done": (delivered_at_ts is not None),
                     "compression_name": compression_name,
                     "compression_eff_pct": compression_eff_pct,
+                    "compression_norm": compression_norm,
                 }
                 if packets is not None:
                     meta_data_out["packets"] = (int(packets[0]), int(packets[1]))
@@ -5954,6 +7559,7 @@ def main() -> int:
                 sent_at_ts = None
                 compression_name = None
                 compression_eff_pct = None
+                compression_norm = None
                 old_meta_data = entry.get("meta_data")
                 if isinstance(old_meta_data, dict):
                     try:
@@ -5969,6 +7575,11 @@ def main() -> int:
                             compression_eff_pct = float(raw_eff)
                     except Exception:
                         compression_eff_pct = None
+                    try:
+                        raw_norm = str(old_meta_data.get("compression_norm", "") or "").strip()
+                        compression_norm = raw_norm.upper() if raw_norm else None
+                    except Exception:
+                        compression_norm = None
                 entry["meta"] = format_meta(
                     None,
                     float(attempts),
@@ -5979,6 +7590,7 @@ def main() -> int:
                     sent_at_ts=sent_at_ts,
                     compression_name=compression_name,
                     compression_eff_pct=compression_eff_pct,
+                    compression_norm=compression_norm,
                 )
                 entry["meta_data"] = {
                     "delivery": None,
@@ -5991,6 +7603,7 @@ def main() -> int:
                     "done": False,
                     "compression_name": compression_name,
                     "compression_eff_pct": compression_eff_pct,
+                    "compression_norm": compression_norm,
                 }
                 if sent_at_ts is not None:
                     entry["meta_data"]["sent_at_ts"] = sent_at_ts
@@ -6002,6 +7615,141 @@ def main() -> int:
                 else:
                     refresh_list()
                 return
+
+        def peer_used_meshtalk(peer_norm: str) -> bool:
+            peer_id = norm_id_for_filename(peer_norm)
+            if not peer_id:
+                return False
+            now_ts = time.time()
+            try:
+                pinned_pub_exists = os.path.isfile(os.path.join(keydir, f"{peer_id}.pub"))
+            except Exception:
+                pinned_pub_exists = False
+            st = peer_states.get(peer_id)
+            if st:
+                try:
+                    seen_ts = float(getattr(st, "last_seen_ts", 0.0) or 0.0)
+                    offline_ts = float(getattr(st, "app_offline_ts", 0.0) or 0.0)
+                    if offline_ts > 0.0 and (float(now_ts) - offline_ts) <= float(CONTACT_STALE_SECONDS) and seen_ts <= offline_ts:
+                        return False
+                    key_ready_now = bool(getattr(st, "key_ready", False))
+                    if (key_ready_now or pinned_pub_exists) and seen_ts > 0.0 and (float(now_ts) - seen_ts) <= float(CONTACT_STALE_SECONDS):
+                        return True
+                except Exception:
+                    pass
+            rec = peer_meta.get(peer_id, {})
+            if isinstance(rec, dict):
+                try:
+                    seen_ts = float(rec.get("last_seen_ts", 0.0) or 0.0)
+                    offline_ts = float(rec.get("app_offline_ts", 0.0) or 0.0)
+                    if offline_ts > 0.0 and (float(now_ts) - offline_ts) <= float(CONTACT_STALE_SECONDS) and seen_ts <= offline_ts:
+                        return False
+                    if pinned_pub_exists and seen_ts > 0.0 and (float(now_ts) - seen_ts) <= float(CONTACT_STALE_SECONDS):
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        def send_plain_meshtastic_text(peer_norm: str, text: str) -> bool:
+            peer_id = norm_id_for_filename(peer_norm)
+            if not peer_id or not radio_ready or interface is None:
+                return False
+            try:
+                pkt = interface.sendText(
+                    text,
+                    destinationId=wire_id_from_norm(peer_id),
+                    wantAck=False,
+                    channelIndex=(args.channel if args.channel is not None else 0),
+                )
+            except Exception as ex:
+                log_line(f"{ts_local()} SENDSTD: failed -> {peer_id} ({type(ex).__name__}: {ex})", "warn")
+                return False
+            msg_id = f"mtxt:{os.urandom(4).hex()}"
+            try:
+                if isinstance(pkt, dict):
+                    pid = pkt.get("id")
+                    if isinstance(pid, int):
+                        msg_id = f"mtxt:{int(pid) & 0xFFFFFFFF:08x}"
+            except Exception:
+                pass
+            sent_at_ts = time.time()
+            meta_data_out: Dict[str, object] = {
+                "incoming": False,
+                "done": True,
+                "sent_at_ts": sent_at_ts,
+                "transport": "meshtastic_text",
+            }
+            chat_line(
+                peer_id,
+                text,
+                "#a6e22e",
+                outgoing=True,
+                msg_id=msg_id,
+                meta=format_plain_transport_meta(incoming=False, sent_at_ts=sent_at_ts),
+                meta_data=meta_data_out,
+            )
+            append_history("sent", peer_id, msg_id, text, meta_data=meta_data_out)
+            try:
+                preview = " ".join(str(text or "").split())
+            except Exception:
+                preview = ""
+            if len(preview) > 120:
+                preview = preview[:117] + "..."
+            log_line(
+                f"{ts_local()} SENDSTD: {msg_id} -> {peer_id} port=TEXT_MESSAGE_APP text={preview!r}",
+                "info",
+            )
+            return True
+
+        def send_plain_meshtastic_broadcast(text: str) -> bool:
+            if not radio_ready or interface is None:
+                return False
+            try:
+                pkt = interface.sendText(
+                    text,
+                    destinationId=meshtastic.BROADCAST_ADDR,
+                    wantAck=False,
+                    channelIndex=(args.channel if args.channel is not None else 0),
+                )
+            except Exception as ex:
+                log_line(f"{ts_local()} SENDSTD: failed -> Primary ({type(ex).__name__}: {ex})", "warn")
+                return False
+            msg_id = f"mtxt:{os.urandom(4).hex()}"
+            try:
+                if isinstance(pkt, dict):
+                    pid = pkt.get("id")
+                    if isinstance(pid, int):
+                        msg_id = f"mtxt:{int(pid) & 0xFFFFFFFF:08x}"
+            except Exception:
+                pass
+            sent_at_ts = time.time()
+            meta_data_out: Dict[str, object] = {
+                "incoming": False,
+                "done": True,
+                "sent_at_ts": sent_at_ts,
+                "transport": "meshtastic_text",
+            }
+            chat_line(
+                "group:Primary",
+                text,
+                "#a6e22e",
+                outgoing=True,
+                msg_id=msg_id,
+                meta=format_plain_transport_meta(incoming=False, sent_at_ts=sent_at_ts),
+                meta_data=meta_data_out,
+            )
+            append_history("sent", "group:Primary", msg_id, text, meta_data=meta_data_out)
+            try:
+                preview = " ".join(str(text or "").split())
+            except Exception:
+                preview = ""
+            if len(preview) > 120:
+                preview = preview[:117] + "..."
+            log_line(
+                f"{ts_local()} SENDSTD: {msg_id} -> Primary port=TEXT_MESSAGE_APP text={preview!r}",
+                "info",
+            )
+            return True
 
         def send_message() -> None:
             if not radio_ready:
@@ -6016,20 +7764,37 @@ def main() -> int:
                 return
             if current_dialog.startswith("group:"):
                 name = current_dialog[6:]
+                if name.strip().lower() == "primary":
+                    log_line(f"{ts_local()} ROUTE: Primary -> meshtastic_text broadcast", "info")
+                    if not send_plain_meshtastic_broadcast(text):
+                        QtWidgets.QMessageBox.warning(win, "meshTalk", "Meshtastic broadcast send failed.")
+                    return
                 queued_ok = 0
                 for peer_norm in sorted(groups.get(name, set())):
-                    if queue_message(peer_norm, text) is not None:
-                        queued_ok += 1
+                    if peer_used_meshtalk(peer_norm):
+                        log_line(f"{ts_local()} ROUTE: {peer_norm} -> meshTalk", "info")
+                        if queue_message(peer_norm, text) is not None:
+                            queued_ok += 1
+                    else:
+                        log_line(f"{ts_local()} ROUTE: {peer_norm} -> meshtastic_text", "info")
+                        if send_plain_meshtastic_text(peer_norm, text):
+                            queued_ok += 1
                 if queued_ok <= 0:
                     QtWidgets.QMessageBox.information(win, "meshTalk", tr("group_send_none"))
                     return
                 chat_line(current_dialog, text, "#fd971f", outgoing=True, meta=format_meta(None, 0, None, None, None))
                 append_history("sent", current_dialog, os.urandom(8).hex(), text)
                 return
+            if not peer_used_meshtalk(current_dialog):
+                log_line(f"{ts_local()} ROUTE: {current_dialog} -> meshtastic_text", "info")
+                if not send_plain_meshtastic_text(current_dialog, text):
+                    QtWidgets.QMessageBox.warning(win, "meshTalk", "Meshtastic text send failed.")
+                return
+            log_line(f"{ts_local()} ROUTE: {current_dialog} -> meshTalk", "info")
             res = queue_message(current_dialog, text)
             if res is None:
                 return
-            group_id, total, cmp_name, cmp_eff_pct = res
+            group_id, total, cmp_name, cmp_eff_pct, cmp_norm = res
             sent_at_ts = time.time()
             chat_line(
                 current_dialog,
@@ -6046,6 +7811,7 @@ def main() -> int:
                     sent_at_ts=sent_at_ts,
                     compression_name=cmp_name,
                     compression_eff_pct=cmp_eff_pct,
+                    compression_norm=cmp_norm,
                 ),
                 meta_data={
                     "delivery": None,
@@ -6058,16 +7824,30 @@ def main() -> int:
                     "sent_at_ts": sent_at_ts,
                     "compression_name": cmp_name,
                     "compression_eff_pct": cmp_eff_pct,
+                    "compression_norm": cmp_norm,
                 },
             )
 
         def update_status() -> None:
-            if errors_need_ack:
-                set_header_status("error")
-            elif radio_ready and not initializing:
+            nonlocal unseen_error_count, unseen_warn_count, errors_need_ack
+            nonlocal last_error_ts, last_warn_ts
+            now = time.time()
+            # Auto de-escalation windows:
+            # error -> warn after 5 min without new errors; clear stale alerts after 15 min.
+            error_to_warn_s = 5.0 * 60.0
+            clear_stale_s = 15.0 * 60.0
+            if unseen_error_count > 0 and last_error_ts > 0.0 and (now - last_error_ts) >= clear_stale_s:
+                unseen_error_count = 0
+            if unseen_warn_count > 0 and last_warn_ts > 0.0 and (now - last_warn_ts) >= clear_stale_s:
+                unseen_warn_count = 0
+
+            errors_need_ack = bool(unseen_error_count > 0)
+            # Base header color follows only connection/init state.
+            if radio_ready and not initializing:
                 set_header_status("ok")
             else:
                 set_header_status("init")
+            _update_alert_indicator()
 
         def dialog_has_dynamic_pending(dialog_id: Optional[str]) -> bool:
             if not dialog_id:
@@ -6145,7 +7925,7 @@ def main() -> int:
                     continue
                 if msg_id:
                     seen_ids.add(key)
-                if peer_id.startswith("group:") and peer_id[6:] not in groups:
+                if peer_id.startswith("group:") and peer_id[6:] not in groups and peer_id.lower() != "group:primary":
                     continue
                 time_only = ts_part.split(" ")[1][:5] if " " in ts_part else ts_part[:5]
                 dialog_id = peer_id if peer_id.startswith("group:") else peer_norm
@@ -6167,6 +7947,7 @@ def main() -> int:
             nonlocal current_lang, verbose_log, runtime_log_file, auto_pacing, last_pacing_save_ts, pinned_dialogs, hidden_contacts, groups
             nonlocal security_policy
             nonlocal session_rekey_enabled
+            nonlocal contacts_visibility
             nonlocal current_dialog, dialogs, chat_history, list_index
             nonlocal discovery_send, discovery_reply
             nonlocal incoming_state
@@ -6225,6 +8006,14 @@ def main() -> int:
                     else:
                         discovery_reply = bool(discovery_reply)
                     clear_pending_on_switch = bool(cfg.get("clear_pending_on_switch", True))
+                    contacts_visibility = str(cfg.get("contacts_visibility", contacts_visibility) or "all").strip().lower()
+                    if contacts_visibility not in ("all", "online", "app", "device"):
+                        contacts_visibility = "all"
+                    theme_cfg = str(cfg.get("ui_theme", current_theme) or "ubuntu_style").strip().lower()
+                    if theme_cfg not in THEME_STYLES:
+                        theme_cfg = "ubuntu_style"
+                    if theme_cfg != current_theme:
+                        apply_theme(theme_cfg)
                     args.retry_seconds = int(cfg.get("retry_seconds", args.retry_seconds))
                     args.max_seconds = int(cfg.get("max_seconds", args.max_seconds))
                     args.max_bytes = int(cfg.get("max_bytes", args.max_bytes))
@@ -6256,6 +8045,12 @@ def main() -> int:
                             except Exception:
                                 pass
                             try:
+                                ds = meta_raw.get("device_seen_ts")
+                                if isinstance(ds, (int, float)) and float(ds) > 0.0:
+                                    rec["device_seen_ts"] = float(ds)
+                            except Exception:
+                                pass
+                            try:
                                 kc = meta_raw.get("key_confirmed_ts")
                                 if isinstance(kc, (int, float)) and float(kc) > 0.0:
                                     rec["key_confirmed_ts"] = float(kc)
@@ -6267,6 +8062,8 @@ def main() -> int:
                                 if st:
                                     if float(getattr(st, "last_seen_ts", 0.0) or 0.0) <= 0.0 and rec.get("last_seen_ts"):
                                         st.last_seen_ts = float(rec["last_seen_ts"])
+                                    if float(getattr(st, "device_seen_ts", 0.0) or 0.0) <= 0.0 and rec.get("device_seen_ts"):
+                                        st.device_seen_ts = float(rec["device_seen_ts"])
                                     if float(getattr(st, "key_confirmed_ts", 0.0) or 0.0) <= 0.0 and rec.get("key_confirmed_ts"):
                                         st.key_confirmed_ts = float(rec["key_confirmed_ts"])
                     groups_cfg_local = cfg.get("groups", {}) if isinstance(cfg.get("groups", {}), dict) else {}
@@ -6644,7 +8441,16 @@ def main() -> int:
                             legacy_codec=rec.get("legacy_codec"),
                             parts=rec.get("parts"),
                         )
+                        try:
+                            inferred_exact = infer_compact_cmp_label_from_joined_parts(rec.get("parts"), int(total))
+                        except Exception:
+                            inferred_exact = None
+                        if inferred_exact:
+                            cmp_raw = inferred_exact
                         compression_name = normalize_compression_name(cmp_raw)
+                        compression_norm = infer_compact_norm_from_joined_parts(rec.get("parts"), int(total))
+                        if compression_norm:
+                            compression_norm = str(compression_norm).upper()
                         compression_eff_pct = None
                         if compression_name and bool(rec.get("compact", False)) and done_now and decode_ok:
                             compressed_size = 0
@@ -6685,6 +8491,7 @@ def main() -> int:
                             incoming_started_ts=float(rec.get("incoming_started_ts", recv_now_ts) or recv_now_ts),
                             compression_name=compression_name,
                             compression_eff_pct=compression_eff_pct,
+                            compression_norm=compression_norm,
                         )
                         meta_data_in: Dict[str, object] = {
                             "delivery": rec.get("delivery"),
@@ -6699,6 +8506,7 @@ def main() -> int:
                             "incoming_started_ts": float(rec.get("incoming_started_ts", recv_now_ts) or recv_now_ts),
                             "compression_name": compression_name,
                             "compression_eff_pct": compression_eff_pct,
+                            "compression_norm": compression_norm,
                         }
                         chat_line(
                             peer_norm,
@@ -6716,6 +8524,48 @@ def main() -> int:
                                 append_history("recv_error", peer_norm, group_id, "[decode error]", "compressed_payload_decode_failed")
                             incoming_state.pop(key, None)
                             save_incoming_state(incoming_state)
+                elif evt == "recv_plain":
+                    if isinstance(payload, (tuple, list)) and len(payload) >= 3:
+                        peer_norm = norm_id_for_filename(str(payload[0] or ""))
+                        text_plain = str(payload[1] or "")
+                        msg_id_plain = str(payload[2] or "")
+                        dialog_id_plain = peer_norm
+                        if len(payload) >= 4:
+                            try:
+                                did = str(payload[3] or "").strip()
+                            except Exception:
+                                did = ""
+                            if did:
+                                dialog_id_plain = did
+                        if peer_norm and text_plain and msg_id_plain and not history_has_msg(dialog_id_plain, msg_id_plain):
+                            update_peer_meta(peer_norm)
+                            recv_ts = time.time()
+                            meta_data_in: Dict[str, object] = {
+                                "incoming": True,
+                                "done": True,
+                                "received_at_ts": recv_ts,
+                                "transport": "meshtastic_text",
+                                "from_peer": peer_norm,
+                            }
+                            chat_line(
+                                dialog_id_plain,
+                                text_plain,
+                                "#66d9ef",
+                                meta=format_plain_transport_meta(incoming=True, received_at_ts=recv_ts),
+                                meta_data=meta_data_in,
+                                msg_id=msg_id_plain,
+                            )
+                            append_history("recv", dialog_id_plain, msg_id_plain, text_plain, meta_data=meta_data_in)
+                            try:
+                                preview = " ".join(str(text_plain or "").split())
+                            except Exception:
+                                preview = ""
+                            if len(preview) > 120:
+                                preview = preview[:117] + "..."
+                            log_line(
+                                f"{ts_local()} RECVSTD: {msg_id_plain} <- {peer_norm} via {dialog_id_plain} port=TEXT_MESSAGE_APP text={preview!r}",
+                                "info",
+                            )
                 elif evt == "queued":
                     if isinstance(payload, tuple) and payload:
                         peer_norm = str(payload[0] or "")
@@ -6791,8 +8641,46 @@ def main() -> int:
                     update_sent_failed(str(peer_norm), str(group_id), str(reason), int(attempts), int(total))
                 elif evt == "log":
                     log_line(str(payload), "info")
+                elif evt == "key_conflict":
+                    if isinstance(payload, (tuple, list)) and len(payload) >= 3:
+                        peer_norm = norm_id_for_filename(str(payload[0] or ""))
+                        old_fp = str(payload[1] or "")
+                        new_fp = str(payload[2] or "")
+                        if re.fullmatch(r"[0-9a-fA-F]{8}", peer_norm):
+                            conflict_sig = f"{old_fp}:{new_fp}"
+                            ignore_rec = key_conflict_ignored.get(peer_norm)
+                            try:
+                                ignore_sig = str((ignore_rec or {}).get("sig", "") or "")
+                                ignore_until = float((ignore_rec or {}).get("until", 0.0) or 0.0)
+                            except Exception:
+                                ignore_sig = ""
+                                ignore_until = 0.0
+                            now_ts = time.time()
+                            if ignore_sig and now_ts >= ignore_until:
+                                key_conflict_ignored.pop(peer_norm, None)
+                                ignore_sig = ""
+                            if ignore_sig and (ignore_sig == conflict_sig) and now_ts < ignore_until:
+                                last_hidden_log = float(key_conflict_hidden_log_ts.get(peer_norm, 0.0) or 0.0)
+                                if (now_ts - last_hidden_log) >= 10.0:
+                                    left = int(max(1.0, ignore_until - now_ts))
+                                    ui_emit(
+                                        "log",
+                                        f"{ts_local()} KEY: conflict hidden peer={peer_norm} reason=user_ignore wait={left}s",
+                                    )
+                                    key_conflict_hidden_log_ts[peer_norm] = now_ts
+                            else:
+                                _set_key_conflict_header(peer_norm, conflict_sig)
                 elif evt == "self_update":
-                    chat_label.setText(self_title())
+                    update_status()
+                elif evt == "radio_wait":
+                    try:
+                        chat_label.setText(str(payload or "Waiting for radio..."))
+                    except Exception:
+                        pass
+                elif evt == "radio_ready":
+                    initializing = False
+                    refresh_list()
+                    update_status()
                 elif evt == "radio_lost":
                     if radio_ready:
                         ui_emit("log", f"{ts_local()} RADIO: disconnected")
@@ -6806,6 +8694,8 @@ def main() -> int:
                     with peer_names_lock:
                         peer_names.clear()
                     key_response_last_ts.clear()
+                    key_conflict_ignored.clear()
+                    key_conflict_hidden_log_ts.clear()
                     incoming_state.clear()
                     with pending_lock:
                         pending_by_peer.clear()
@@ -6813,6 +8703,7 @@ def main() -> int:
                     chat_history.clear()
                     list_index.clear()
                     current_dialog = None
+                    _clear_key_conflict_header()
                     try:
                         chat_text.clear()
                         items_list.clear()
@@ -6883,8 +8774,9 @@ def main() -> int:
             else:
                 add_action(tr("unpin"), lambda: (pinned_dialogs.discard(current_id), save_gui_config(), refresh_list()))
             if current_id.startswith("group:"):
-                add_action(tr("group_rename"), lambda: rename_group(current_id))
-                add_action(tr("group_delete"), lambda: delete_group(current_id))
+                if current_id.lower() != "group:primary":
+                    add_action(tr("group_rename"), lambda: rename_group(current_id))
+                    add_action(tr("group_delete"), lambda: delete_group(current_id))
             else:
                 if groups:
                     def add_to_group() -> None:
@@ -6894,7 +8786,6 @@ def main() -> int:
                     add_action(tr("group_add"), add_to_group)
                 add_action(tr("msg_ctx_route"), lambda: trace_route(current_id))
                 add_action(tr("key_request"), lambda: request_key(current_id))
-                add_action(tr("key_reset"), lambda: reset_peer_key(current_id))
                 add_action(tr("clear_history"), lambda: clear_history(current_id))
                 add_action(tr("peer_delete"), lambda: delete_peer(current_id))
 
@@ -6939,6 +8830,29 @@ def main() -> int:
         shortcut_actions = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+M"), win)
         shortcut_actions.setContext(QtCore.Qt.ApplicationShortcut)
         shortcut_actions.activated.connect(open_context_menu_current)
+        _orig_search_mouse_press = search_field.mousePressEvent
+
+        def _search_field_mouse_press(e):
+            try:
+                if e.button() == QtCore.Qt.LeftButton:
+                    now = time.time()
+                    if (now - float(search_click_state.get("last_ts", 0.0))) <= 0.6:
+                        search_click_state["count"] = int(search_click_state.get("count", 0)) + 1
+                    else:
+                        search_click_state["count"] = 1
+                    search_click_state["last_ts"] = now
+                    if int(search_click_state.get("count", 0)) >= 3:
+                        search_click_state["count"] = 0
+                        log_line(f"{ts_local()} DISCOVERY: burst", "discovery")
+                        send_discovery_broadcast()
+            except Exception:
+                pass
+            try:
+                _orig_search_mouse_press(e)
+            except Exception:
+                pass
+
+        search_field.mousePressEvent = _search_field_mouse_press
         search_field.textChanged.connect(lambda _t: refresh_list())
         search_field.returnPressed.connect(lambda: start_dialog_by_id(search_field.text()))
         send_btn.clicked.connect(send_message)
@@ -6981,12 +8895,10 @@ def main() -> int:
                 if ok:
                     ui_emit("log", f"{ts_local()} RADIO: connected")
                     ui_emit("log", f"{ts_local()} GUI: ready | self={wire_id_from_norm(self_id)}")
-                    initializing = False
-                    refresh_list()
-                    chat_label.setText(self_title())
+                    ui_emit("radio_ready", None)
                     radio_loop_running = False
                     return
-                chat_label.setText(msg)
+                ui_emit("radio_wait", msg)
                 time.sleep(5.0)
             radio_loop_running = False
 
@@ -7025,6 +8937,14 @@ def main() -> int:
 
         start_radio_loop()
         threading.Thread(target=monitor_radio, daemon=True).start()
+
+        def _on_app_about_to_quit() -> None:
+            try:
+                send_app_offline_broadcast()
+            except Exception:
+                pass
+
+        app.aboutToQuit.connect(_on_app_about_to_quit)
 
         win.show()
         return app.exec()

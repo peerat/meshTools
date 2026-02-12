@@ -1,0 +1,95 @@
+meshTalk User Manual (EN)
+Version: 0.4.0
+Updated: 2026-02-12
+
+1) What this app is
+- meshTalk is a desktop client for experimental payload exchange over Meshtastic.
+- It supports two transport paths:
+  - meshTalk protocol (encrypted MT-WIRE, KR1/KR2 key flow),
+  - plain Meshtastic text channel (`TEXT_MESSAGE_APP`).
+
+2) Requirements
+- Python 3.9+
+- Meshtastic Python package and CLI available in your environment
+- PySide6
+- Device connected by USB/serial
+
+3) Start
+- Run:
+  - `python meshTalk.py`
+- Default port mode is `auto`.
+- On startup the app scans serial ports and connects automatically.
+
+4) Main screen
+- Left panel: contacts and groups.
+- Right panel: chat/messages.
+- Top header: client id and runtime alert bar.
+- Bottom: input box + Send.
+
+5) Contacts and groups
+- Direct contact dialog: messages to one peer.
+- `group:Primary`: public/broadcast Meshtastic text channel.
+- Other groups: selected peers list.
+
+6) Sending logic (important)
+- In direct dialog:
+  - if peer is considered meshTalk-capable and active -> message goes through meshTalk protocol,
+  - otherwise -> message goes through plain Meshtastic text.
+- In `Primary` dialog:
+  - Send always uses Meshtastic broadcast text (`TEXT_MESSAGE_APP`).
+- In custom groups:
+  - each member is routed individually (meshTalk or plain) based on current peer state.
+
+7) Receiving logic
+- Direct Meshtastic text messages are shown in the sender contact dialog.
+- Broadcast Meshtastic text messages are shown in `group:Primary`.
+- meshTalk protocol payloads are shown in peer dialogs with protocol metadata.
+
+8) Message status lines
+- meshTalk protocol messages: detailed status (delivery timing, attempts, hops, parts, compression).
+- Plain Meshtastic text messages:
+  - outgoing: `sent at HH:MM`
+  - incoming: `received at HH:MM`
+
+9) Contact status indicator colors
+- Bright green: meshTalk online (valid keys + recent app activity).
+- Dark green: meshTalk offline (seen by app within last 24h).
+- Yellow: Meshtastic-only online.
+- Dark yellow: Meshtastic-only offline (seen within last 24h).
+- No indicator: no presence seen for >24h.
+
+10) Key exchange and security basics
+- Key exchange frames: `KR1` / `KR2`.
+- Transport container: MT-WIREv1 (AES-256-GCM).
+- On key mismatch, app shows warning and action buttons.
+- Context menu action `Send and request public key` can force a new key request.
+
+11) App offline signal
+- On app close, meshTalk sends offline presence broadcast (`KOF1|<id>`).
+- Peers that receive it switch this contact from app-online to offline immediately.
+
+12) Settings quick guide
+- General: retry/max wait/max bytes/rate/parallel/autopacing.
+- Log: verbosity/runtime.log.
+- Discovery: broadcast send/reply toggles.
+- Security: key-rotation policy, session rekey.
+- Compression: normalization + compressor policy.
+- Contacts: visibility filters and status legend.
+
+13) Common troubleshooting
+- "Waiting for radio":
+  - check USB cable/port and OS serial permissions.
+- Message not sent:
+  - check runtime log for `ROUTE`, `SEND`, `SENDSTD`, `KEY`, `ACK`, `failed`.
+- Plain messages not visible:
+  - verify `RECVSTD` lines in log and that message is direct vs broadcast (`Primary`).
+- Key mismatch:
+  - review warning, then choose accept/ignore according to your policy.
+
+14) Runtime log markers to watch
+- `ROUTE` -> selected transport path.
+- `SEND` / `ACK` -> meshTalk send/ack.
+- `SENDSTD` / `RECVSTD` -> plain Meshtastic text traffic.
+- `KEY` / `KEYOK` -> key exchange lifecycle.
+- `DISCOVERY`, `HEALTH`, `TRACE` -> network diagnostics.
+

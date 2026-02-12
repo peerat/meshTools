@@ -1,7 +1,7 @@
 # meshTools
 
 Author: Anton Vologzhanin (R3VAF)
-Current version: 0.3.3
+Current version: 0.4.0
 
 Small utilities around Meshtastic.
 
@@ -23,18 +23,19 @@ Small utilities around Meshtastic.
 ## Contents
 
 - `meshTalk.py`: research prototype GUI for best-effort P2P payload exchange (ACK/retry, key exchange, runtime diagnostics).
-- `meshLogger.py`: traceroute/events logger + SQLite telemetry DB (`meshLogger.db`).
-- `graphGen.py`: Graphviz + D3 map/graph generator from collected logs/DB.
-- `nodeDbUpdater.py`: legacy text node DB updater (`nodeDb.txt`).
+- `meshtools/meshLogger.py`: traceroute/events logger + SQLite telemetry DB (`meshLogger.db`).
+- `meshtools/graphGen.py`: Graphviz + D3 map/graph generator from collected logs/DB.
+- `meshtools/nodeDbUpdater.py`: legacy text node DB updater (`nodeDb.txt`).
 - `meshtalk/`: internal protocol/storage modules (`protocol.py`, `storage.py`).
 - `meshtalk_utils.py`: shared parsing/formatting/runtime helpers.
 - `message_text_compression.py`: compression/normalization pipeline for payload text.
-- Text references: `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+- Text references: `meshTalk.txt`, `meshtools/meshLogger.txt`, `meshtools/graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
 
 ## Key capabilities
 
 - Best-effort delivery over Meshtastic with ACK/retry/backoff and message status tracking.
 - Per-peer key exchange flow (KR1/KR2), MT-WIRE AES-256-GCM container, and local at-rest sealing for profile data.
+- Dedicated `Primary` dialog for Meshtastic broadcast/public text channel (`TEXT_MESSAGE_APP`), with direct messages routed to contact dialogs.
 - Adaptive pacing and queue control to reduce traffic noise.
 - Traceroute integration in dialogs with route details and diagnostics.
 - Compression with automatic mode selection (`DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `ZSTD`) plus reversible normalization (`Token stream`, `SentencePiece vocab`).
@@ -46,7 +47,7 @@ Small utilities around Meshtastic.
 - Meshtastic CLI in PATH (`meshtastic`)
 - `cryptography` package (for `meshTalk.py`)
 - `PySide6` package (Qt GUI for `meshTalk.py`)
-- Graphviz in PATH (`dot`) for `graphGen.py`
+- Graphviz in PATH (`dot`) for `meshtools/graphGen.py`
 
 ## Windows notes
 
@@ -87,28 +88,28 @@ dot -V
 Continuous route logging (Ctrl+C to stop):
 
 ```bash
-python meshLogger.py --port /dev/ttyUSB0
+python meshtools/meshLogger.py --port /dev/ttyUSB0
 ```
 
 Update node DB (one-shot):
 
 ```bash
-python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt
+python meshtools/nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt
 ```
 
-Hourly DB updates (SQLite) are built into `meshLogger.py`.
+Hourly DB updates (SQLite) are built into `meshtools/meshLogger.py`.
 Traceroutes and listen-events are stored in SQLite only (no text logs).
 
 Print DB schema:
 
 ```bash
-python meshLogger.py --db-schema
+python meshtools/meshLogger.py --db-schema
 ```
 
 Generate graph from recent logs (Graphviz + D3.js):
 
 ```bash
-python graphGen.py --root .
+python meshtools/graphGen.py --root .
 ```
 
 Best-effort P2P payload exchange (cryptographic primitives + ACK):
@@ -158,6 +159,11 @@ Quick summary:
 - MT-WIRE v1 (AES-256-GCM): `[ver=1][type][msg_id(8)][nonce(12)][ct||tag]`
 - MT-MSG v2 (inside MSG): binary `M2` framing (16-byte header + chunk)
 - MT-ACK (inside ACK): UTF-8 `ACK|...`
+
+## User Manuals
+
+- English: `documentation/user_manual_en.txt`
+- Русский: `documentation/user_manual_ru.txt`
 
 ## Runtime Log: Event Types and UI Colors
 
@@ -237,16 +243,16 @@ Output: `dist\meshTalk.exe`
 
 - `meshtastic --help` works
 - `dot -V` works
-- `python meshLogger.py --port ...` creates `meshLogger/YYYY-MM-DD !xxxxxxxx.txt`
-- `python nodeDbUpdater.py --port ...` creates/updates `nodeDb.txt`
+- `python meshtools/meshLogger.py --port ...` creates `meshLogger/YYYY-MM-DD !xxxxxxxx.txt`
+- `python meshtools/nodeDbUpdater.py --port ...` creates/updates `nodeDb.txt`
 
 ## File layout
 
 ### Project files (repository / source-controlled)
 
-- `meshLogger.py` — traceroute/logger utility.
-- `nodeDbUpdater.py` — legacy text DB updater.
-- `graphGen.py` — Graphviz + D3 generator.
+- `meshtools/meshLogger.py` — traceroute/logger utility.
+- `meshtools/nodeDbUpdater.py` — legacy text DB updater.
+- `meshtools/graphGen.py` — Graphviz + D3 generator.
 - `meshTalk.py` — research prototype GUI for best-effort P2P payload exchange (ACK/retry + cryptographic primitives).
 - `meshtalk/` — internal meshTalk modules:
   - `meshtalk/protocol.py` — wire protocol + cryptographic primitives.
@@ -271,7 +277,7 @@ Output: `dist\meshTalk.exe`
 
 - `nodeDb.txt` may contain sensitive data (keys, coordinates). Keep it private.
 - `.gitignore` excludes generated logs and DB.
-- `graphGen.py` expects trace files named `YYYY-MM-DD !xxxxxxxx*.txt`.
+- `meshtools/graphGen.py` expects trace files named `YYYY-MM-DD !xxxxxxxx*.txt`.
 
 ## Troubleshooting
 
@@ -280,7 +286,7 @@ Output: `dist\meshTalk.exe`
 - No logs: ensure `meshLogger/` has `YYYY-MM-DD !xxxxxxxx*.txt` files.
 - Device not found: check port name (Linux `/dev/ttyUSB0`, Windows `COM3`), cable, and drivers.
 
-## graphGen.py (D3.js options)
+## meshtools/graphGen.py (D3.js options)
 
 - `--no-d3` disables HTML/JSON.
 - `--d3-top N` limits top-N nodes for filtering (default: 30).
@@ -310,13 +316,13 @@ Output: `dist\meshTalk.exe`
 ## Содержание
 
 - `meshTalk.py`: исследовательский GUI-прототип best-effort P2P-обмена (ACK/повторы, обмен ключами, runtime-диагностика).
-- `meshLogger.py`: логгер traceroute/событий + SQLite-телеметрия (`meshLogger.db`).
-- `graphGen.py`: генерация карт/графов Graphviz + D3 из логов/БД.
-- `nodeDbUpdater.py`: legacy-обновление текстовой базы узлов (`nodeDb.txt`).
+- `meshtools/meshLogger.py`: логгер traceroute/событий + SQLite-телеметрия (`meshLogger.db`).
+- `meshtools/graphGen.py`: генерация карт/графов Graphviz + D3 из логов/БД.
+- `meshtools/nodeDbUpdater.py`: legacy-обновление текстовой базы узлов (`nodeDb.txt`).
 - `meshtalk/`: внутренние модули протокола/хранилища (`protocol.py`, `storage.py`).
 - `meshtalk_utils.py`: общие утилиты парсинга/форматирования.
 - `message_text_compression.py`: пайплайн сжатия/нормализации текста payload.
-- Текстовые справки: `meshTalk.txt`, `meshLogger.txt`, `graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+- Текстовые справки: `meshTalk.txt`, `meshtools/meshLogger.txt`, `meshtools/graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
 
 ## Ключевые возможности
 
@@ -332,7 +338,7 @@ Output: `dist\meshTalk.exe`
 - Python 3.9+
 - Meshtastic CLI в PATH (`meshtastic`)
 - Пакет `cryptography` (для `meshTalk.py`)
-- Graphviz в PATH (`dot`) для `graphGen.py`
+- Graphviz в PATH (`dot`) для `meshtools/graphGen.py`
 
 ## Примечания для Windows
 
@@ -373,28 +379,28 @@ dot -V
 Непрерывное логирование маршрутов (Ctrl+C для остановки):
 
 ```bash
-python meshLogger.py --port /dev/ttyUSB0
+python meshtools/meshLogger.py --port /dev/ttyUSB0
 ```
 
 Обновить базу узлов (однократно):
 
 ```bash
-python nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt
+python meshtools/nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt
 ```
 
-Почасовое обновление SQLite-базы встроено в `meshLogger.py`.
+Почасовое обновление SQLite-базы встроено в `meshtools/meshLogger.py`.
 Traceroute и события listen сохраняются только в SQLite (без текстовых логов).
 
 Показать схему БД:
 
 ```bash
-python meshLogger.py --db-schema
+python meshtools/meshLogger.py --db-schema
 ```
 
 Сгенерировать граф из свежих логов (Graphviz + D3.js):
 
 ```bash
-python graphGen.py --root .
+python meshtools/graphGen.py --root .
 ```
 
 Best-effort P2P-обмен полезной нагрузкой (криптографические примитивы + ACK):
@@ -487,16 +493,16 @@ build_meshTalk.bat
 
 - `meshtastic --help` работает
 - `dot -V` работает
-- `python meshLogger.py --port ...` создает `meshLogger/YYYY-MM-DD !xxxxxxxx.txt`
-- `python nodeDbUpdater.py --port ...` создает/обновляет `nodeDb.txt`
+- `python meshtools/meshLogger.py --port ...` создает `meshLogger/YYYY-MM-DD !xxxxxxxx.txt`
+- `python meshtools/nodeDbUpdater.py --port ...` создает/обновляет `nodeDb.txt`
 
 ## Структура файлов
 
 ### Файлы проекта (в репозитории / исходники)
 
-- `meshLogger.py` — утилита traceroute/logger.
-- `nodeDbUpdater.py` — legacy-обновление текстовой БД.
-- `graphGen.py` — генерация Graphviz + D3.
+- `meshtools/meshLogger.py` — утилита traceroute/logger.
+- `meshtools/nodeDbUpdater.py` — legacy-обновление текстовой БД.
+- `meshtools/graphGen.py` — генерация Graphviz + D3.
 - `meshTalk.py` — research prototype GUI для best-effort P2P-обмена полезной нагрузкой (ACK/повторы + криптографические примитивы).
 - `meshtalk/` — внутренние модули meshTalk:
   - `meshtalk/protocol.py` — wire-протокол + криптографические примитивы.
@@ -521,7 +527,7 @@ build_meshTalk.bat
 
 - `nodeDb.txt` может содержать чувствительные данные (ключи, координаты). Храните приватно.
 - `.gitignore` исключает сгенерированные логи и базу.
-- `graphGen.py` ожидает файлы трасс вида `YYYY-MM-DD !xxxxxxxx*.txt`.
+- `meshtools/graphGen.py` ожидает файлы трасс вида `YYYY-MM-DD !xxxxxxxx*.txt`.
 
 ## Устранение неполадок
 
@@ -530,7 +536,7 @@ build_meshTalk.bat
 - Нет логов: убедитесь, что в `meshLogger/` есть файлы `YYYY-MM-DD !xxxxxxxx*.txt`.
 - Устройство не найдено: проверьте порт (Linux `/dev/ttyUSB0`, Windows `COM3`), кабель и драйверы.
 
-## graphGen.py (D3.js опции)
+## meshtools/graphGen.py (D3.js опции)
 
 - `--no-d3` выключает HTML/JSON.
 - `--d3-top N` ограничивает top-N узлов для фильтрации (по умолчанию 30).

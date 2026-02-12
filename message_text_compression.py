@@ -62,16 +62,25 @@ PUNCT_SET = set(PUNCT_TOKENS)
 OPEN_PUNCT_NO_SPACE_AFTER = {"(", '"', "'", "«"}
 
 DEFAULT_PHRASES = [
-    "каждый участник сети",
-    "в течение дня",
-    "в случае, если",
-    "в идеале",
-    "своими наработками",
-    "полезных инструментов",
-    "экспериментальных решений",
-    "исходный код",
-    "описание и ссылку",
-    "опубликовать только ссылку",
+    "привет, как дела",
+    "кто на связи",
+    "кто онлайн",
+    "проверь связь",
+    "проверь, пожалуйста",
+    "скинь лог",
+    "скинь конфиг",
+    "почему не работает",
+    "что случилось",
+    "где ошибка",
+    "попробуй еще раз",
+    "подожди секунду",
+    "сейчас проверю",
+    "у меня тоже",
+    "same issue here",
+    "works for me",
+    "factory reset",
+    "try stable",
+    "try dev",
     "отправлено в",
     "доставлено в",
     "получено в",
@@ -406,37 +415,37 @@ def _detokenize(tokens: Sequence[str]) -> str:
 
 def _build_default_dict_tokens() -> List[str]:
     words = [
-        "и", "в", "не", "на", "я", "быть", "он", "с", "что", "а", "по", "это", "она", "к", "но", "они",
-        "мы", "как", "из", "у", "же", "за", "ты", "от", "то", "о", "так", "его", "для", "все", "вы", "да",
-        "нет", "если", "или", "когда", "только", "еще", "уже", "очень", "можно", "нужно", "тут", "там",
-        "где", "кто", "чтобы", "почему", "потом", "сейчас", "привет", "ок", "хорошо", "спасибо", "давай",
-        "сообщение", "сообщения", "текст", "ключ", "ключи", "доставка", "попытка", "попытки", "пакет",
-        "пакеты", "часть", "части", "хоп", "хопы", "время", "минута", "секунда", "статус", "ошибка",
-        "получено", "доставлено", "отправлено", "прием", "принимаю", "отправка", "очередь", "сеть", "узел",
-        "нода", "порт", "канал", "настройки", "лог", "история", "контакт", "диалог", "группа", "поиск",
-        "проверка", "тест", "работает", "нормально", "да", "нет", "может", "будет", "сделать", "сделай",
-        "надо", "можно", "нельзя", "пока", "потом", "снова", "сразу", "длинное", "короткое", "имя", "id",
-        "public", "pub", "ack", "mesh", "lora", "node", "message", "send", "recv", "queue", "radio", "gui",
-        "error", "timeout", "retry", "config", "history", "runtime", "clear", "delete", "request", "response",
-        "exchange", "crypto", "active", "waiting", "ready", "connected", "disconnected", "self", "peer",
-        "part", "parts", "done", "in", "at", "elapsed", "hops", "there", "back", "delivered", "received",
-        "sent", "start", "stop", "mode", "byte", "fixed", "dict", "compression", "enabled", "disabled",
-        "русский", "английский", "принято", "отправил", "получил", "перезапуск", "профиль", "инициализация",
-        "обнаружение", "broadcast", "многопакетный", "однопакетный", "динамический", "таймер", "оранжевый",
-        "замок", "прочитано", "непрочитано", "копировать", "буфер", "подтверждение", "регенерация",
-        "совместимость", "протокол", "формат", "данные", "байт", "бит", "словарь", "токен", "пунктуация",
-        "скобка", "кавычка", "длина", "crc", "версия", "магия", "режим",
+        # RU high-frequency conversational core
+        "и", "в", "не", "на", "я", "он", "она", "мы", "вы", "они", "это", "что", "как", "кто", "где", "когда",
+        "почему", "зачем", "уже", "еще", "только", "да", "нет", "ага", "угу", "ок", "окей", "хорошо", "понял",
+        "принял", "ясно", "спасибо", "привет", "салют", "здарова", "ку", "пока", "давай", "подожди", "секунду",
+        "минуту", "сейчас", "потом", "позже", "снова", "быстро", "медленно", "нормально", "стабильно",
+        "нестабильно", "плохо", "лучше", "хуже",
+        # Chat + support phrases
+        "работает", "не работает", "сломалось", "зависло", "лагает", "тормозит", "отваливается", "крашится",
+        "проверь", "проверил", "проверяю", "повтори", "повтори еще раз", "скинь", "лог", "конфиг", "настройки",
+        "что случилось", "где ошибка", "в логах", "ошибка", "таймаут", "повтор", "дроп", "доставка",
+        # Mesh/network domain
+        "mesh", "meshtastic", "lora", "lorawan", "radio", "node", "nodeid", "nodedb", "peer", "self",
+        "channel", "region", "frequency", "sf", "bw", "cr", "tx", "rx", "txpower", "rssi", "snr", "noise",
+        "hops", "route", "traceroute", "trace", "beacon", "broadcast", "unicast", "multicast",
+        "ack", "nack", "retry", "backoff", "timeout", "deadline", "queue", "buffer", "payload", "packet",
+        "packets", "parts", "fragmentation", "mtu", "latency", "jitter", "loss", "throughput", "bandwidth",
+        # Device/platform terms
+        "heltec", "heltec_v3", "tbeam", "tdeck", "rak", "rak4631", "wisblock", "esp32", "nrf52", "sx1262",
+        "sx1276", "antenna", "yagi", "groundplane", "swr", "nanovna", "coax", "rg58", "rg174", "rg316",
+        "usb", "uart", "serial", "ttl", "baud", "driver", "windows", "linux", "ubuntu", "android", "ios",
+        # Crypto/protocol/runtime
+        "key", "keys", "pubkey", "privkey", "crypto", "encryption", "aes", "x25519", "hkdf", "wire",
+        "protocol", "version", "frame", "request", "response", "exchange", "confirmed", "mismatch", "reset",
+        "rekey", "runtime", "history", "config", "state", "incoming", "crc",
+        # EN frequent chat abbreviations (internet chat corpora/SMS style)
+        "lol", "idk", "imo", "imho", "tbh", "brb", "btw", "fyi", "afaik", "plz", "pls", "thx",
+        "works for me", "same issue here", "try stable", "try dev", "factory reset",
+        # CLI/API ecosystem
+        "python", "script", "api", "mqtt", "http", "websocket", "grpc", "node-red", "grafana", "prometheus",
+        "influxdb", "telegram", "bot", "notify", "vpn", "tunnel", "firewall", "dns", "dhcp",
     ]
-    # Chat/feed-oriented words often seen in public mesh discussions.
-    words.extend([
-        "каждый", "может", "поделиться", "здесь", "своими", "наработками", "полезных", "инструментов",
-        "экспериментальных", "решений", "выкладывать", "ваш", "проект", "созданный", "нуля", "форк",
-        "чужого", "доработками", "автор", "ссылку", "отправляйте", "топик", "ссылки", "зовите", "сам",
-        "написал", "творение", "случае", "закрытый", "описание", "сервис", "исходный", "идеале",
-        "разместить", "github", "gitflic", "gitverse", "аналоге", "опубликовать", "часть", "частей",
-        "частями", "начали", "прием", "получено", "доставлено", "отправлено", "прошло", "попытки",
-        "попытка", "хопов", "туда", "обратно", "минута", "секунда", "включено", "выключено",
-    ])
     tokens: List[str] = list(PUNCT_TOKENS) + [" ", "\n", "\t"]
     seen = set(tokens)
     for p in DEFAULT_PHRASES:
@@ -724,6 +733,53 @@ def _decode_binary(data: bytes, mode: int) -> str:
 
 def mode_name(mode: int) -> str:
     return MODE_TO_NAME.get(int(mode), "mc_unknown")
+
+
+def normalization_stats(text: str, normalize: str = "off") -> Dict[str, object]:
+    """Return pre-compression normalization telemetry.
+
+    This is purely diagnostic and does not alter wire format.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    plain_bytes = len(text.encode("utf-8"))
+    norm = str(normalize or "off").strip().lower()
+    if norm in ("", "off"):
+        return {
+            "mode": "off",
+            "plain_bytes": plain_bytes,
+            "normalized_bytes": plain_bytes,
+            "tokens": 0,
+            "delta_bytes": 0,
+            "gain_pct": 0.0,
+        }
+
+    if norm in ("tokens", "token_stream", "basic"):
+        toks = _tokenize_basic(text, preserve_case=True)
+        mode = "tokens"
+    elif norm in ("sp_vocab", "sentencepiece", "sentencepiece_vocab", "sp"):
+        toks = _tokenize_sentencepiece_vocab(text)
+        mode = "sp_vocab"
+    else:
+        toks = _tokenize_basic(text, preserve_case=True)
+        mode = "tokens"
+
+    tok_stream = _encode_token_stream(toks)
+    normalized_bytes = len(tok_stream)
+    delta = plain_bytes - normalized_bytes
+    gain_pct: float
+    if plain_bytes > 0:
+        gain_pct = ((plain_bytes - normalized_bytes) / float(plain_bytes)) * 100.0
+    else:
+        gain_pct = 0.0
+    return {
+        "mode": mode,
+        "plain_bytes": plain_bytes,
+        "normalized_bytes": normalized_bytes,
+        "tokens": len(toks),
+        "delta_bytes": delta,
+        "gain_pct": gain_pct,
+    }
 
 
 def _decode_fixed(data: bytes) -> List[str]:

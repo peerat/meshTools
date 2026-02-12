@@ -1,0 +1,75 @@
+meshtools/graphGen.py reference
+Author: Anton Vologzhanin (R3VAF)
+Updated: 2026-02-10
+
+========================
+EN
+========================
+
+Purpose
+- Build Meshtastic topology graphs from telemetry/traceroute data.
+- Generates Graphviz outputs and optional interactive D3.js outputs.
+
+License
+- Apache License 2.0 (`LICENSE`).
+- Keep attribution notices from `NOTICE` when redistributing.
+
+Inputs
+- SQLite DB (`meshLogger.db`) created by `meshtools/meshLogger.py` (preferred).
+- Optional fallback files in project root (`nodeDb.txt`, legacy traces).
+
+Outputs
+- `graphGen/` directory with generated artifacts.
+- Typical files: `*.dot`, `*.svg`, `*.html`, `*.json`.
+
+Main options
+- `--root`: input directory (default current).
+- `--min-edge`: minimum confirmations for directed link.
+- `--rankdir`: Graphviz layout direction.
+- `--no-d3`: disable D3.js outputs.
+- `--d3-top`, `--d3-min-neighbors`: D3 filtering.
+- `--datetime`: strict line-timestamp time window.
+
+Usage examples
+- `python meshtools/graphGen.py --root .`
+- `python meshtools/graphGen.py --root . --datetime "2026-02-09 00:00 - 2026-02-09 23:59"`
+
+Notes
+- For full option list use `python meshtools/graphGen.py --help`.
+- Generated graph artifacts are local runtime/output files.
+
+========================
+RU
+========================
+
+Назначение
+- Построение графов топологии Meshtastic по данным telemetry/traceroute.
+- Генерирует Graphviz-вывод и (опционально) интерактивный D3.js.
+
+Лицензия
+- Apache License 2.0 (`LICENSE`).
+- При распространении сохраняйте атрибуцию из `NOTICE`.
+
+Входные данные
+- SQLite БД (`meshLogger.db`) из `meshtools/meshLogger.py` (предпочтительно).
+- Опциональный fallback по файлам в корне проекта (`nodeDb.txt`, legacy traces).
+
+Выходные данные
+- Каталог `graphGen/` с результатами генерации.
+- Типичные файлы: `*.dot`, `*.svg`, `*.html`, `*.json`.
+
+Основные параметры
+- `--root`: входная папка (по умолчанию текущая).
+- `--min-edge`: минимум подтверждений для ориентированного ребра.
+- `--rankdir`: направление компоновки Graphviz.
+- `--no-d3`: отключить D3.js-вывод.
+- `--d3-top`, `--d3-min-neighbors`: фильтры D3.
+- `--datetime`: строгое окно по timestamp в начале строк.
+
+Примеры
+- `python meshtools/graphGen.py --root .`
+- `python meshtools/graphGen.py --root . --datetime "2026-02-09 00:00 - 2026-02-09 23:59"`
+
+Примечания
+- Полный список параметров: `python meshtools/graphGen.py --help`.
+- Артефакты графов являются локальными runtime/output файлами.
