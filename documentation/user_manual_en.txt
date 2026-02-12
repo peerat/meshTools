@@ -26,6 +26,17 @@ Updated: 2026-02-12
 - Top header: client id and runtime alert bar.
 - Bottom: input box + Send.
 
+4.1) Top status header (colors and alerts)
+- The top bar background shows app/radio state:
+  - Orange: initializing / starting up.
+  - Dark green: connected and ready.
+- Runtime alerts do NOT repaint the whole header. Instead they appear as an alert control:
+  - A small `!` / counter at the top-right means there are unseen warnings/errors in the runtime log.
+  - Click it to view the latest alert text; use "Acknowledge alerts" in Settings -> Log to clear the counter.
+- Key mismatch banner:
+  - When a contact public key changes and conflicts with the pinned key, the header shows a message for that contact.
+  - Action buttons appear on the right: Replace / Paranoid (ignore).
+
 5) Contacts and groups
 - Direct contact dialog: messages to one peer.
 - `group:Primary`: public/broadcast Meshtastic text channel.
@@ -92,4 +103,3 @@ Updated: 2026-02-12
 - `SENDSTD` / `RECVSTD` -> plain Meshtastic text traffic.
 - `KEY` / `KEYOK` -> key exchange lifecycle.
 - `DISCOVERY`, `HEALTH`, `TRACE` -> network diagnostics.
-

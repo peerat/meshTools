@@ -3195,6 +3195,7 @@ def main() -> int:
                 "theme_select": "Theme",
                 "theme_ubuntu_style": "ubuntu style",
                 "theme_brutal_man": "brutal man",
+                "theme_pretty_girl": "pretty girl",
                 "theme_hint": "Applies immediately to the main window and settings dialog.",
                 "security_auto_stale_hours": "Auto accept if key age, h",
                 "security_auto_seen_minutes": "Auto accept if seen within, min",
@@ -3357,6 +3358,7 @@ def main() -> int:
                 "theme_select": "Тема",
                 "theme_ubuntu_style": "ubuntu style",
                 "theme_brutal_man": "brutal man",
+                "theme_pretty_girl": "pretty girl",
                 "theme_hint": "Применяется сразу к главному окну и окну настроек.",
                 "security_auto_stale_hours": "Автопринять если ключ старше, ч",
                 "security_auto_seen_minutes": "Автопринять если был в сети, мин",
@@ -3655,11 +3657,17 @@ def main() -> int:
                 pass
         win.resizeEvent = _win_resize_event
 
-        peer_logo_cache: Dict[Tuple[str, int], "QtGui.QPixmap"] = {}
+        # Theme-aware cache: light themes use transparent avatar background, so the cache key must include that.
+        peer_logo_cache: Dict[Tuple[str, int, str], "QtGui.QPixmap"] = {}
 
         def _peer_logo_pixmap(peer_id: str, side: int) -> "QtGui.QPixmap":
             s = max(16, int(side))
-            key = (str(peer_id or ""), s)
+            try:
+                is_light = str(current_theme or "").strip().lower() in ("pretty_girl",)
+            except Exception:
+                is_light = False
+            theme_kind = "light" if is_light else "dark"
+            key = (str(peer_id or ""), s, theme_kind)
             cached = peer_logo_cache.get(key)
             if cached is not None:
                 return cached
@@ -3687,9 +3695,13 @@ def main() -> int:
             p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
 
             outer = QtCore.QRectF(0.5, 0.5, float(s - 1), float(s - 1))
-            p.setPen(QtCore.Qt.NoPen)
-            p.setBrush(c_bg)
-            p.drawRoundedRect(outer, max(2.0, s * 0.22), max(2.0, s * 0.22))
+            # Avatar background:
+            # - dark themes: keep a muted rounded background
+            # - light themes: keep it fully transparent (no "tile" behind the strokes)
+            if not is_light:
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(c_bg)
+                p.drawRoundedRect(outer, max(2.0, s * 0.22), max(2.0, s * 0.22))
 
             # Deterministic RNG-like values from digest.
             vals = []
@@ -3878,6 +3890,8 @@ def main() -> int:
             QGroupBox#listGroup::title { height: 0px; }
             QGroupBox#listGroup { margin-top: 0px; }
             QListWidget { background: #2b0a22; border: 1px solid #3c0f2e; padding: 0px; }
+            QListWidget#contactsList { background: #2b0a22; }
+            QListWidget#chatList { background: #35102a; }
             QListWidget#chatList::item { background: transparent; border: none; padding: 2px 0px; }
             QListWidget#chatList::item:selected { background: transparent; }
             QListWidget#chatList::item:selected:!active { background: transparent; }
@@ -3908,7 +3922,7 @@ def main() -> int:
             QMenu::item { padding: 6px 14px; color: #eeeeec; }
             QMenu::item:selected { background: #ff9800; color: #2b0a22; }
             QLabel#muted { color: #c0b7c2; }
-            QLabel#hint { color: #bcaec0; font-size: 10px; }
+            QLabel#hint { color: #bcaec0; font-size: 11px; }
             QLabel#section { color: #c0b7c2; font-size: 13px; font-weight: 400; }
             QWidget#headerBar { background: #c24f00; }
             QWidget#headerBar QLabel { background: transparent; font-weight: 600; color: #2b0a22; }
@@ -3953,6 +3967,8 @@ def main() -> int:
             QGroupBox#listGroup::title { height: 0px; }
             QGroupBox#listGroup { margin-top: 0px; }
             QListWidget { background: #15181b; border: 1px solid #3a3f46; padding: 0px; }
+            QListWidget#contactsList { background: #15181b; }
+            QListWidget#chatList { background: #101214; }
             QListWidget#chatList::item { background: transparent; border: none; padding: 2px 0px; }
             QListWidget#chatList::item:selected { background: transparent; }
             QListWidget#chatList::item:selected:!active { background: transparent; }
@@ -3980,7 +3996,7 @@ def main() -> int:
             QMenu::item { padding: 6px 14px; color: #e8e8e8; }
             QMenu::item:selected { background: #f05d23; color: #101214; }
             QLabel#muted { color: #b8b8b8; }
-            QLabel#hint { color: #999fa8; font-size: 10px; }
+            QLabel#hint { color: #999fa8; font-size: 11px; }
             QLabel#section { color: #b8b8b8; font-size: 13px; font-weight: 500; }
             QWidget#headerBar { background: #f05d23; }
             QWidget#headerBar QLabel { background: transparent; font-weight: 700; color: #101214; }
@@ -4018,9 +4034,94 @@ def main() -> int:
                 background: transparent;
             }
             """
+        THEME_PRETTY_GIRL = """
+            /* Light theme, background based on Pantone 2026 (Cloud Dancer) approximation. */
+            QWidget { background: #f0eee9; color: #2b1b24; }
+            QGroupBox { border: 0; margin-top: 0; font-weight: 700; }
+            QGroupBox::title { subcontrol-origin: margin; left: 6px; color: #3a2a33; }
+            QGroupBox#listGroup::title { height: 0px; }
+            QGroupBox#listGroup { margin-top: 0px; }
+
+            QListWidget { background: #f7f5f0; border: 1px solid #d7d1c8; padding: 0px; }
+            QListWidget#contactsList { background: #f7f5f0; }
+            QListWidget#chatList { background: #f3f0f4; }
+            QListWidget#chatList::item { background: transparent; border: none; padding: 2px 0px; }
+            QListWidget#chatList::item:selected { background: transparent; }
+            QListWidget#chatList::item:selected:!active { background: transparent; }
+
+            QTextEdit { background: #f7f5f0; border: 1px solid #d7d1c8; padding: 0px; }
+            QLineEdit { background: #ffffff; border: 1px solid #cdb9c4; padding: 6px; color:#2b1b24; }
+
+            QPushButton { background: #f3bfd9; border: 1px solid #cdb9c4; padding: 6px 10px; color:#2b1b24; }
+            QPushButton:hover { background: #f7cfe3; }
+
+            QTabWidget::pane { border: 1px solid #cdb9c4; top: -1px; }
+            QTabBar::tab {
+                background: #ede2ea;
+                color: #3a2a33;
+                border: 1px solid #cdb9c4;
+                border-bottom: 0;
+                padding: 6px 12px;
+                margin-right: 2px;
+                min-height: 22px;
+            }
+            QTabBar::tab:selected {
+                background: #ff76b3;
+                color: #22131b;
+                font-weight: 800;
+            }
+            QTabBar::tab:!selected:hover { background: #f3bfd9; color: #22131b; }
+
+            QMenu { background: #ffffff; border: 1px solid #cdb9c4; padding: 2px; }
+            QMenu::item { padding: 6px 14px; color: #2b1b24; }
+            QMenu::item:selected { background: #ff76b3; color: #22131b; }
+
+            QLabel#muted { color: #6b5d66; }
+            QLabel#hint { color: #6b5d66; font-size: 11px; }
+            QLabel#section { color: #3a2a33; font-size: 13px; font-weight: 600; }
+
+            QWidget#headerBar { background: #f3bfd9; }
+            QWidget#headerBar QLabel { background: transparent; font-weight: 700; color: #2b1b24; }
+            QWidget#headerBar[mtStatus="ok"] { background: #1f6b3f; }
+            QWidget#headerBar[mtStatus="ok"] QLabel { color: #fffff0; }
+            QWidget#headerBar[mtStatus="warn"] { background: #b78300; }
+            QWidget#headerBar[mtStatus="warn"] QLabel { color: #fff7df; }
+            QWidget#headerBar[mtStatus="error"] { background: #7a1e1e; }
+            QWidget#headerBar[mtStatus="error"] QLabel { color: #ffecec; }
+
+            QListWidget#contactsList::item { padding: 8px 0px; }
+            QListWidget#contactsList::item:selected { background: #f0d6e4; }
+            QListWidget#contactsList::item:selected:!active { background: #f0d6e4; }
+
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                margin: 0px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(205, 145, 178, 0.42);
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(205, 145, 178, 0.62);
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+                border: none;
+                background: transparent;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            """
         THEME_STYLES = {
             "ubuntu_style": THEME_UBUNTU_STYLE,
             "brutal_man": THEME_BRUTAL_MAN,
+            "pretty_girl": THEME_PRETTY_GIRL,
         }
         current_theme = str(cfg.get("ui_theme", "ubuntu_style") or "ubuntu_style").strip().lower()
         if current_theme not in THEME_STYLES:
@@ -4032,6 +4133,15 @@ def main() -> int:
             if tid not in THEME_STYLES:
                 tid = "ubuntu_style"
             current_theme = tid
+            # Theme affects avatar rendering (light themes remove avatar background).
+            try:
+                peer_logo_cache.clear()
+            except Exception:
+                pass
+            try:
+                avatar_cache.clear()
+            except Exception:
+                pass
             win.setStyleSheet(THEME_STYLES[tid])
             try:
                 win.update()
@@ -4799,6 +4909,7 @@ def main() -> int:
                 theme_combo = QtWidgets.QComboBox()
                 theme_combo.addItem(tr("theme_ubuntu_style"), "ubuntu_style")
                 theme_combo.addItem(tr("theme_brutal_man"), "brutal_man")
+                theme_combo.addItem(tr("theme_pretty_girl"), "pretty_girl")
                 try:
                     idx = theme_combo.findData(current_theme)
                     theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -5160,6 +5271,15 @@ def main() -> int:
                     cfg["ui_theme"] = next_theme
                     if next_theme != current_theme:
                         apply_theme(next_theme)
+                        # Re-render dynamic widgets that use inline styles (bubbles/contact cards).
+                        try:
+                            refresh_list()
+                        except Exception:
+                            pass
+                        try:
+                            render_chat(current_dialog)
+                        except Exception:
+                            pass
 
                     # Compression settings
                     choice = cmp_choice.currentData()
@@ -5561,25 +5681,75 @@ def main() -> int:
             bl = int(ab + (bb - ab) * t)
             return "#{:02x}{:02x}{:02x}".format(r, g, bl)
 
+        def _hex_rgb(hx: str) -> Tuple[int, int, int]:
+            h = str(hx or "").strip().lstrip("#")
+            if len(h) != 6:
+                return (0, 0, 0)
+            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+        def _rgba_css(hx: str, alpha: float) -> str:
+            r, g, b = _hex_rgb(hx)
+            a = max(0.0, min(1.0, float(alpha)))
+            return f"rgba({r},{g},{b},{a:.3f})"
+
+        THEME_BASE = {
+            # Two main backgrounds: contacts field and chat/bubbles field.
+            "ubuntu_style": {
+                "contacts_bg": "#2b0a22",
+                "chat_bg": "#35102a",
+                "contact_alpha": 0.92,
+                "bubble_alpha": 0.92,
+                "bubble_border": "rgba(255,255,255,0.10)",
+            },
+            "brutal_man": {
+                "contacts_bg": "#15181b",
+                "chat_bg": "#101214",
+                "contact_alpha": 0.94,
+                "bubble_alpha": 0.94,
+                "bubble_border": "rgba(255,255,255,0.10)",
+            },
+            "pretty_girl": {
+                # Pantone 2026 Cloud Dancer approximation as base; chat is slightly cooler.
+                "contacts_bg": "#f7f5f0",
+                "chat_bg": "#f3f0f4",
+                "contact_alpha": 0.96,
+                "bubble_alpha": 0.96,
+                "bubble_border": "rgba(0,0,0,0.12)",
+            },
+        }
+
+        def _theme_base(theme_id: str) -> Dict[str, object]:
+            tid = str(theme_id or "ubuntu_style").strip().lower()
+            base = THEME_BASE.get(tid) or THEME_BASE["ubuntu_style"]
+            return dict(base)
+
         def color_pair_for_id(seed: str) -> Tuple[str, str]:
-            base_bg = "#35102a"  # dialog background
+            base_bg = str(_theme_base(current_theme).get("contacts_bg") or "#35102a")
             accent = avatar_base_color(seed)
             # Contact list cards: deliberately muted tint.
             bg_hex = mix_hex(base_bg, accent, 0.05)
-            tx_hex = mix_hex("#e8e0e8", accent, 0.16)
+            # Text color must keep contrast; base differs between light/dark themes.
+            base_tx = "#2b1b24" if str(current_theme or "") == "pretty_girl" else "#e8e0e8"
+            tx_hex = mix_hex(base_tx, accent, 0.16)
             return (bg_hex, tx_hex)
 
         def color_pair_for_message(seed: str) -> Tuple[str, str]:
-            base_bg = "#35102a"
+            base_bg = str(_theme_base(current_theme).get("chat_bg") or "#35102a")
             accent = avatar_base_color(seed)
             bg_hex = mix_hex(base_bg, accent, 0.12)
-            tx_hex = mix_hex("#eeeeec", accent, 0.35)
+            base_tx = "#2b1b24" if str(current_theme or "") == "pretty_girl" else "#eeeeec"
+            tx_hex = mix_hex(base_tx, accent, 0.35)
             return (bg_hex, tx_hex)
 
-        avatar_cache: Dict[Tuple[str, int], str] = {}
+        avatar_cache: Dict[Tuple[str, int, str], str] = {}
 
         def avatar_data_uri(seed: str, size: int) -> str:
-            key = (seed, size)
+            try:
+                is_light = str(current_theme or "").strip().lower() in ("pretty_girl",)
+            except Exception:
+                is_light = False
+            theme_kind = "light" if is_light else "dark"
+            key = (seed, size, theme_kind)
             cached = avatar_cache.get(key)
             if cached:
                 return cached
@@ -5635,6 +5805,7 @@ def main() -> int:
                     or meta_l.startswith("отправлено в ")
                     or meta_l.startswith("доставлено в ")
                     or meta_l.startswith("получено в ")
+                    or meta_l.startswith("пришло ")
                     or meta_l.startswith("sent at ")
                     or meta_l.startswith("delivered at ")
                     or meta_l.startswith("received at ")
@@ -5671,8 +5842,12 @@ def main() -> int:
             bubble = QtWidgets.QFrame()
             bubble.setObjectName("chatBubble")
             bubble.setProperty("peer_id", str(peer_id))
+            base = _theme_base(current_theme)
+            bubble_alpha = float(base.get("bubble_alpha", 0.92) or 0.92)
+            bubble_border = str(base.get("bubble_border") or "rgba(255,255,255,0.10)")
+            bg_rgba = _rgba_css(bg, bubble_alpha)
             bubble.setStyleSheet(
-                f"QFrame#chatBubble {{ background:{bg}; border:1px solid rgba(255,255,255,0.10); border-radius:9px; }}"
+                f"QFrame#chatBubble {{ background-color:{bg_rgba}; border:1px solid {bubble_border}; border-radius:9px; }}"
             )
             bubble_l = QtWidgets.QVBoxLayout(bubble)
             bubble_l.setContentsMargins(8, 6, 10, 6)
@@ -6181,7 +6356,14 @@ def main() -> int:
                         bg_hex = QtGui.QColor(bg_hex).darker(135).name()
                     except Exception:
                         pass
-                item.setBackground(QtGui.QColor(bg_hex))
+                try:
+                    base = _theme_base(current_theme)
+                    ca = float(base.get("contact_alpha", 0.92) or 0.92)
+                    c = QtGui.QColor(bg_hex)
+                    c.setAlphaF(max(0.0, min(1.0, ca)))
+                    item.setBackground(c)
+                except Exception:
+                    item.setBackground(QtGui.QColor(bg_hex))
                 item.setForeground(QtGui.QColor(tx_hex))
                 item.setIcon(make_avatar(item_id))
                 unread = int(dialogs.get(item_id, {}).get("unread", 0) or 0)
@@ -7289,19 +7471,23 @@ def main() -> int:
             append_runtime_log(line_norm)
 
         def log_append_view(view: QtWidgets.QTextEdit, text: str, level: str) -> None:
-            # Severity palette:
-            # - red: critical
-            # - orange: needs attention
-            # - yellow: informational
-            # - green: success/healthy
-            if level == "error":
-                color = "#f92672"
-            elif level in ("warn", "key"):
-                color = "#fd971f"
-            elif level == "keyok":
-                color = "#6be5b5"
-            else:
-                color = "#ffd75f"
+            # Runtime log color palette (reading aid only).
+            # Keep mapping stable across OS themes; do not rely on QTextEdit inherited format.
+            lvl = str(level or "info").strip().lower()
+            palette = {
+                "error": "#f92672",     # red
+                "warn": "#fd971f",      # orange
+                "key": "#ffd75f",       # yellow (crypto/key lifecycle)
+                "keyok": "#ffd75f",     # yellow (confirmed key exchange)
+                "trace": "#66d9ef",     # cyan
+                "pace": "#a6e22e",      # green
+                "health": "#6be5b5",    # mint
+                "discovery": "#b894ff", # violet
+                "radio": "#74b2ff",     # blue
+                "gui": "#e0e0e0",       # light
+                "queue": "#c3b38a",     # sand
+            }
+            color = palette.get(lvl, "#e0e0e0")  # default/info
             try:
                 esc = html_escape(str(text))
             except Exception:
@@ -7443,7 +7629,8 @@ def main() -> int:
             hhmm = time.strftime("%H:%M", time.localtime(ts_val))
             is_ru = (current_lang == "ru")
             if incoming:
-                return f"пришло в {hhmm}" if is_ru else f"received at {hhmm}"
+                # Keep it short and avoid duplicate timestamps in UI.
+                return f"пришло {hhmm}" if is_ru else f"received at {hhmm}"
             return f"отправлено в {hhmm}" if is_ru else f"sent at {hhmm}"
 
         def update_sent_delivery(
