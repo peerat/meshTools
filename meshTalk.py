@@ -91,7 +91,7 @@ from message_text_compression import (
 )
 
 
-VERSION = "0.3.3"
+VERSION = "0.4.0"
 DEFAULT_PORTNUM = portnums_pb2.PortNum.PRIVATE_APP
 PAYLOAD_OVERHEAD = 1 + 1 + 8 + 12 + 16  # ver + type + msg_id + nonce + tag
 KEY_REQ_PREFIX = b"KR1|"
