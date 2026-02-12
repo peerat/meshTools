@@ -2844,6 +2844,10 @@ def main() -> int:
             if (now - last_key_refresh_ts) >= 5.0:
                 last_key_refresh_ts = now
                 peers, _ = snapshot_runtime_state(peer_states, known_peers, tracked_peers)
+                # Safety: never spam KR1 refresh across the whole node DB.
+                # We only refresh keys for peers that are actually meshTalk-capable (keys known + app used),
+                # and we cap the number of refresh sends per tick.
+                refresh_budget = 2
                 for peer_norm in peers:
                     if not peer_norm or peer_norm == self_id:
                         continue
@@ -2853,10 +2857,19 @@ def main() -> int:
                     if st.key_ready and st.await_key_confirm and now >= st.next_key_req_ts:
                         send_key_request(peer_norm, require_confirm=True, reason="await_confirm_retry")
                         continue
+                    # Refresh is meaningful only for established meshTalk peers.
+                    # Do not refresh unknown peers or Meshtastic-only nodes (reduces noise and privacy leakage).
+                    if not bool(getattr(st, "key_ready", False)):
+                        continue
+                    if not peer_used_meshtalk(peer_norm):
+                        continue
                     if st.next_key_refresh_ts <= 0.0:
                         st.next_key_refresh_ts = now + 3600.0 + random.uniform(0, 600)
                     if now >= st.next_key_refresh_ts:
+                        if refresh_budget <= 0:
+                            break
                         send_key_request(peer_norm, require_confirm=False, reason="refresh_timer")
+                        refresh_budget -= 1
                 # Session rekey: low-noise, only for active peers with confirmed keys.
                 if bool(session_rekey_enabled) and (now - last_rekey_tick_ts) >= 5.0:
                     last_rekey_tick_ts = now
