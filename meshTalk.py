@@ -3823,11 +3823,11 @@ def main() -> int:
                 if status_code == "app_online":
                     panel_color = QtGui.QColor("#2bbf66")
                 elif status_code == "app_offline":
-                    panel_color = QtGui.QColor("#1f6b3f")
+                    panel_color = QtGui.QColor("#154a2b")
                 elif status_code == "mesh_online":
                     panel_color = QtGui.QColor("#d9b233")
                 elif status_code == "mesh_offline":
-                    panel_color = QtGui.QColor("#8f6f18")
+                    panel_color = QtGui.QColor("#5f470c")
                 if panel_color is not None:
                     painter.setPen(QtCore.Qt.NoPen)
                     painter.setBrush(panel_color)
