@@ -827,19 +827,11 @@ def format_meta_text(
             t = received_at_ts if received_at_ts is not None else (time.time() if now_ts is None else now_ts)
             recv_at = time.strftime("%H:%M", time.localtime(t))
             if is_ru:
-                if delivery is not None:
-                    sent_ts = max(0.0, float(t) - float(delivery))
-                    sent_at = time.strftime("%H:%M", time.localtime(sent_ts))
-                    prefix = f"отправлено в {sent_at} получено в {recv_at}" + (f" за {dur}" if dur else "")
-                else:
-                    prefix = f"получено в {recv_at}" + (f" за {dur}" if dur else "")
+                # Incoming status should be short and unambiguous (avoid "sent at ... received at ...").
+                # We keep only the receive time, plus optional transfer duration.
+                prefix = f"пришло {recv_at}" + (f" за {dur}" if dur else "")
             else:
-                if delivery is not None:
-                    sent_ts = max(0.0, float(t) - float(delivery))
-                    sent_at = time.strftime("%H:%M", time.localtime(sent_ts))
-                    prefix = f"sent at {sent_at} received at {recv_at}" + (f" in {dur}" if dur else "")
-                else:
-                    prefix = f"received at {recv_at}" + (f" in {dur}" if dur else "")
+                prefix = f"received at {recv_at}" + (f" in {dur}" if dur else "")
             return f"{prefix}, {', '.join(details)}" if details else prefix
         now_ref = time.time() if now_ts is None else now_ts
         start_ts = incoming_started_ts if incoming_started_ts is not None else now_ref

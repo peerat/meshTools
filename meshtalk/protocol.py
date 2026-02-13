@@ -21,7 +21,7 @@ from meshtalk_utils import (
 )
 
 
-PROTO_VERSION = 1
+PROTO_VERSION = 2
 TYPE_MSG = 1
 TYPE_ACK = 2
 
@@ -49,8 +49,9 @@ def derive_key(priv: x25519.X25519PrivateKey, peer: x25519.X25519PublicKey) -> b
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=b"meshTalk v1",
-        info=b"meshTalk v1",
+        # Protocol v2: change salt/info so keys are not re-used across wire versions.
+        salt=b"meshTalk v2",
+        info=b"meshTalk v2",
     )
     return hkdf.derive(shared)
 
@@ -134,4 +135,3 @@ def parse_payload(raw) -> Optional[bytes]:
         except Exception:
             return None
     return None
-

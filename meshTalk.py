@@ -92,11 +92,19 @@ from message_text_compression import (
 )
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_PORTNUM = portnums_pb2.PortNum.PRIVATE_APP
 PAYLOAD_OVERHEAD = 1 + 1 + 8 + 12 + 16  # ver + type + msg_id + nonce + tag
+# Legacy text key frames (v0.4.x). Protocol v2 uses compact binary key frames.
 KEY_REQ_PREFIX = b"KR1|"
 KEY_RESP_PREFIX = b"KR2|"
+
+# Protocol v2: compact binary key/discovery frames (plaintext on PRIVATE_APP).
+MT2_MAGIC = b"MT"
+MT2_FRAME_VER = 1
+MT2_F_HELLO = 0x10
+MT2_F_KR1 = 0x01
+MT2_F_KR2 = 0x02
 APP_OFFLINE_PREFIX = b"KOF1|"
 MSG_V2_PREFIX = b"M2"
 MSG_V2_HEADER_LEN = 16  # prefix(2) + ts(4) + group(4) + part(2) + total(2) + attempt(1) + meta(1)
@@ -125,6 +133,32 @@ REKEY_MIN_INTERVAL_SECONDS = 6 * 3600.0
 REKEY_MIN_MESSAGES = 50
 CONTACT_ONLINE_SECONDS = 30.0 * 60.0
 CONTACT_STALE_SECONDS = 24.0 * 3600.0
+
+
+def peer_used_meshtalk(peer_norm: str, now_ts: Optional[float] = None) -> bool:
+    """
+    Thread-safe-ish helper used by non-GUI code paths.
+    Returns True if the peer has shown meshTalk app activity recently (within CONTACT_STALE_SECONDS)
+    and we have no explicit offline marker that is newer than last seen.
+
+    IMPORTANT: This must exist at module scope, because sender/background loops should not depend on
+    nested GUI helpers (which may not be defined in those threads).
+    """
+    try:
+        st = get_peer_state(peer_norm)
+    except Exception:
+        st = None
+    if not st:
+        return False
+    now = time.time() if now_ts is None else float(now_ts)
+    try:
+        seen_ts = float(getattr(st, "last_seen_ts", 0.0) or 0.0)
+        offline_ts = float(getattr(st, "app_offline_ts", 0.0) or 0.0)
+    except Exception:
+        return False
+    if offline_ts > 0.0 and (now - offline_ts) <= float(CONTACT_STALE_SECONDS) and (seen_ts <= offline_ts):
+        return False
+    return bool(seen_ts > 0.0 and (now - seen_ts) <= float(CONTACT_STALE_SECONDS))
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_BASE_DIR = "meshTalk"
 DATA_DIR = BASE_DIR
@@ -641,39 +675,39 @@ def peer_request_id(args_user: Optional[str]) -> Optional[str]:
     return args_user
 
 
-def parse_key_frame(
-    payload: bytes,
-) -> Optional[
-    Tuple[
-        str,
-        str,
-        bytes,
-        Optional[set[int]],
-        Optional[set[str]],
-        Optional[set[int]],
-        Optional[set[int]],
-        Optional[set[int]],
-    ]
-]:
-    parsed = parse_key_exchange_frame(
-        payload=payload,
-        key_req_prefix=KEY_REQ_PREFIX,
-        key_resp_prefix=KEY_RESP_PREFIX,
-        supported_modes=set(supported_mc_modes_for_config(cfg)),
-    )
-    if parsed is None:
+def parse_key_frame(payload: bytes) -> Optional[Tuple[str, Optional[bytes], Optional[bytes]]]:
+    """Parse protocol v2 plaintext frames (PRIVATE_APP).
+
+    Returns:
+      ("hello", None, nonce4) for MT2 hello/beacon
+      ("req", pub32, nonce4) for KR1
+      ("resp", pub32, nonce4) for KR2
+    """
+    try:
+        raw = bytes(payload or b"")
+    except Exception:
+        raw = b""
+    if len(raw) < 5:
         return None
-    kind, peer_id, pub_raw, peer_modes, peer_caps, peer_wire, peer_msg, peer_mc = parsed
-    return (
-        kind,
-        peer_id,
-        pub_raw,
-        set(peer_modes) if peer_modes else None,
-        set(peer_caps) if peer_caps else None,
-        set(peer_wire) if peer_wire else None,
-        set(peer_msg) if peer_msg else None,
-        set(peer_mc) if peer_mc else None,
-    )
+    if not raw.startswith(MT2_MAGIC):
+        return None
+    ftype = raw[2]
+    ver = raw[3]
+    _flags = raw[4]
+    if int(ver) != int(MT2_FRAME_VER):
+        return None
+    if int(ftype) == int(MT2_F_HELLO):
+        if len(raw) < 9:
+            return None
+        return ("hello", None, raw[5:9])
+    if int(ftype) in (int(MT2_F_KR1), int(MT2_F_KR2)):
+        if len(raw) < (5 + 32 + 4):
+            return None
+        pub_raw = raw[5 : 5 + 32]
+        nonce = raw[5 + 32 : 5 + 32 + 4]
+        kind = "req" if int(ftype) == int(MT2_F_KR1) else "resp"
+        return (kind, pub_raw, nonce)
+    return None
 
 
 def parse_app_offline_frame(payload: bytes) -> Optional[str]:
@@ -1420,240 +1454,139 @@ def main() -> int:
             ui_emit("log", f"{ts_local()} PRESENCE: app offline broadcast from {peer_norm}")
             return
 
-        # Key exchange frames are plaintext
+        # Protocol v2 plaintext frames on PRIVATE_APP (hello + key exchange).
         key_frame = parse_key_frame(payload)
         if key_frame:
-            activity_record("in", "srv", 1, bytes_count=len(payload), subkind="key")
-            kind, peer_id, pub_raw, peer_modes, peer_caps, peer_wire, peer_msg, peer_mc = key_frame
+            kind, pub_raw, nonce = key_frame
+            now = time.time()
             from_id_raw = packet.get("fromId")
+            peer_norm = norm_id_for_filename(from_id_raw) if from_id_raw else None
+            if kind == "hello":
+                # Presence beacon only (no key, no caps).
+                if peer_norm and peer_norm != self_id:
+                    st = get_peer_state(peer_norm)
+                    if st:
+                        st.last_seen_ts = now
+                        st.app_offline_ts = 0.0
+                    try:
+                        rec = peer_meta.setdefault(peer_norm, {})
+                        if isinstance(rec, dict):
+                            rec["last_seen_ts"] = float(now)
+                            rec["app_offline_ts"] = 0.0
+                    except Exception:
+                        pass
+                    ui_emit("peer_update", peer_norm)
+                activity_record("in", "srv", 1, now=now, bytes_count=len(payload), subkind="disc")
+                return
+
+            # KR1/KR2 must be unicast; do not accept broadcast key frames.
             to_id = packet.get("toId") or packet.get("to")
-            accepted_frame, trusted_capabilities, reject_reason, is_broadcast, from_id = key_frame_receive_policy(
-                peer_id=peer_id,
-                from_id_raw=from_id_raw,
-                to_id=to_id,
-                broadcast_addr=meshtastic.BROADCAST_ADDR,
-                discovery_reply=bool(discovery_reply),
-            )
-            if not accepted_frame and reject_reason == "broadcast_disabled":
-                return
-            peer_norm = norm_id_for_filename(peer_id)
-            update_peer_names_from_nodes(peer_norm)
-            if not accepted_frame and reject_reason == "missing_from_id":
-                ui_emit("log", f"{ts_local()} KEY: reject frame from {peer_id} (missing fromId).")
-                return
-            if not accepted_frame and reject_reason == "id_mismatch":
-                ui_emit(
-                    "log",
-                    f"{ts_local()} KEY: reject frame id mismatch from={from_id_raw} payload={peer_id}.",
-                )
-                return
-            if not accepted_frame:
-                ui_emit("log", f"{ts_local()} KEY: reject frame from {peer_id}.")
-                return
+            is_broadcast = False
             try:
-                st_seen = get_peer_state(peer_norm)
-                if st_seen:
-                    st_seen.last_seen_ts = time.time()
-                    st_seen.app_offline_ts = 0.0
+                if isinstance(to_id, str) and to_id.strip() == "^all":
+                    is_broadcast = True
+                elif isinstance(to_id, int) and int(to_id) == int(meshtastic.BROADCAST_ADDR):
+                    is_broadcast = True
             except Exception:
                 pass
+            if is_broadcast:
+                activity_record("in", "srv", 1, now=now, bytes_count=len(payload), subkind="key")
+                ui_emit("log", f"{ts_local()} KEY: ignored broadcast key frame from {from_id_raw or '?'}")
+                return
+            if not peer_norm:
+                activity_record("in", "srv", 1, now=now, bytes_count=len(payload), subkind="key")
+                ui_emit("log", f"{ts_local()} KEY: reject key frame (missing fromId).")
+                return
+
+            update_peer_names_from_nodes(peer_norm)
+            activity_record("in", "srv", 1, now=now, bytes_count=len(payload), subkind="key")
+            st = get_peer_state(peer_norm)
+            if st:
+                st.last_seen_ts = now
+                st.app_offline_ts = 0.0
+
+            # Store/TOFU pin peer key.
             try:
-                store_peer_pub(peer_id, pub_raw)
+                if pub_raw is None:
+                    raise ValueError("missing pubkey")
+                store_peer_pub(peer_norm, bytes(pub_raw))
             except PeerKeyPinnedError as ex:
-                st = get_peer_state(peer_norm)
                 auto_ok, auto_why = should_auto_accept_peer_key_rotation(peer_norm, st)
                 if auto_ok:
-                    # Overwrite pinned key according to policy (AUTO/ALWAYS).
                     try:
-                        path = os.path.join(keydir, f"{norm_id_for_filename(peer_id)}.pub")
+                        path = os.path.join(keydir, f"{norm_id_for_filename(peer_norm)}.pub")
                         try:
                             if os.path.isfile(path):
                                 os.remove(path)
                         except Exception:
                             pass
-                        force_store_peer_pub(peer_id, pub_raw)
-                        ui_emit(
-                            "log",
-                            f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=auto_accept {auto_why}",
-                        )
+                        force_store_peer_pub(peer_norm, bytes(pub_raw))
+                        ui_emit("log", f"{ts_local()} KEY: pinned key mismatch peer={peer_norm} old={ex.old_fp} new={ex.new_fp} action=auto_accept {auto_why}")
                     except Exception as e:
-                        ui_emit(
-                            "log",
-                            f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required auto_accept_failed={type(e).__name__}",
-                        )
-                        # Fall through to pinned-mismatch behavior (manual reset).
-                    else:
-                        # Continue processing this key frame normally.
-                        last_activity_ts = time.time()
-                        st2 = get_peer_state(peer_norm)
-                        if st2 and trusted_capabilities:
-                            if peer_modes:
-                                st2.compression_capable = True
-                                st2.compression_modes = set(peer_modes)
-                            else:
-                                st2.compression_capable = False
-                                st2.compression_modes = set(LEGACY_COMPRESSION_MODES)
-                            st2.aad_type_bound = bool(peer_caps and ("aad_type" in peer_caps))
-                            if peer_wire:
-                                st2.peer_wire_versions = set(peer_wire)
-                            else:
-                                st2.peer_wire_versions = {int(PROTO_VERSION)}
-                            if peer_msg:
-                                st2.peer_msg_versions = set(peer_msg)
-                            else:
-                                st2.peer_msg_versions = {1}
-                            if peer_mc:
-                                st2.peer_mc_versions = set(peer_mc)
-                            else:
-                                st2.peer_mc_versions = {1}
-                        if st2 and st2.key_ready and kind == "resp":
-                            st2.last_key_ok_ts = time.time()
-                            st2.key_confirmed_ts = st2.last_key_ok_ts
-                            ui_emit(
-                                "log",
-                                f"{ts_local()} KEYOK: confirmed_by=resp peer={peer_id} initiator=remote wire=MT-WIREv1 aes-256-gcm",
-                            )
-                            st2.force_key_req = False
-                            st2.await_key_confirm = False
-                            st2.next_key_req_ts = float('inf')
-                        ui_emit("peer_update", peer_norm)
-                        return
-
-                # Peer rotated key. Keep old pinned key until user resets explicitly.
-                # Suppress repeated logs to avoid noisy spam loops.
-                if st:
-                    st.pinned_mismatch = True
-                    st.pinned_old_fp = str(ex.old_fp or "")
-                    st.pinned_new_fp = str(ex.new_fp or "")
-                    st.pinned_new_pub_b64 = b64e(bytes(pub_raw))
-                    st.force_key_req = False
-                    st.await_key_confirm = False
-                    st.next_key_req_ts = float("inf")
-                    # Don't keep trying to decrypt with a known-stale key.
-                    st.aes = None
-                    now = time.time()
-                    if (now - float(getattr(st, "last_pinned_mismatch_log_ts", 0.0) or 0.0)) >= 30.0:
-                        st.last_pinned_mismatch_log_ts = now
-                        ui_emit(
-                            "log",
-                            f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required {auto_why}",
-                        )
+                        ui_emit("log", f"{ts_local()} KEY: pinned key mismatch peer={peer_norm} old={ex.old_fp} new={ex.new_fp} action=reset_key_required auto_accept_failed={type(e).__name__}")
+                        auto_ok = False
+                if not auto_ok:
+                    if st:
+                        st.pinned_mismatch = True
+                        st.pinned_old_fp = str(ex.old_fp or "")
+                        st.pinned_new_fp = str(ex.new_fp or "")
+                        st.pinned_new_pub_b64 = b64e(bytes(pub_raw))
+                        st.force_key_req = False
+                        st.await_key_confirm = False
+                        st.next_key_req_ts = float("inf")
+                        st.aes = None
+                    ui_emit("log", f"{ts_local()} KEY: pinned key mismatch peer={peer_norm} old={ex.old_fp} new={ex.new_fp} action=reset_key_required {auto_why}")
                     ui_emit("key_conflict", (peer_norm, str(ex.old_fp or ""), str(ex.new_fp or "")))
-                else:
-                    ui_emit(
-                        "log",
-                        f"{ts_local()} KEY: pinned key mismatch peer={peer_id} old={ex.old_fp} new={ex.new_fp} action=reset_key_required {auto_why}",
-                    )
-                    ui_emit("key_conflict", (peer_norm, str(ex.old_fp or ""), str(ex.new_fp or "")))
-                return
-            except ValueError:
-                ui_emit("log", f"{ts_local()} KEY: reject invalid key frame from {peer_id}.")
-                return
+                    return
             except Exception:
-                ui_emit("log", f"{ts_local()} KEY: reject invalid public key from {peer_id}.")
+                ui_emit("log", f"{ts_local()} KEY: reject invalid public key from {peer_norm}.")
                 return
-            last_activity_ts = time.time()
-            st = get_peer_state(peer_norm)
-            if st and trusted_capabilities:
-                # Capabilities from key frames are accepted only for verifiable unicast sources.
-                if peer_modes:
-                    st.compression_capable = True
-                    st.compression_modes = set(peer_modes)
-                else:
-                    # Missing modes means peer is legacy or downgraded: reset stale capabilities.
-                    st.compression_capable = False
-                    st.compression_modes = set(LEGACY_COMPRESSION_MODES)
-                st.aad_type_bound = bool(peer_caps and ("aad_type" in peer_caps))
-                if peer_wire:
-                    st.peer_wire_versions = set(peer_wire)
-                else:
-                    st.peer_wire_versions = {int(PROTO_VERSION)}
-                if peer_msg:
-                    st.peer_msg_versions = set(peer_msg)
-                else:
-                    st.peer_msg_versions = {1}
-                if peer_mc:
-                    st.peer_mc_versions = set(peer_mc)
-                else:
-                    st.peer_mc_versions = {1}
-                if peer_wire and int(PROTO_VERSION) not in st.peer_wire_versions:
-                    ui_emit(
-                        "log",
-                        f"{ts_local()} WARN: peer {peer_id} advertises mt_wire={sorted(st.peer_wire_versions)}, local={int(PROTO_VERSION)}.",
-                    )
-            if st and st.key_ready and kind == "resp":
-                st.last_key_ok_ts = time.time()
-                st.key_confirmed_ts = st.last_key_ok_ts
-                ui_emit(
-                    "log",
-                    f"{ts_local()} KEYOK: confirmed_by=resp peer={peer_id} initiator=remote wire=MT-WIREv1 aes-256-gcm",
-                )
-                st.force_key_req = False
-                st.await_key_confirm = False
-                st.next_key_req_ts = float("inf")
+
+            # Update runtime key material (AES key for encrypted packets).
+            try:
+                update_peer_pub(peer_norm, bytes(pub_raw))
+            except Exception:
+                pass
+
+            st2 = get_peer_state(peer_norm)
             if kind == "req":
-                ui_emit("log", f"{ts_local()} KEY: request from {peer_id} initiator=remote event=req")
-                now = time.time()
+                # Reply with KR2 (unicast), rate-limited.
                 last_resp = float(key_response_last_ts.get(peer_norm, 0.0) or 0.0)
-                retrying_confirm = bool(st and st.await_key_confirm and not is_broadcast)
-                min_reply_interval = (
-                    float(KEY_RESPONSE_RETRY_INTERVAL_SECONDS)
-                    if retrying_confirm
-                    else float(KEY_RESPONSE_MIN_INTERVAL_SECONDS)
-                )
+                retrying_confirm = bool(st2 and st2.await_key_confirm)
+                min_reply_interval = float(KEY_RESPONSE_RETRY_INTERVAL_SECONDS) if retrying_confirm else float(KEY_RESPONSE_MIN_INTERVAL_SECONDS)
                 if (now - last_resp) < min_reply_interval:
                     left_s = int(max(0.0, min_reply_interval - (now - last_resp)))
-                    ui_emit(
-                        "log",
-                        f"{ts_local()} KEY: response suppressed peer={peer_id} initiator=remote reason=recent_response wait={left_s}s",
-                    )
+                    ui_emit("log", f"{ts_local()} KEY: response suppressed peer={peer_norm} initiator=remote reason=recent_response wait={left_s}s")
                 else:
-                    modes_bytes = ",".join(str(m) for m in supported_mc_modes_for_config(cfg)).encode("ascii")
-                    wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
-                    msg_bytes = b"1,2"
-                    mc_bytes = b"1"
-                    resp = (
-                        KEY_RESP_PREFIX
-                        + self_id.encode("utf-8")
-                        + b"|"
-                        + b64e(pub_self_raw).encode("ascii")
-                        + b"|mc_modes="
-                        + modes_bytes
-                        + b"|mt_wire="
-                        + wire_bytes
-                        + b"|mt_msg="
-                        + msg_bytes
-                        + b"|mt_mc="
-                        + mc_bytes
-                        + b"|mt_caps=aad_type"
-                    )
-                    if from_id:
+                    nonce4 = os.urandom(4)
+                    resp = MT2_MAGIC + bytes([MT2_F_KR2, MT2_FRAME_VER, 0]) + bytes(pub_self_raw) + nonce4
+                    try:
                         interface.sendData(
                             resp,
-                            destinationId=from_id,
+                            destinationId=wire_id_from_norm(peer_norm),
                             wantAck=False,
                             portNum=DEFAULT_PORTNUM,
                             channelIndex=(args.channel if args.channel is not None else 0),
                         )
-                        activity_record("out", "srv", 1, now=now)
+                        activity_record("out", "srv", 1, now=now, bytes_count=len(resp), subkind="key")
                         key_response_last_ts[peer_norm] = now
-                    ui_emit(
-                        "log",
-                        f"{ts_local()} KEY: response sent to {peer_id} initiator=remote event=req_reply retry_confirm={1 if retrying_confirm else 0} frame=KR2 plaintext x25519+hkdf-sha256->aes-256-gcm",
-                    )
-                if st and not is_broadcast and bool(st.await_key_confirm):
-                    # Receiving peer KR1 must not start a new local confirm loop by itself.
-                    # Only extend timer if we already have our own confirm flow in progress.
-                    st.next_key_req_ts = now + max(1.0, float(args.retry_seconds))
-            else:
-                if st:
-                    st.force_key_req = False
-                    st.await_key_confirm = False
-                    st.next_key_req_ts = float("inf")
-                    st.last_key_ok_ts = time.time()
-                    if st.key_ready and st.key_confirmed_ts <= 0.0:
-                        # Response implies peer received our pub key, so this is confirmed.
-                        st.key_confirmed_ts = st.last_key_ok_ts
+                    except Exception:
+                        ui_emit("radio_lost", None)
+                        return
+                    ui_emit("log", f"{ts_local()} KEY: response sent to {peer_norm} initiator=remote event=req_reply frame=KR2 plaintext x25519(32b)->aes-256-gcm")
+                ui_emit("peer_update", peer_norm)
+                return
+
+            # kind == "resp"
+            if st2 and st2.key_ready:
+                st2.last_key_ok_ts = now
+                # Mark confirmed only when we received KR2 in response to our KR1 (two-way).
+                if bool(getattr(st2, "await_key_confirm", False)):
+                    st2.key_confirmed_ts = now
+                    st2.await_key_confirm = False
+                    st2.force_key_req = False
+                    st2.next_key_req_ts = float("inf")
+                    ui_emit("log", f"{ts_local()} KEYOK: confirmed_by=resp peer={peer_norm} initiator=remote wire=MT-WIREv2 aes-256-gcm")
             ui_emit("peer_update", peer_norm)
             return
 
@@ -1776,10 +1709,10 @@ def main() -> int:
                 )
 
         def build_ack_text(hops: Optional[int]) -> bytes:
-            parts = ["ACK", "mc=1", f"mc_modes={','.join(str(m) for m in supported_mc_modes_for_config(cfg))}"]
-            if hops is not None:
-                parts.append(f"hops={hops}")
-            return "|".join(parts).encode("utf-8")
+            # Protocol v2: keep ACK plaintext minimal (no capability advertisement).
+            if hops is None:
+                return b"ACK"
+            return f"ACK|hops={int(hops)}".encode("utf-8")
 
         if msg_type == TYPE_ACK:
             now = time.time()
@@ -1791,27 +1724,6 @@ def main() -> int:
                     ack_text = pt.decode("utf-8", errors="ignore")
                 except Exception:
                     ack_text = ""
-                m_mc = re.search(r"\bmc=(\d+)\b", ack_text)
-                if m_mc:
-                    try:
-                        if int(m_mc.group(1)) == 1:
-                            st.compression_capable = True
-                    except Exception:
-                        pass
-                m_modes = re.search(r"\bmc_modes=([0-9,]+)\b", ack_text)
-                if m_modes:
-                    try:
-                        parsed_modes = {
-                            int(item)
-                            for item in m_modes.group(1).split(",")
-                            if item != ""
-                        }
-                        parsed_modes = {m for m in parsed_modes if m in set(supported_mc_modes_for_config(cfg))}
-                        if parsed_modes:
-                            st.compression_modes = set(parsed_modes)
-                            st.compression_capable = True
-                    except Exception:
-                        pass
                 m = re.search(r"\bhops=(\d+)\b", ack_text)
                 if m:
                     try:
@@ -2294,25 +2206,9 @@ def main() -> int:
             )
             return
         dest_id = wire_id_from_norm(peer_norm)
-        modes_bytes = ",".join(str(m) for m in supported_mc_modes_for_config(cfg)).encode("ascii")
-        wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
-        msg_bytes = b"1,2"
-        mc_bytes = b"1"
-        req = (
-            KEY_REQ_PREFIX
-            + self_id.encode("utf-8")
-            + b"|"
-            + b64e(pub_self_raw).encode("ascii")
-            + b"|mc_modes="
-            + modes_bytes
-            + b"|mt_wire="
-            + wire_bytes
-            + b"|mt_msg="
-            + msg_bytes
-            + b"|mt_mc="
-            + mc_bytes
-            + b"|mt_caps=aad_type"
-        )
+        # Protocol v2: compact binary KR1 (unicast). Do not leak capabilities in plaintext.
+        nonce4 = os.urandom(4)
+        req = MT2_MAGIC + bytes([MT2_F_KR1, MT2_FRAME_VER, 0]) + bytes(pub_self_raw) + nonce4
         try:
             interface.sendData(
                 req,
@@ -2337,31 +2233,15 @@ def main() -> int:
                 st.next_key_req_ts = last_activity_ts + max(1.0, float(args.retry_seconds))
         ui_emit(
             "log",
-            f"{ts_local()} KEY: request sent to {dest_id} initiator=local reason={reason or '-'} confirm={1 if require_confirm else 0} frame=KR1 plaintext x25519+hkdf-sha256->aes-256-gcm",
+            f"{ts_local()} KEY: request sent to {dest_id} initiator=local reason={reason or '-'} confirm={1 if require_confirm else 0} frame=KR1 plaintext x25519(32b)->aes-256-gcm",
         )
 
     def send_discovery_broadcast() -> None:
         if not radio_ready or interface is None:
             return
-        modes_bytes = ",".join(str(m) for m in supported_mc_modes_for_config(cfg)).encode("ascii")
-        wire_bytes = str(int(PROTO_VERSION)).encode("ascii")
-        msg_bytes = b"1,2"
-        mc_bytes = b"1"
-        req = (
-            KEY_REQ_PREFIX
-            + self_id.encode("utf-8")
-            + b"|"
-            + b64e(pub_self_raw).encode("ascii")
-            + b"|mc_modes="
-            + modes_bytes
-            + b"|mt_wire="
-            + wire_bytes
-            + b"|mt_msg="
-            + msg_bytes
-            + b"|mt_mc="
-            + mc_bytes
-            + b"|mt_caps=aad_type"
-        )
+        # Protocol v2: HELLO broadcast without public key (minimize plaintext metadata).
+        nonce4 = os.urandom(4)
+        req = MT2_MAGIC + bytes([MT2_F_HELLO, MT2_FRAME_VER, 0]) + nonce4
         try:
             interface.sendData(
                 req,
@@ -2585,7 +2465,9 @@ def main() -> int:
     # -------------------
     # Metrics for graphs (15 minutes window)
     # -------------------
-    METRICS_GRAPH_WINDOW_SECONDS = 15 * 60  # 15 minutes
+    METRICS_GRAPH_WINDOW_SECONDS = 15 * 60  # default window: 15 minutes
+    # Keep a longer retention so the Graphs tab can switch time scales without losing history.
+    METRICS_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
     _metrics_lock = threading.Lock()
     _metrics_series = deque()  # list of (sec:int, row:dict[str, float])
 
@@ -2611,7 +2493,7 @@ def main() -> int:
         with _metrics_lock:
             row = _metrics_row_for_sec(sec)
             row[k] = float(row.get(k, 0.0) or 0.0) + float(d)
-            cutoff = int(sec) - int(METRICS_GRAPH_WINDOW_SECONDS) - 5
+            cutoff = int(sec) - int(METRICS_RETENTION_SECONDS) - 5
             while _metrics_series and int(_metrics_series[0][0]) < cutoff:
                 _metrics_series.popleft()
 
@@ -2630,7 +2512,7 @@ def main() -> int:
         with _metrics_lock:
             row = _metrics_row_for_sec(sec)
             row[k] = float(v)
-            cutoff = int(sec) - int(METRICS_GRAPH_WINDOW_SECONDS) - 5
+            cutoff = int(sec) - int(METRICS_RETENTION_SECONDS) - 5
             while _metrics_series and int(_metrics_series[0][0]) < cutoff:
                 _metrics_series.popleft()
 
@@ -3420,6 +3302,7 @@ def main() -> int:
                 "tab_about": "About",
                 "tab_activity": "Activity",
                 "tab_graphs": "Graphs",
+                "graphs_window": "Time window",
                 "language": "Language",
                 "lang_ru": "Russian",
                 "lang_en": "English",
@@ -3623,6 +3506,7 @@ def main() -> int:
                 "tab_about": "О программе",
                 "tab_activity": "Активность",
                 "tab_graphs": "Графики",
+                "graphs_window": "Окно времени",
                 "language": "Язык",
                 "lang_ru": "Русский",
                 "lang_en": "Английский",
@@ -4338,7 +4222,7 @@ def main() -> int:
             QMenu::item { padding: 6px 14px; color: #eeeeec; }
             QMenu::item:selected { background: #ff9800; color: #2b0a22; }
             QLabel#muted { color: #c0b7c2; }
-            QLabel#hint { color: #bcaec0; font-size: 11px; }
+            QLabel#hint { color: #bcaec0; font-size: 12px; }
             QLabel#section { color: #c0b7c2; font-size: 13px; font-weight: 400; }
             QWidget#headerBar { background: #c24f00; }
             QWidget#headerBar QLabel { background: transparent; font-weight: 600; color: #2b0a22; }
@@ -4412,7 +4296,7 @@ def main() -> int:
             QMenu::item { padding: 6px 14px; color: #e8e8e8; }
             QMenu::item:selected { background: #f05d23; color: #101214; }
             QLabel#muted { color: #b8b8b8; }
-            QLabel#hint { color: #999fa8; font-size: 11px; }
+            QLabel#hint { color: #999fa8; font-size: 12px; }
             QLabel#section { color: #b8b8b8; font-size: 13px; font-weight: 500; }
             QWidget#headerBar { background: #f05d23; }
             QWidget#headerBar QLabel { background: transparent; font-weight: 700; color: #101214; }
@@ -4493,7 +4377,7 @@ def main() -> int:
             QMenu::item:selected { background: #ff76b3; color: #22131b; }
 
             QLabel#muted { color: #6b5d66; }
-            QLabel#hint { color: #6b5d66; font-size: 11px; }
+            QLabel#hint { color: #6b5d66; font-size: 12px; }
             QLabel#section { color: #3a2a33; font-size: 13px; font-weight: 600; }
 
             QWidget#headerBar { background: #f3bfd9; }
@@ -5336,32 +5220,31 @@ def main() -> int:
                 tab_graphs = QtWidgets.QWidget()
                 tabs.addTab(tab_graphs, tr("tab_graphs"))
                 graphs_root = QtWidgets.QVBoxLayout(tab_graphs)
-                graphs_root.setContentsMargins(14, 12, 14, 10)
-                graphs_root.setSpacing(12)
-
-                graphs_title = QtWidgets.QLabel(tr("graphs_title"))
-                graphs_title.setObjectName("muted")
-                graphs_title.setStyleSheet("font-weight:600;")
-                graphs_title.setContentsMargins(6, 8, 0, 0)
-                graphs_root.addWidget(graphs_title)
-
-                graphs_scroll = QtWidgets.QScrollArea(tab_graphs)
-                graphs_scroll.setWidgetResizable(True)
-                graphs_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-                graphs_root.addWidget(graphs_scroll, 1)
-
-                graphs_body = QtWidgets.QWidget()
-                graphs_scroll.setWidget(graphs_body)
-                graphs_v = QtWidgets.QVBoxLayout(graphs_body)
-                graphs_v.setContentsMargins(0, 0, 0, 0)
-                graphs_v.setSpacing(12)
+                graphs_root.setContentsMargins(14, 6, 14, 10)
+                graphs_root.setSpacing(6)
 
                 class MetricsLineGraph(QtWidgets.QWidget):
                     def __init__(self, series: list[tuple[str, str, str]], parent=None) -> None:
                         super().__init__(parent)
                         self._series = list(series)
-                        self.setMinimumHeight(130)
+                        self._window_s = int(cfg.get("graphs_window_seconds", METRICS_GRAPH_WINDOW_SECONDS) or METRICS_GRAPH_WINDOW_SECONDS)
+                        # Compact height: the graph should not dominate the settings page.
+                        self.setMinimumHeight(110)
+                        self.setMaximumHeight(130)
                         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+                    def set_series(self, series: list[tuple[str, str, str]]) -> None:
+                        self._series = list(series)
+                        self.update()
+
+                    def set_window_seconds(self, window_s: int) -> None:
+                        try:
+                            w = int(window_s)
+                        except Exception:
+                            w = int(METRICS_GRAPH_WINDOW_SECONDS)
+                        w = max(60, min(int(METRICS_RETENTION_SECONDS), int(w)))
+                        self._window_s = int(w)
+                        self.update()
 
                     def paintEvent(self, event) -> None:  # type: ignore[override]
                         del event
@@ -5378,7 +5261,7 @@ def main() -> int:
                         p.setPen(QtCore.Qt.NoPen)
                         p.drawRoundedRect(r.adjusted(0, 0, -1, -1), 8, 8)
 
-                        rows = metrics_snapshot_rows(window_s=int(METRICS_GRAPH_WINDOW_SECONDS))
+                        rows = metrics_snapshot_rows(window_s=int(self._window_s))
                         if not rows or r.width() < 80 or r.height() < 60:
                             return
                         # Compute max Y
@@ -5436,97 +5319,37 @@ def main() -> int:
                             p.setBrush(QtCore.Qt.NoBrush)
                             p.drawPath(path)
 
-                def _graphs_section(
-                    title: str,
-                    hint: str,
-                    cb_default: bool,
-                    graph_widget: QtWidgets.QWidget,
-                ) -> QtWidgets.QCheckBox:
-                    group = QtWidgets.QGroupBox("")
-                    v = QtWidgets.QVBoxLayout(group)
-                    v.setContentsMargins(10, 10, 10, 10)
-                    v.setSpacing(8)
-                    cb = QtWidgets.QCheckBox(title, group)
-                    cb.setChecked(bool(cb_default))
-                    v.addWidget(cb)
-                    lbl = QtWidgets.QLabel(hint, group)
-                    lbl.setObjectName("hint")
-                    lbl.setWordWrap(True)
-                    v.addWidget(lbl)
-                    v.addWidget(graph_widget)
-                    graph_widget.setVisible(cb.isChecked())
-                    cb.toggled.connect(lambda on, w=graph_widget: w.setVisible(bool(on)))
-                    graphs_v.addWidget(group)
-                    return cb
-
-                # Defaults: keep essential graphs enabled, rest optional.
-                g_traffic_default = bool(cfg.get("graphs_traffic_enabled", True))
-                g_bytes_default = bool(cfg.get("graphs_bytes_enabled", False))
-                g_rel_default = bool(cfg.get("graphs_reliability_enabled", True))
-                g_backlog_default = bool(cfg.get("graphs_backlog_enabled", True))
-                g_latency_default = bool(cfg.get("graphs_latency_enabled", True))
-                g_comp_default = bool(cfg.get("graphs_compression_enabled", False))
-                g_srv_default = bool(cfg.get("graphs_service_enabled", False))
-
-                traffic_graph = MetricsLineGraph(
-                    [
+                # Single graph field (time window selectable). Multiple datasets can be enabled at once:
+                # they are rendered as stacked sub-plots to avoid mixing different units on one scale.
+                graph_datasets: Dict[str, Tuple[str, str, list[tuple[str, str, str]]]] = {
+                    "traffic": (tr("graphs_traffic"), tr("graphs_traffic_hint"), [
                         ("out_msg", "out msg", "#a6e22e"),
                         ("in_msg", "in msg", "#66d9ef"),
                         ("out_srv", "out srv", "#fd971f"),
                         ("in_srv", "in srv", "#ffd75f"),
-                    ],
-                    parent=tab_graphs,
-                )
-                cb_g_traffic = _graphs_section(tr("graphs_traffic"), tr("graphs_traffic_hint"), g_traffic_default, traffic_graph)
-
-                bytes_graph = MetricsLineGraph(
-                    [
+                    ]),
+                    "bytes": (tr("graphs_bytes"), tr("graphs_bytes_hint"), [
                         ("out_msg_bytes", "out msg bytes", "#a6e22e"),
                         ("in_msg_bytes", "in msg bytes", "#66d9ef"),
                         ("out_srv_bytes", "out srv bytes", "#fd971f"),
                         ("in_srv_bytes", "in srv bytes", "#ffd75f"),
-                    ],
-                    parent=tab_graphs,
-                )
-                cb_g_bytes = _graphs_section(tr("graphs_bytes"), tr("graphs_bytes_hint"), g_bytes_default, bytes_graph)
-
-                rel_graph = MetricsLineGraph(
-                    [
+                    ]),
+                    "reliability": (tr("graphs_reliability"), tr("graphs_reliability_hint"), [
                         ("out_send", "send", "#a6e22e"),
                         ("out_retry", "retry", "#fd971f"),
                         ("in_ack", "ack in", "#66d9ef"),
-                    ],
-                    parent=tab_graphs,
-                )
-                cb_g_rel = _graphs_section(tr("graphs_reliability"), tr("graphs_reliability_hint"), g_rel_default, rel_graph)
-
-                backlog_graph = MetricsLineGraph(
-                    [
+                    ]),
+                    "backlog": (tr("graphs_backlog"), tr("graphs_backlog_hint"), [
                         ("pending_count", "pending", "#ffd75f"),
                         ("pending_peers", "peers", "#b894ff"),
-                    ],
-                    parent=tab_graphs,
-                )
-                cb_g_backlog = _graphs_section(tr("graphs_backlog"), tr("graphs_backlog_hint"), g_backlog_default, backlog_graph)
-
-                latency_graph = MetricsLineGraph(
-                    [
+                    ]),
+                    "latency": (tr("graphs_latency"), tr("graphs_latency_hint"), [
                         ("rtt_avg_s", "rtt avg", "#74b2ff"),
-                    ],
-                    parent=tab_graphs,
-                )
-                cb_g_latency = _graphs_section(tr("graphs_latency"), tr("graphs_latency_hint"), g_latency_default, latency_graph)
-
-                comp_graph = MetricsLineGraph(
-                    [
+                    ]),
+                    "compression": (tr("graphs_compression"), tr("graphs_compression_hint"), [
                         ("comp_size_pct", "size %", "#c3b38a"),
-                    ],
-                    parent=tab_graphs,
-                )
-                cb_g_comp = _graphs_section(tr("graphs_compression"), tr("graphs_compression_hint"), g_comp_default, comp_graph)
-
-                srv_graph = MetricsLineGraph(
-                    [
+                    ]),
+                    "service": (tr("graphs_service_breakdown"), tr("graphs_service_breakdown_hint"), [
                         ("out_srv_ack", "out ack", "#fd971f"),
                         ("in_srv_ack", "in ack", "#66d9ef"),
                         ("out_srv_key", "out key", "#ffd75f"),
@@ -5537,31 +5360,345 @@ def main() -> int:
                         ("in_srv_rekey", "in rekey", "#74b2ff"),
                         ("out_srv_trace", "out trace", "#c3b38a"),
                         ("in_srv_trace", "in trace", "#c3b38a"),
-                    ],
-                    parent=tab_graphs,
-                )
-                cb_g_srv = _graphs_section(tr("graphs_service_breakdown"), tr("graphs_service_breakdown_hint"), g_srv_default, srv_graph)
+                    ]),
+                }
 
-                graphs_v.addStretch(1)
+                def _default_graph_enabled(ds: str, default: bool) -> bool:
+                    try:
+                        return bool(cfg.get(f"graphs_{ds}_enabled", default))
+                    except Exception:
+                        return bool(default)
+
+                enabled_order = ("traffic", "reliability", "backlog", "latency", "bytes", "compression", "service")
+                enabled_datasets = [ds for ds in enabled_order if _default_graph_enabled(ds, ds in ("traffic", "reliability", "backlog", "latency"))]
+                if not enabled_datasets:
+                    enabled_datasets = ["traffic"]
+
+                class MultiMetricsGraph(QtWidgets.QWidget):
+                    def __init__(self, datasets: list[str], parent=None) -> None:
+                        super().__init__(parent)
+                        self._datasets = list(datasets)
+                        self._window_s = int(cfg.get("graphs_window_seconds", METRICS_GRAPH_WINDOW_SECONDS) or METRICS_GRAPH_WINDOW_SECONDS)
+                        # Compact height.
+                        self.setMinimumHeight(110)
+                        self.setMaximumHeight(130)
+                        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+                    def set_window_seconds(self, window_s: int) -> None:
+                        try:
+                            w = int(window_s)
+                        except Exception:
+                            w = int(METRICS_GRAPH_WINDOW_SECONDS)
+                        w = max(60, min(int(METRICS_RETENTION_SECONDS), int(w)))
+                        self._window_s = int(w)
+                        self.update()
+
+                    def set_datasets(self, datasets: list[str]) -> None:
+                        self._datasets = [d for d in datasets if d in graph_datasets]
+                        if not self._datasets:
+                            self._datasets = ["traffic"]
+                        self.update()
+
+                    def paintEvent(self, event) -> None:  # type: ignore[override]
+                        del event
+                        p = QtGui.QPainter(self)
+                        try:
+                            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                        except Exception:
+                            pass
+                        r = self.rect()
+                        bg = QtGui.QColor("#1b1b1b")
+                        bg.setAlpha(40)
+                        p.setBrush(bg)
+                        p.setPen(QtCore.Qt.NoPen)
+                        p.drawRoundedRect(r.adjusted(0, 0, -1, -1), 8, 8)
+
+                        rows = metrics_snapshot_rows(window_s=int(self._window_s))
+                        if not rows or r.width() < 80 or r.height() < 60:
+                            return
+                        n = len(rows)
+                        if n < 2:
+                            return
+
+                        pad_l, pad_r, pad_t, pad_b = (10, 10, 10, 10)
+                        inner = QtCore.QRect(
+                            int(r.left() + pad_l),
+                            int(r.top() + pad_t),
+                            int(max(10, r.width() - pad_l - pad_r)),
+                            int(max(10, r.height() - pad_t - pad_b)),
+                        )
+                        ds_list = list(self._datasets) if self._datasets else ["traffic"]
+                        gap = 6
+                        slot_h = int(max(10, (inner.height() - gap * (len(ds_list) - 1)) / float(max(1, len(ds_list)))))
+
+                        label_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 120))
+                        grid_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 25))
+
+                        for idx_ds, ds in enumerate(ds_list):
+                            title, _hint, series = graph_datasets.get(ds, graph_datasets["traffic"])
+                            top = inner.top() + idx_ds * (slot_h + gap)
+                            pr = QtCore.QRect(inner.left(), int(top), inner.width(), int(slot_h))
+                            # grid
+                            p.setPen(grid_pen)
+                            for j in range(1, 3):
+                                y = pr.top() + int((pr.height() * j) / 3)
+                                p.drawLine(pr.left(), y, pr.right(), y)
+                            # max Y for this subplot
+                            max_y = 1.0
+                            for _sec, row in rows:
+                                for key, _name, _color in series:
+                                    try:
+                                        v = float(row.get(key, 0.0) or 0.0)
+                                    except Exception:
+                                        v = 0.0
+                                    if v > max_y:
+                                        max_y = v
+                            max_y = max(1.0, float(max_y))
+                            # plot lines
+                            for key, _name, color in series:
+                                path = QtGui.QPainterPath()
+                                first = True
+                                for i_row, (_sec, row) in enumerate(rows):
+                                    try:
+                                        v = float(row.get(key, 0.0) or 0.0)
+                                    except Exception:
+                                        v = 0.0
+                                    x = pr.left() + (pr.width() * i_row) / float(max(1, n - 1))
+                                    y = pr.bottom() - (pr.height() * (v / max_y))
+                                    if first:
+                                        path.moveTo(float(x), float(y))
+                                        first = False
+                                    else:
+                                        path.lineTo(float(x), float(y))
+                                pen = QtGui.QPen(QtGui.QColor(color))
+                                pen.setWidthF(1.6)
+                                try:
+                                    pen.setCapStyle(QtCore.Qt.RoundCap)
+                                    pen.setJoinStyle(QtCore.Qt.RoundJoin)
+                                except Exception:
+                                    pass
+                                p.setPen(pen)
+                                p.setBrush(QtCore.Qt.NoBrush)
+                                p.drawPath(path)
+
+                graph_widget = MultiMetricsGraph(enabled_datasets, parent=tab_graphs)
+                graphs_root.addWidget(graph_widget, 1)
+
+                # Time scale selector (window).
+                window_row = QtWidgets.QWidget()
+                window_h = QtWidgets.QHBoxLayout(window_row)
+                window_h.setContentsMargins(0, 0, 0, 0)
+                window_h.setSpacing(10)
+                window_lbl = QtWidgets.QLabel(tr("graphs_window"))
+                window_lbl.setObjectName("muted")
+                window_h.addWidget(window_lbl, 0)
+                window_combo = QtWidgets.QComboBox(window_row)
+                compact_field(window_combo, width=160)
+                # Store seconds in data; show localized label.
+                if current_lang == "en":
+                    window_combo.addItem("5 min", 5 * 60)
+                    window_combo.addItem("15 min", 15 * 60)
+                    window_combo.addItem("1 hour", 60 * 60)
+                    window_combo.addItem("6 hours", 6 * 60 * 60)
+                    window_combo.addItem("24 hours", 24 * 60 * 60)
+                else:
+                    window_combo.addItem("5 мин", 5 * 60)
+                    window_combo.addItem("15 мин", 15 * 60)
+                    window_combo.addItem("1 час", 60 * 60)
+                    window_combo.addItem("6 часов", 6 * 60 * 60)
+                    window_combo.addItem("24 часа", 24 * 60 * 60)
+                try:
+                    current_w = int(cfg.get("graphs_window_seconds", METRICS_GRAPH_WINDOW_SECONDS) or METRICS_GRAPH_WINDOW_SECONDS)
+                except Exception:
+                    current_w = int(METRICS_GRAPH_WINDOW_SECONDS)
+                _widx = window_combo.findData(int(current_w))
+                window_combo.setCurrentIndex(_widx if _widx >= 0 else 1)
+                window_h.addWidget(window_combo, 0)
+                window_h.addStretch(1)
+                graphs_root.addWidget(window_row, 0)
+                window_hint = QtWidgets.QLabel(
+                    ( "Changes how much history the graph shows (stored up to 24 hours)." if current_lang == "en"
+                      else "Меняет, какой кусок истории показывает график (в памяти до 24 часов)." )
+                )
+                window_hint.setObjectName("hint")
+                window_hint.setWordWrap(True)
+                try:
+                    window_hint.setContentsMargins(2, 0, 2, 0)
+                except Exception:
+                    pass
+                graphs_root.addWidget(window_hint, 0)
+
+                def _on_window_change(_idx: int) -> None:
+                    try:
+                        w = int(window_combo.currentData() or METRICS_GRAPH_WINDOW_SECONDS)
+                    except Exception:
+                        w = int(METRICS_GRAPH_WINDOW_SECONDS)
+                    w = max(60, min(int(METRICS_RETENTION_SECONDS), int(w)))
+                    cfg["graphs_window_seconds"] = int(w)
+                    try:
+                        graph_widget.set_window_seconds(int(w))
+                    except Exception:
+                        pass
+
+                window_combo.currentIndexChanged.connect(_on_window_change)
+                _on_window_change(window_combo.currentIndex())
+
+                # Checkboxes list below (title + description under it).
+                cb_scroll = QtWidgets.QScrollArea(tab_graphs)
+                cb_scroll.setWidgetResizable(True)
+                cb_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+                cb_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+                graphs_root.addWidget(cb_scroll, 1)
+
+                cb_body = QtWidgets.QWidget()
+                cb_scroll.setWidget(cb_body)
+                cb_v = QtWidgets.QVBoxLayout(cb_body)
+                cb_v.setContentsMargins(0, 0, 0, 0)
+                cb_v.setSpacing(4)
+
+                cb_by_ds: Dict[str, QtWidgets.QCheckBox] = {}
+
+                def apply_graph_checkbox_selection() -> None:
+                    enabled = []
+                    for ds in enabled_order:
+                        cb = cb_by_ds.get(ds)
+                        if cb is not None:
+                            try:
+                                if cb.isChecked():
+                                    enabled.append(ds)
+                            except Exception:
+                                pass
+                    if not enabled:
+                        enabled = ["traffic"]
+                        try:
+                            cb_by_ds["traffic"].setChecked(True)
+                        except Exception:
+                            pass
+                    graph_widget.set_datasets(enabled)
+
+                def _series_label_for_key(key: str) -> str:
+                    # Legend labels shown under dataset checkbox.
+                    k = str(key or "").strip().lower()
+                    if current_lang == "en":
+                        labels = {
+                            "out_msg": "out msg",
+                            "in_msg": "in msg",
+                            "out_srv": "out svc",
+                            "in_srv": "in svc",
+                            "out_msg_bytes": "out msg bytes",
+                            "in_msg_bytes": "in msg bytes",
+                            "out_srv_bytes": "out svc bytes",
+                            "in_srv_bytes": "in svc bytes",
+                            "out_send": "send",
+                            "out_retry": "retry",
+                            "in_ack": "ack in",
+                            "pending_count": "pending",
+                            "pending_peers": "peers",
+                            "rtt_avg_s": "rtt avg (s)",
+                            "comp_size_pct": "size %",
+                            "out_srv_ack": "out ack",
+                            "in_srv_ack": "in ack",
+                            "out_srv_key": "out key",
+                            "in_srv_key": "in key",
+                            "out_srv_disc": "out disc",
+                            "in_srv_disc": "in disc",
+                            "out_srv_rekey": "out rekey",
+                            "in_srv_rekey": "in rekey",
+                            "out_srv_trace": "out trace",
+                            "in_srv_trace": "in trace",
+                        }
+                    else:
+                        labels = {
+                            "out_msg": "исх msg",
+                            "in_msg": "вх msg",
+                            "out_srv": "исх svc",
+                            "in_srv": "вх svc",
+                            "out_msg_bytes": "исх msg байт",
+                            "in_msg_bytes": "вх msg байт",
+                            "out_srv_bytes": "исх svc байт",
+                            "in_srv_bytes": "вх svc байт",
+                            "out_send": "отправки",
+                            "out_retry": "повторы",
+                            "in_ack": "ACK вх",
+                            "pending_count": "в очереди",
+                            "pending_peers": "пиров",
+                            "rtt_avg_s": "RTT ср (с)",
+                            "comp_size_pct": "размер %",
+                            "out_srv_ack": "исх ACK",
+                            "in_srv_ack": "вх ACK",
+                            "out_srv_key": "исх KEY",
+                            "in_srv_key": "вх KEY",
+                            "out_srv_disc": "исх DISC",
+                            "in_srv_disc": "вх DISC",
+                            "out_srv_rekey": "исх REKEY",
+                            "in_srv_rekey": "вх REKEY",
+                            "out_srv_trace": "исх TRACE",
+                            "in_srv_trace": "вх TRACE",
+                        }
+                    return str(labels.get(k, key))
+
+                def add_ds_checkbox(ds: str) -> None:
+                    title, hint, _series = graph_datasets[ds]
+                    w = QtWidgets.QWidget()
+                    v = QtWidgets.QVBoxLayout(w)
+                    v.setContentsMargins(10, 4, 10, 4)
+                    v.setSpacing(2)
+                    # Row: [checkbox title] [hint...]
+                    head = QtWidgets.QWidget(w)
+                    head_h = QtWidgets.QHBoxLayout(head)
+                    head_h.setContentsMargins(0, 0, 0, 0)
+                    head_h.setSpacing(10)
+                    cb = QtWidgets.QCheckBox(title, head)
+                    cb.setChecked(ds in enabled_datasets)
+                    head_h.addWidget(cb, 0)
+                    # Colored legend (parameter names) inline after the option title.
+                    try:
+                        series = graph_datasets[ds][2]
+                    except Exception:
+                        series = []
+                    legend = QtWidgets.QLabel(head)
+                    legend.setObjectName("hint")
+                    legend.setTextFormat(QtCore.Qt.RichText)
+                    legend.setWordWrap(True)
+                    legend.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
+                    try:
+                        legend.setMaximumWidth(360)
+                    except Exception:
+                        pass
+                    parts = []
+                    for key, _name, color in series:
+                        name = _series_label_for_key(key)
+                        parts.append(f"<span style='color:{color};font-weight:700;'>{html_escape(name)}</span>")
+                    legend.setText("  ".join(parts))
+                    head_h.addWidget(legend, 0)
+
+                    lbl = QtWidgets.QLabel(hint, head)
+                    lbl.setObjectName("hint")
+                    lbl.setWordWrap(True)
+                    lbl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+                    head_h.addWidget(lbl, 1)
+                    v.addWidget(head)
+                    cb_v.addWidget(w)
+                    cb_by_ds[ds] = cb
+                    cb.toggled.connect(lambda _on, _ds=ds: apply_graph_checkbox_selection())
+
+                # Order matches the old layout.
+                for ds in ("traffic", "reliability", "backlog", "latency", "bytes", "compression", "service"):
+                    add_ds_checkbox(ds)
+
+                cb_v.addStretch(1)
+
+                # Initialize graph to enabled datasets.
+                apply_graph_checkbox_selection()
 
                 graphs_timer = QtCore.QTimer(dlg)
                 graphs_timer.setInterval(1000)
                 def _graphs_tick() -> None:
-                    # Only repaint visible widgets (keeps Settings lightweight).
-                    for cb, w in (
-                        (cb_g_traffic, traffic_graph),
-                        (cb_g_bytes, bytes_graph),
-                        (cb_g_rel, rel_graph),
-                        (cb_g_backlog, backlog_graph),
-                        (cb_g_latency, latency_graph),
-                        (cb_g_comp, comp_graph),
-                        (cb_g_srv, srv_graph),
-                    ):
-                        try:
-                            if cb.isChecked() and w.isVisible():
-                                w.update()
-                        except Exception:
-                            pass
+                    try:
+                        if graph_widget.isVisible():
+                            graph_widget.update()
+                    except Exception:
+                        pass
                 graphs_timer.timeout.connect(_graphs_tick)
                 graphs_timer.start()
 
@@ -6059,14 +6196,19 @@ def main() -> int:
                         contacts_visibility = "all"
                     cfg["contacts_visibility"] = contacts_visibility
 
-                    # Graphs tab toggles (persisted; window is always last 15 minutes).
-                    cfg["graphs_traffic_enabled"] = _safe_is_checked(cb_g_traffic, bool(cfg.get("graphs_traffic_enabled", True)))
-                    cfg["graphs_bytes_enabled"] = _safe_is_checked(cb_g_bytes, bool(cfg.get("graphs_bytes_enabled", False)))
-                    cfg["graphs_reliability_enabled"] = _safe_is_checked(cb_g_rel, bool(cfg.get("graphs_reliability_enabled", True)))
-                    cfg["graphs_backlog_enabled"] = _safe_is_checked(cb_g_backlog, bool(cfg.get("graphs_backlog_enabled", True)))
-                    cfg["graphs_latency_enabled"] = _safe_is_checked(cb_g_latency, bool(cfg.get("graphs_latency_enabled", True)))
-                    cfg["graphs_compression_enabled"] = _safe_is_checked(cb_g_comp, bool(cfg.get("graphs_compression_enabled", False)))
-                    cfg["graphs_service_enabled"] = _safe_is_checked(cb_g_srv, bool(cfg.get("graphs_service_enabled", False)))
+                    # Graphs tab: enabled datasets + window selection.
+                    try:
+                        cfg["graphs_window_seconds"] = int(cfg.get("graphs_window_seconds", METRICS_GRAPH_WINDOW_SECONDS) or METRICS_GRAPH_WINDOW_SECONDS)
+                    except Exception:
+                        cfg["graphs_window_seconds"] = int(METRICS_GRAPH_WINDOW_SECONDS)
+                    # Store enabled toggles from the Graphs tab checkboxes.
+                    cfg["graphs_traffic_enabled"] = _safe_is_checked(cb_by_ds.get("traffic"), True)
+                    cfg["graphs_reliability_enabled"] = _safe_is_checked(cb_by_ds.get("reliability"), True)
+                    cfg["graphs_backlog_enabled"] = _safe_is_checked(cb_by_ds.get("backlog"), True)
+                    cfg["graphs_latency_enabled"] = _safe_is_checked(cb_by_ds.get("latency"), True)
+                    cfg["graphs_bytes_enabled"] = _safe_is_checked(cb_by_ds.get("bytes"), False)
+                    cfg["graphs_compression_enabled"] = _safe_is_checked(cb_by_ds.get("compression"), False)
+                    cfg["graphs_service_enabled"] = _safe_is_checked(cb_by_ds.get("service"), False)
 
                     # Theme settings
                     next_theme = str(theme_combo.currentData() or "ubuntu_style").strip().lower()
@@ -8341,7 +8483,8 @@ def main() -> int:
 
         def log_append_view(view: QtWidgets.QTextEdit, text: str, level: str) -> None:
             # Runtime log color palette (reading aid only).
-            # Keep mapping stable across OS themes; do not rely on QTextEdit inherited format.
+            # Use QTextCursor + QTextCharFormat: avoids HTML parsing differences across Qt builds
+            # and prevents "everything becomes one color" regressions when stylesheets change.
             lvl = str(level or "info").strip().lower()
             palette = {
                 "error": "#f92672",     # red
@@ -8358,13 +8501,15 @@ def main() -> int:
             }
             color = palette.get(lvl, "#e0e0e0")  # default/info
             try:
-                esc = html_escape(str(text))
+                cursor = view.textCursor()
+                cursor.movePosition(QtGui.QTextCursor.End)
+                fmt = QtGui.QTextCharFormat()
+                fmt.setForeground(QtGui.QBrush(QtGui.QColor(color)))
+                cursor.setCharFormat(fmt)
+                cursor.insertText(str(text).rstrip("\n") + "\n")
+                view.setTextCursor(cursor)
+                view.ensureCursorVisible()
             except Exception:
-                esc = str(text)
-            try:
-                view.append(f"<span style='color:{color};'>{esc}</span>")
-            except Exception:
-                # Fallback to plain text if rich append fails.
                 try:
                     view.append(str(text))
                 except Exception:
