@@ -64,10 +64,15 @@ Updated: 2026-02-12
 
 9) Contact status indicator colors
 - Bright green: meshTalk online (valid keys + recent app activity).
-- Dark green: meshTalk offline (seen by app within last 24h).
+- Dark green: meshTalk offline (seen by app before; fades during the first 24h).
 - Yellow: Meshtastic-only online.
-- Dark yellow: Meshtastic-only offline (seen within last 24h).
-- No indicator: no presence seen for >24h.
+- Dark yellow: Meshtastic-only offline (fades during the first 24h).
+- No indicator: no Meshtastic device presence seen for >24h.
+
+Note:
+- If meshTalk has not seen app activity from a contact for more than 24 hours, the indicator falls back to
+  Meshtastic device presence (yellow/dark yellow) and sending switches to plain Meshtastic text until the
+  contact returns to meshTalk.
 
 10) Key exchange and security basics
 - Key exchange frames: `KR1` / `KR2`.

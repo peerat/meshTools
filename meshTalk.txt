@@ -71,10 +71,10 @@ Contacts context menu
 
 Contact list indicators
 - Bright green: meshTalk online (keys valid, recent app activity).
-- Dark green: meshTalk offline (seen by app in last 24h).
+- Dark green: meshTalk offline (seen by app before; fades during the first 24h).
 - Yellow: Meshtastic-only online.
-- Dark yellow: Meshtastic-only offline (seen in last 24h).
-- Hidden indicator: no presence for >24h.
+- Dark yellow: Meshtastic-only offline (fades during the first 24h).
+- Hidden indicator: no Meshtastic device presence for >24h.
 - On app close, client sends offline broadcast (`KOF1|...`), so peers can switch presence/routing immediately.
 
 Settings
@@ -97,7 +97,9 @@ Settings
 Auto key refresh
 - Periodic key request roughly hourly (+ jitter).
 - Auto key request on decrypt failures.
-- Lock indicator removed if key is stale for over 24 hours.
+- Contact status indicator fades towards offline during the first 24 hours without activity.
+- If meshTalk has not seen app activity from a contact for >24h, routing falls back to plain Meshtastic text
+  until the contact returns to meshTalk.
 
 Cryptography (where/when)
 - This project uses cryptographic primitives for payload sealing and local at-rest sealing.
@@ -271,7 +273,7 @@ RU
 - Обычный Meshtastic-канал, исходящее:
   `отправлено в 10:19`
 - Обычный Meshtastic-канал, входящее:
-  `пришло в 10:20`
+  `пришло 10:20`
 
 Контекстное меню контакта
 - Pin/Unpin
@@ -283,10 +285,10 @@ RU
 
 Индикаторы в списке контактов
 - Ярко-зеленый: meshTalk online (ключи валидны, есть недавняя активность приложения).
-- Темно-зеленый: meshTalk offline (приложение было видно в пределах 24ч).
+- Темно-зеленый: meshTalk offline (приложение было видно раньше; затухает первые 24ч).
 - Желтый: только Meshtastic online.
-- Темно-желтый: только Meshtastic offline (устройство было видно в пределах 24ч).
-- Без индикатора: отсутствует присутствие более 24ч.
+- Темно-желтый: только Meshtastic offline (затухает первые 24ч).
+- Без индикатора: отсутствует присутствие устройства (Meshtastic) более 24ч.
 - При закрытии приложения отправляется offline-broadcast (`KOF1|...`), чтобы пиры сразу гасили app-online состояние и переключали роутинг.
 
 Настройки

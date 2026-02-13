@@ -19,6 +19,9 @@ config.json
 state.json
 history.log
 incoming.json
+startup_crash.log
+core
+core.*
 [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/
 
 # Local archives and temp

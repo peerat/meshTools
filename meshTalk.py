@@ -25,6 +25,7 @@ import colorsys
 import re
 import random
 import struct
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 from meshtastic.serial_interface import SerialInterface
@@ -102,6 +103,15 @@ MSG_V2_HEADER_LEN = 16  # prefix(2) + ts(4) + group(4) + part(2) + total(2) + at
 MAX_PENDING_PER_PEER = 128
 RETRY_BACKOFF_MAX_SECONDS = 300.0
 RETRY_JITTER_RATIO = 0.25
+# Message resend policy aims to minimize RF noise:
+# - active phase for the first N minutes (more eager retries, capped),
+# - then muted phase: probe once per interval, in a short active window, then sleep again,
+# - if peer becomes responsive (ACK/inbound traffic), switch back to active immediately.
+MSG_RETRY_ACTIVE_WINDOW_SECONDS = 300.0  # 5 minutes
+# Legacy fixed muted/probe timings (kept as defaults/backward compat; UI exposes adaptive knobs).
+MSG_RETRY_MUTED_INTERVAL_SECONDS = 3600.0  # muted: wake up once per hour
+MSG_RETRY_PROBE_WINDOW_SECONDS = 300.0  # muted: stay active for 5 minutes after wakeup
+PEER_RESPONSIVE_GRACE_SECONDS = 180.0  # peer considered responsive if any activity within this window
 KEY_RESPONSE_MIN_INTERVAL_SECONDS = 300.0
 KEY_RESPONSE_RETRY_INTERVAL_SECONDS = 5.0
 REKEY_CTRL_PREFIX1 = b"RK1"
@@ -1271,6 +1281,7 @@ def main() -> int:
                 portNum=DEFAULT_PORTNUM,
                 channelIndex=(args.channel if args.channel is not None else 0),
             )
+            activity_record("out", "srv", 1, bytes_count=len(payload), subkind="rekey")
             last_activity_ts = time.time()
             ui_emit("log", f"{ts_local()} KEY: rekey {label} -> {peer_norm} wire=MT-WIREv1 aes-256-gcm")
             return True
@@ -1347,6 +1358,7 @@ def main() -> int:
             if not text_plain:
                 ui_emit("log", f"{ts_local()} RECVSTD: empty text payload from {peer_norm_text}")
                 return
+            activity_record("in", "msg", 1)
             packet_id = packet.get("id")
             if isinstance(packet_id, int):
                 std_msg_id = f"mtxt:{int(packet_id) & 0xFFFFFFFF:08x}"
@@ -1411,6 +1423,7 @@ def main() -> int:
         # Key exchange frames are plaintext
         key_frame = parse_key_frame(payload)
         if key_frame:
+            activity_record("in", "srv", 1, bytes_count=len(payload), subkind="key")
             kind, peer_id, pub_raw, peer_modes, peer_caps, peer_wire, peer_msg, peer_mc = key_frame
             from_id_raw = packet.get("fromId")
             to_id = packet.get("toId") or packet.get("to")
@@ -1622,6 +1635,7 @@ def main() -> int:
                             portNum=DEFAULT_PORTNUM,
                             channelIndex=(args.channel if args.channel is not None else 0),
                         )
+                        activity_record("out", "srv", 1, now=now)
                         key_response_last_ts[peer_norm] = now
                     ui_emit(
                         "log",
@@ -1769,6 +1783,8 @@ def main() -> int:
 
         if msg_type == TYPE_ACK:
             now = time.time()
+            activity_record("in", "srv", 1, now=now, subkind="ack")
+            metrics_inc("in_ack", 1.0, now=now)
             ack_forward_hops: Optional[int] = None
             if pt:
                 try:
@@ -1822,6 +1838,10 @@ def main() -> int:
                     f"{ts_local()} ACK: {msg_hex} rtt={rtt:.2f}s avg={st.rtt_avg:.2f}s attempts={attempts} wire=MT-WIREv1 aes-256-gcm",
                 )
                 try:
+                    st.last_ack_ts = float(now)
+                except Exception:
+                    pass
+                try:
                     pacer.observe_ack(rtt_s=rtt, attempts=int(attempts or 1), now=now)
                 except Exception:
                     pass
@@ -1864,6 +1884,7 @@ def main() -> int:
                                 portNum=DEFAULT_PORTNUM,
                                 channelIndex=(args.channel if args.channel is not None else 0),
                             )
+                            activity_record("out", "srv", 1, bytes_count=len(ack_payload), subkind="ack")
                         except Exception:
                             ui_emit("radio_lost", None)
                             return
@@ -1876,6 +1897,7 @@ def main() -> int:
             except Exception:
                 raw_pt = b""
             if raw_pt.startswith(REKEY_CTRL_PREFIX1) and len(raw_pt) == (3 + 4 + 32) and peer_norm and from_id:
+                activity_record("in", "srv", 1, subkind="rekey")
                 rid = raw_pt[3:7]
                 peer_epub_raw = raw_pt[7:39]
                 # If we already computed a candidate for this rid, just re-send RK2 (idempotent).
@@ -1916,11 +1938,13 @@ def main() -> int:
                         portNum=DEFAULT_PORTNUM,
                         channelIndex=(args.channel if args.channel is not None else 0),
                     )
+                    activity_record("out", "srv", 1, bytes_count=len(ack_payload), subkind="ack")
                 except Exception:
                     ui_emit("radio_lost", None)
                 return
 
             if raw_pt.startswith(REKEY_CTRL_PREFIX2) and len(raw_pt) == (3 + 4 + 32) and peer_norm and from_id:
+                activity_record("in", "srv", 1, subkind="rekey")
                 rid = raw_pt[3:7]
                 peer_repub_raw = raw_pt[7:39]
                 if bool(getattr(st, "rekey_inflight", False)) and st.rekey_id == rid and st.rekey_priv is not None:
@@ -1960,11 +1984,13 @@ def main() -> int:
                         portNum=DEFAULT_PORTNUM,
                         channelIndex=(args.channel if args.channel is not None else 0),
                     )
+                    activity_record("out", "srv", 1, bytes_count=len(ack_payload), subkind="ack")
                 except Exception:
                     ui_emit("radio_lost", None)
                 return
 
             if raw_pt.startswith(REKEY_CTRL_PREFIX3) and len(raw_pt) == (3 + 4) and peer_norm and from_id:
+                activity_record("in", "srv", 1, subkind="rekey")
                 rid = raw_pt[3:7]
                 # Switch to candidate key if it matches.
                 if st.rekey_candidate_aes is not None and st.rekey_candidate_id == rid:
@@ -1994,9 +2020,13 @@ def main() -> int:
                         portNum=DEFAULT_PORTNUM,
                         channelIndex=(args.channel if args.channel is not None else 0),
                     )
+                    activity_record("out", "srv", 1, bytes_count=len(ack_payload), subkind="ack")
                 except Exception:
                     ui_emit("radio_lost", None)
                 return
+
+            # Regular incoming user data message.
+            activity_record("in", "msg", 1)
 
             delivery = None
             group_id = None
@@ -2096,6 +2126,7 @@ def main() -> int:
                                     portNum=DEFAULT_PORTNUM,
                                     channelIndex=(args.channel if args.channel is not None else 0),
                                 )
+                                activity_record("out", "srv", 1, bytes_count=len(ack_payload), subkind="ack")
                             except Exception:
                                 ui_emit("radio_lost", None)
                             return
@@ -2165,6 +2196,7 @@ def main() -> int:
                         portNum=DEFAULT_PORTNUM,
                         channelIndex=(args.channel if args.channel is not None else 0),
                     )
+                    activity_record("out", "srv", 1, bytes_count=len(ack_payload), subkind="ack")
                 except Exception:
                     ui_emit("radio_lost", None)
                     return
@@ -2292,6 +2324,7 @@ def main() -> int:
         except Exception:
             ui_emit("radio_lost", None)
             return
+        activity_record("out", "srv", 1, now=now, bytes_count=len(req), subkind="key")
         last_activity_ts = now
         last_key_sent_ts = last_activity_ts
         if st:
@@ -2337,6 +2370,7 @@ def main() -> int:
                 portNum=DEFAULT_PORTNUM,
                 channelIndex=(args.channel if args.channel is not None else 0),
             )
+            activity_record("out", "srv", 1, bytes_count=len(req), subkind="disc")
             ui_emit("log", f"{ts_local()} DISCOVERY: broadcast")
         except Exception:
             ui_emit("radio_lost", None)
@@ -2354,6 +2388,7 @@ def main() -> int:
                 portNum=DEFAULT_PORTNUM,
                 channelIndex=(args.channel if args.channel is not None else 0),
             )
+            activity_record("out", "srv", 1, bytes_count=len(payload), subkind="offline")
             ui_emit("log", f"{ts_local()} PRESENCE: app offline broadcast")
         except Exception:
             pass
@@ -2370,11 +2405,149 @@ def main() -> int:
 
     def retry_delay_seconds(base: float, attempts_next: int) -> float:
         # Exponential backoff with jitter to reduce synchronized retries.
+        def _cfg_float(key: str, default: float) -> float:
+            try:
+                v = float(cfg.get(key, default))
+                if not math.isfinite(v):
+                    return float(default)
+                return float(v)
+            except Exception:
+                return float(default)
+
         step = max(1, int(attempts_next) - 1)
         raw = max(1.0, float(base)) * (2.0 ** step)
-        capped = min(float(RETRY_BACKOFF_MAX_SECONDS), raw)
-        jitter = capped * float(RETRY_JITTER_RATIO) * random.uniform(-1.0, 1.0)
+        cap_s = max(1.0, _cfg_float("activity_retry_backoff_max_seconds", float(RETRY_BACKOFF_MAX_SECONDS)))
+        jitter_ratio = max(0.0, min(1.0, _cfg_float("activity_retry_jitter_ratio", float(RETRY_JITTER_RATIO))))
+        capped = min(float(cap_s), raw)
+        jitter = capped * float(jitter_ratio) * random.uniform(-1.0, 1.0)
         return max(1.0, capped + jitter)
+
+    def peer_is_responsive(st: object, now: float) -> bool:
+        # Peer is "responsive" if we saw any meshTalk activity recently:
+        # - ACK for any packet, or
+        # - inbound meshTalk packets (last_seen_ts is updated on receive).
+        try:
+            last_ack = float(getattr(st, "last_ack_ts", 0.0) or 0.0)
+        except Exception:
+            last_ack = 0.0
+        try:
+            last_seen = float(getattr(st, "last_seen_ts", 0.0) or 0.0)
+        except Exception:
+            last_seen = 0.0
+        try:
+            grace = float(cfg.get("activity_peer_responsive_grace_seconds", float(PEER_RESPONSIVE_GRACE_SECONDS)))
+        except Exception:
+            grace = float(PEER_RESPONSIVE_GRACE_SECONDS)
+        grace = max(1.0, float(grace))
+        if last_ack > 0.0 and (now - last_ack) <= grace:
+            return True
+        if last_seen > 0.0 and (now - last_seen) <= grace:
+            return True
+        return False
+
+    def peer_last_activity_ts(st: object) -> float:
+        # Best-effort "is peer alive" signal (meshTalk only).
+        # Used to reduce retries when peer appears offline.
+        try:
+            la = float(getattr(st, "last_ack_ts", 0.0) or 0.0)
+        except Exception:
+            la = 0.0
+        try:
+            ls = float(getattr(st, "last_seen_ts", 0.0) or 0.0)
+        except Exception:
+            ls = 0.0
+        return float(max(la, ls, 0.0))
+
+    def schedule_next_retry_for_record(rec: dict, st: object, now: float, base_active_s: float, attempts_next: int) -> float:
+        # Resend policy per pending record:
+        # - Active window for the first N minutes.
+        # - Then muted mode: wake up periodically and retry in a short active probe window,
+        #   otherwise sleep to reduce RF noise.
+        created = float(rec.get("created", now) or now)
+        elapsed = max(0.0, now - created)
+        phase = str(rec.get("retry_phase", "active") or "active").strip().lower()
+        responsive = peer_is_responsive(st, now)
+
+        def _cfg_float(key: str, default: float) -> float:
+            try:
+                v = float(cfg.get(key, default))
+                if not math.isfinite(v):
+                    return float(default)
+                return float(v)
+            except Exception:
+                return float(default)
+
+        active_window_s = max(1.0, _cfg_float("activity_active_window_seconds", float(MSG_RETRY_ACTIVE_WINDOW_SECONDS)))
+
+        # Adaptive probe scheduling (logarithmic calm-down).
+        # Only a few knobs are exposed in UI: min/max probe interval and max probe window.
+        min_probe_s = max(60.0, _cfg_float("activity_probe_interval_min_seconds", float(10 * 60)))
+        max_probe_s = max(min_probe_s, _cfg_float("activity_probe_interval_max_seconds", float(MSG_RETRY_MUTED_INTERVAL_SECONDS)))
+        probe_window_max_s = max(10.0, _cfg_float("activity_probe_window_max_seconds", float(MSG_RETRY_PROBE_WINDOW_SECONDS)))
+
+        # Time since last peer activity (ACK/inbound). If never seen, use age of the record.
+        last_act = peer_last_activity_ts(st)
+        t_no_act = (now - last_act) if last_act > 0.0 else elapsed
+        t_no_act = max(0.0, float(t_no_act))
+
+        # Map "time without activity" -> probe interval using a log curve that saturates at max_probe_s.
+        tau = max(60.0, float(active_window_s))
+        # We shape the curve to reach close to max over ~24h by default.
+        t_span = max(3600.0, float(cfg.get("activity_span_seconds", 86400.0) or 86400.0))
+        denom = max(1e-6, math.log1p(t_span / tau))
+        k = (max_probe_s - min_probe_s) / denom
+        probe_interval_s = min_probe_s + k * math.log1p(t_no_act / tau)
+        probe_interval_s = max(min_probe_s, min(max_probe_s, float(probe_interval_s)))
+
+        # Probe window also shrinks over time (less chatter when peer stays silent).
+        # Start with probe_window_max_s and gradually reduce towards ~30s.
+        w_min = 30.0
+        a = 3.0 / denom  # ~4x reduction by t_span
+        probe_window_s = float(probe_window_max_s) / (1.0 + a * math.log1p(t_no_act / tau))
+        probe_window_s = max(w_min, min(float(probe_window_max_s), float(probe_window_s)))
+
+        # Active for the first N minutes, or if peer is responsive.
+        if elapsed <= float(active_window_s) or responsive:
+            if phase != "active":
+                rec["retry_phase"] = "active"
+                rec["retry_phase_attempts"] = 0
+            # Clear muted/probe bookkeeping when we are actively exchanging traffic.
+            rec.pop("probe_until_ts", None)
+            rec.pop("next_probe_ts", None)
+            rec.pop("probe_attempts", None)
+            return retry_delay_seconds(float(base_active_s), attempts_next)
+
+        # Muted phase (adaptive probe windows).
+        if phase != "muted":
+            rec["retry_phase"] = "muted"
+            rec["retry_phase_attempts"] = 0
+            rec["probe_until_ts"] = 0.0
+            rec["probe_attempts"] = 0
+            # First muted probe happens after one interval since last send.
+            rec["next_probe_ts"] = now + float(probe_interval_s)
+
+        probe_until = float(rec.get("probe_until_ts", 0.0) or 0.0)
+        next_probe = float(rec.get("next_probe_ts", 0.0) or 0.0)
+
+        # Start a new probe window if it's time.
+        if (probe_until <= 0.0 or now >= probe_until) and (next_probe > 0.0 and now >= next_probe):
+            rec["probe_until_ts"] = now + float(probe_window_s)
+            rec["next_probe_ts"] = now + float(probe_interval_s)
+            rec["probe_attempts"] = 0
+            probe_until = float(rec.get("probe_until_ts", 0.0) or 0.0)
+
+        # During probe window, use active backoff but against probe_attempts (stable across long waits).
+        if probe_until > 0.0 and now < probe_until:
+            probe_attempts_next = int(rec.get("probe_attempts", 0) or 0) + 1
+            rec["probe_attempts"] = probe_attempts_next
+            return retry_delay_seconds(float(base_active_s), int(probe_attempts_next))
+
+        # Outside probe window: sleep until next probe.
+        if next_probe <= 0.0:
+            # Defensive fallback: schedule one hour from now.
+            next_probe = now + float(probe_interval_s)
+            rec["next_probe_ts"] = next_probe
+        return max(1.0, float(next_probe - now))
 
     def compression_efficiency_pct(plain_size: int, packed_size: int) -> Optional[float]:
         try:
@@ -2408,6 +2581,120 @@ def main() -> int:
             "lzma": "LZMA",
         }
         return aliases.get(low, name)
+
+    # -------------------
+    # Metrics for graphs (15 minutes window)
+    # -------------------
+    METRICS_GRAPH_WINDOW_SECONDS = 15 * 60  # 15 minutes
+    _metrics_lock = threading.Lock()
+    _metrics_series = deque()  # list of (sec:int, row:dict[str, float])
+
+    def _metrics_row_for_sec(sec: int) -> Dict[str, float]:
+        if _metrics_series and int(_metrics_series[-1][0]) == int(sec):
+            return _metrics_series[-1][1]
+        row: Dict[str, float] = {}
+        _metrics_series.append((int(sec), row))
+        return row
+
+    def metrics_inc(key: str, delta: float = 1.0, now: Optional[float] = None) -> None:
+        try:
+            sec = int(time.time() if now is None else float(now))
+        except Exception:
+            sec = int(time.time())
+        k = str(key or "").strip()
+        if not k:
+            return
+        try:
+            d = float(delta)
+        except Exception:
+            d = 1.0
+        with _metrics_lock:
+            row = _metrics_row_for_sec(sec)
+            row[k] = float(row.get(k, 0.0) or 0.0) + float(d)
+            cutoff = int(sec) - int(METRICS_GRAPH_WINDOW_SECONDS) - 5
+            while _metrics_series and int(_metrics_series[0][0]) < cutoff:
+                _metrics_series.popleft()
+
+    def metrics_set(key: str, value: float, now: Optional[float] = None) -> None:
+        try:
+            sec = int(time.time() if now is None else float(now))
+        except Exception:
+            sec = int(time.time())
+        k = str(key or "").strip()
+        if not k:
+            return
+        try:
+            v = float(value)
+        except Exception:
+            return
+        with _metrics_lock:
+            row = _metrics_row_for_sec(sec)
+            row[k] = float(v)
+            cutoff = int(sec) - int(METRICS_GRAPH_WINDOW_SECONDS) - 5
+            while _metrics_series and int(_metrics_series[0][0]) < cutoff:
+                _metrics_series.popleft()
+
+    def metrics_snapshot_rows(window_s: int = METRICS_GRAPH_WINDOW_SECONDS) -> list[Tuple[int, Dict[str, float]]]:
+        try:
+            window_s = max(60, int(window_s))
+        except Exception:
+            window_s = int(METRICS_GRAPH_WINDOW_SECONDS)
+        now_sec = int(time.time())
+        start = now_sec - window_s + 1
+        with _metrics_lock:
+            rows = list(_metrics_series)
+        by_sec = {int(s): dict(r) for (s, r) in rows}
+        out: list[Tuple[int, Dict[str, float]]] = []
+        for sec in range(int(start), int(now_sec) + 1):
+            out.append((int(sec), by_sec.get(int(sec), {})))
+        return out
+
+    def activity_record(
+        direction: str,
+        kind: str,
+        n: int = 1,
+        now: Optional[float] = None,
+        bytes_count: int = 0,
+        subkind: Optional[str] = None,
+    ) -> None:
+        # direction: "out"|"in"
+        # kind: "msg"|"srv"
+        d = "out" if str(direction) == "out" else "in"
+        k = "srv" if str(kind) == "srv" else "msg"
+        try:
+            inc = max(0, int(n))
+        except Exception:
+            inc = 1
+        metrics_inc(f"{d}_{k}", float(inc), now=now)
+        # bytes proxy (helps estimate airtime/noise)
+        try:
+            b = max(0, int(bytes_count))
+        except Exception:
+            b = 0
+        if b:
+            metrics_inc(f"{d}_{k}_bytes", float(b), now=now)
+        # service breakdown (optional)
+        if k == "srv" and subkind:
+            sk = re.sub(r"[^a-z0-9_]+", "_", str(subkind).strip().lower())
+            if sk:
+                metrics_inc(f"{d}_srv_{sk}", float(inc), now=now)
+
+    def metrics_get_last_value(key: str, default: float = 0.0, window_s: int = METRICS_GRAPH_WINDOW_SECONDS) -> float:
+        try:
+            k = str(key or "").strip()
+        except Exception:
+            k = ""
+        if not k:
+            return float(default)
+        try:
+            rows = metrics_snapshot_rows(window_s=int(window_s))
+            if not rows:
+                return float(default)
+            last = rows[-1][1] or {}
+            v = last.get(k, default)
+            return float(v) if v is not None else float(default)
+        except Exception:
+            return float(default)
 
     def queue_message(peer_norm: str, text: str) -> Optional[tuple[str, int, Optional[str], Optional[float], Optional[str]]]:
         nonlocal last_activity_ts
@@ -2568,6 +2855,11 @@ def main() -> int:
                     "attempts": 0,
                     "last_send": 0.0,
                     "next_retry_at": 0.0,
+                    "retry_phase": "active",
+                    "retry_phase_attempts": 0,
+                    "next_probe_ts": 0.0,
+                    "probe_until_ts": 0.0,
+                    "probe_attempts": 0,
                     "peer": peer_norm,
                 }
                 if use_compact_wire:
@@ -2791,13 +3083,20 @@ def main() -> int:
                 except Exception:
                     ui_emit("radio_lost", None)
                     return
+                activity_record("out", "msg", 1, now=now, bytes_count=len(payload))
+                metrics_inc("out_send", 1.0, now=now)
+                if int(attempts_next) > 1:
+                    metrics_inc("out_retry", 1.0, now=now)
                 try:
                     st.rekey_sent_msgs = int(getattr(st, "rekey_sent_msgs", 0) or 0) + 1
                 except Exception:
                     pass
                 rec["attempts"] = attempts_next
                 rec["last_send"] = now
-                rec["next_retry_at"] = now + retry_delay_seconds(float(args.retry_seconds), attempts_next)
+                # Two-phase resend policy: active first 10 minutes, then passive (low duty),
+                # and re-activate if peer shows activity (ACK/inbound traffic).
+                delay_s = schedule_next_retry_for_record(rec, st, now, float(args.retry_seconds), int(attempts_next))
+                rec["next_retry_at"] = now + float(delay_s)
                 with pending_lock:
                     pending_by_peer.setdefault(peer_norm, {})[rec["id"]] = rec
                     save_state(pending_by_peer)
@@ -2833,9 +3132,41 @@ def main() -> int:
         last_names_refresh_ts = 0.0
         last_rekey_tick_ts = 0.0
         last_compstats_ts = 0.0
+        last_metrics_gauges_ts = 0.0
         while True:
             send_due()
             now = time.time()
+            # Gauge metrics for the Graphs tab (best-effort; not performance-critical).
+            if (now - last_metrics_gauges_ts) >= 1.0:
+                last_metrics_gauges_ts = now
+                try:
+                    with pending_lock:
+                        pending_count = sum(len(v) for v in pending_by_peer.values())
+                        pending_peers = sum(1 for v in pending_by_peer.values() if v)
+                    metrics_set("pending_count", float(pending_count), now=now)
+                    metrics_set("pending_peers", float(pending_peers), now=now)
+                except Exception:
+                    pass
+                try:
+                    rtts: list[float] = []
+                    for st in list(peer_states.values()):
+                        try:
+                            r = float(getattr(st, "avg_rtt", 0.0) or 0.0)
+                        except Exception:
+                            r = 0.0
+                        if r > 0.0 and math.isfinite(r):
+                            rtts.append(r)
+                    avg_rtt_s = (sum(rtts) / len(rtts)) if rtts else 0.0
+                    metrics_set("rtt_avg_s", float(avg_rtt_s), now=now)
+                except Exception:
+                    pass
+                try:
+                    plain = float(int(comp_stats.get("plain_bytes_total", 0) or 0))
+                    packed = float(int(comp_stats.get("packed_bytes_total", 0) or 0))
+                    if plain > 0.0 and packed >= 0.0:
+                        metrics_set("comp_size_pct", float((packed / plain) * 100.0), now=now)
+                except Exception:
+                    pass
             if radio_ready and interface is not None and (now - last_names_refresh_ts) >= 60.0:
                 last_names_refresh_ts = now
                 update_peer_names_from_nodes()
@@ -3087,6 +3418,8 @@ def main() -> int:
                 "tab_theme": "Themes",
                 "tab_log": "Log",
                 "tab_about": "About",
+                "tab_activity": "Activity",
+                "tab_graphs": "Graphs",
                 "language": "Language",
                 "lang_ru": "Russian",
                 "lang_en": "English",
@@ -3130,18 +3463,56 @@ def main() -> int:
                 "port": "Port",
                 "channel": "Channel",
                 "retry": "Retry seconds",
-                "max_seconds": "Max seconds",
+                "max_days": "Max wait, days",
                 "max_bytes": "Max bytes",
                 "rate": "Rate seconds",
                 "parallel_sends": "Parallel packets",
                 "auto_pacing": "Auto pacing",
                 "hint_port": "Serial port path or 'auto' to scan USB ports.",
                 "hint_retry": "Base retry interval used for resend/backoff.",
-                "hint_max_seconds": "Drop a pending packet after this many seconds without ACK.",
+                "hint_max_days": "Stop retrying after this many days without ACK (low-noise backoff applies).",
                 "hint_max_bytes": "Max Meshtastic payload bytes per packet (includes encryption overhead).",
                 "hint_rate": "Minimum delay between send windows (used when Auto pacing is off).",
                 "hint_parallel": "How many packets can be sent per send window.",
                 "hint_auto_pacing": "Auto tunes rate/parallel based on recent ACK stats.",
+                "activity_title": "Activity / resend policy",
+                "activity_profile": "Profile",
+                "activity_profile_low": "Low noise (Recommended)",
+                "activity_profile_bal": "Balanced",
+                "activity_profile_fast": "Fast delivery",
+                "activity_aggr": "Aggressiveness",
+                "hint_activity_profile": "Pick a preset tuned for low RF noise. Aggressiveness adjusts retry intensity inside the preset.",
+                "hint_activity_aggr": "Higher values retry more often and keep longer probe windows (more traffic). Lower values calm down sooner (less traffic).",
+                "activity_active_window_min": "Active window, min",
+                "activity_probe_min_interval_min": "Probe interval (min), min",
+                "activity_probe_max_interval_min": "Probe interval (max), min",
+                "activity_probe_window_max_min": "Probe window (max), min",
+                "activity_peer_grace_s": "Peer responsive grace, s",
+                "activity_backoff_cap_s": "Retry backoff cap, s",
+                "activity_jitter_pct": "Retry jitter, %",
+                "hint_activity_active_window_min": "For the first N minutes after queueing, retries are more active. After that, muted mode probes periodically.",
+                "hint_activity_probe_min_interval_min": "Shortest time between probe windows after recent silence. Larger values reduce traffic but may increase delivery latency.",
+                "hint_activity_probe_max_interval_min": "Longest time between probe windows for long silence. This is the main 'low-noise' limiter.",
+                "hint_activity_probe_window_max_min": "Max duration of active retries during a probe. Over time, the window shrinks automatically to reduce RF noise.",
+                "hint_activity_peer_grace_s": "If any ACK/inbound traffic is seen within this time, peer is treated as responsive and active mode resumes.",
+                "hint_activity_backoff_cap_s": "Max delay between retries inside active/probe windows.",
+                "hint_activity_jitter_pct": "Randomizes retry timing to avoid synchronized bursts (percent of delay).",
+                "activity_methodology": "Methodology (goal: low RF noise)\n\nmeshTalk uses a calm-down controller. When a peer is responsive (ACK or inbound traffic), retries are active for a short window. When the peer is silent, meshTalk reduces attempts: it sleeps and only wakes up for short probe windows. The probe interval grows logarithmically with time without confirmations, and probe windows shrink over time.\n\nThis keeps the network stable and reduces parasitic traffic while still allowing best-effort delivery over long periods.",
+                "graphs_title": "Graphs (last 15 minutes)",
+                "graphs_traffic": "Traffic (messages vs service)",
+                "graphs_traffic_hint": "Counts per second: outgoing/incoming messages, outgoing/incoming service packets.",
+                "graphs_bytes": "Bytes (proxy for airtime)",
+                "graphs_bytes_hint": "Bytes per second (best-effort): helps estimate RF airtime/noise.",
+                "graphs_reliability": "Reliability (send/retry/ack)",
+                "graphs_reliability_hint": "Per-second counters: meshTalk sends, retries, and received ACKs.",
+                "graphs_backlog": "Backlog (pending queue)",
+                "graphs_backlog_hint": "Gauge: pending packets in queue and number of peers with pending traffic.",
+                "graphs_latency": "Latency (RTT avg)",
+                "graphs_latency_hint": "Gauge: average RTT from ACKs across peers (seconds).",
+                "graphs_compression": "Compression (size %)",
+                "graphs_compression_hint": "Gauge: packed size as % of original (lower is better).",
+                "graphs_service_breakdown": "Service breakdown (ACK/KEY/DISC/REKEY/TRACE)",
+                "graphs_service_breakdown_hint": "Counts per second split by service type (best-effort).",
                 "discovery": "Discovery",
                 "discovery_send": "Send broadcast discovery",
                 "discovery_reply": "Reply to broadcast discovery",
@@ -3250,6 +3621,8 @@ def main() -> int:
                 "tab_theme": "Темы",
                 "tab_log": "Лог",
                 "tab_about": "О программе",
+                "tab_activity": "Активность",
+                "tab_graphs": "Графики",
                 "language": "Язык",
                 "lang_ru": "Русский",
                 "lang_en": "Английский",
@@ -3293,18 +3666,56 @@ def main() -> int:
                 "port": "Порт",
                 "channel": "Канал",
                 "retry": "Повтор, сек",
-                "max_seconds": "Макс ожидание, сек",
+                "max_days": "Макс ожидание, дни",
                 "max_bytes": "Макс байт",
                 "rate": "Мин интервал, сек",
                 "parallel_sends": "Параллельно, пакетов",
                 "auto_pacing": "Автоподбор скорости",
                 "hint_port": "Серийный порт или 'auto' для поиска по USB.",
                 "hint_retry": "Базовый интервал повторов (resend/backoff).",
-                "hint_max_seconds": "Сбросить пакет из очереди после этого времени без ACK.",
+                "hint_max_days": "Перестать пытаться после этого времени без ACK (с щадящим backoff, чтобы не шуметь).",
                 "hint_max_bytes": "Макс. размер payload Meshtastic на пакет (включая оверхед шифрования).",
                 "hint_rate": "Минимальная пауза между окнами отправки (когда автоподбор выключен).",
                 "hint_parallel": "Сколько пакетов можно отправить подряд в одном окне.",
                 "hint_auto_pacing": "Автоподбор rate/параллельности по статистике ACK.",
+                "activity_title": "Активность / политика повторов",
+                "activity_profile": "Профиль",
+                "activity_profile_low": "Тихий эфир (рекомендуется)",
+                "activity_profile_bal": "Сбалансированный",
+                "activity_profile_fast": "Быстрая доставка",
+                "activity_aggr": "Агрессивность",
+                "hint_activity_profile": "Готовые профили, настроенные на низкий шум в эфире. Агрессивность подстраивает интенсивность внутри профиля.",
+                "hint_activity_aggr": "Больше значение: чаще повторы и длиннее окна проб (больше трафика). Меньше: быстрее успокаивается (меньше трафика).",
+                "activity_active_window_min": "Активно, мин",
+                "activity_probe_min_interval_min": "Проба (мин), мин",
+                "activity_probe_max_interval_min": "Проба (макс), мин",
+                "activity_probe_window_max_min": "Окно проб (макс), мин",
+                "activity_peer_grace_s": "Окно активности пира, сек",
+                "activity_backoff_cap_s": "Потолок backoff, сек",
+                "activity_jitter_pct": "Jitter, %",
+                "hint_activity_active_window_min": "Первые N минут после постановки в очередь повторы идут активнее. Дальше включается приглушенный режим с периодическими окнами попыток.",
+                "hint_activity_probe_min_interval_min": "Минимальный интервал между окнами проб после недавней тишины. Больше значение снижает трафик, но может увеличить задержку доставки.",
+                "hint_activity_probe_max_interval_min": "Максимальный интервал между окнами проб при длительной тишине. Это главный ограничитель «не шуметь».",
+                "hint_activity_probe_window_max_min": "Максимальная длительность активных попыток в окне проб. Со временем окно автоматически уменьшается, чтобы меньше шуметь.",
+                "hint_activity_peer_grace_s": "Если за это время был ACK или входящий трафик, пир считается активным и режим становится активным.",
+                "hint_activity_backoff_cap_s": "Максимальная задержка между попытками внутри активного/пробного окна.",
+                "hint_activity_jitter_pct": "Случайная разбежка времени повторов (процент от задержки), чтобы не было синхронных всплесков.",
+                "activity_methodology": "Методология (цель: низкий шум в эфире)\n\nmeshTalk использует контроллер «успокоения». Когда пир отвечает (ACK или входящий трафик), повторы идут активно короткое время. Когда пир молчит, meshTalk снижает активность: «спит» и просыпается только на короткие окна проб. Интервал между окнами растет логарифмически по мере отсутствия подтверждений, а сами окна проб со временем уменьшаются.\n\nТак сеть работает стабильнее и уменьшается паразитный трафик, но при этом сохраняется best-effort доставка на длинных интервалах.",
+                "graphs_title": "Графики (последние 15 минут)",
+                "graphs_traffic": "Трафик (сообщения и служебные)",
+                "graphs_traffic_hint": "Счетчики в секунду: исходящие/входящие сообщения, исходящие/входящие служебные пакеты.",
+                "graphs_bytes": "Байты (прокси airtime)",
+                "graphs_bytes_hint": "Байты в секунду (best-effort): помогает оценить эфирное время/шум.",
+                "graphs_reliability": "Надежность (send/retry/ack)",
+                "graphs_reliability_hint": "Счетчики в секунду: отправки meshTalk, повторы, полученные ACK.",
+                "graphs_backlog": "Очередь (pending)",
+                "graphs_backlog_hint": "Индикаторы: сколько пакетов ждут ACK и сколько пиров с очередью.",
+                "graphs_latency": "Задержка (RTT средняя)",
+                "graphs_latency_hint": "Индикатор: средняя RTT по ACK среди пиров (сек).",
+                "graphs_compression": "Сжатие (size %)",
+                "graphs_compression_hint": "Индикатор: итоговый размер как % от исходного (меньше лучше).",
+                "graphs_service_breakdown": "Служебные (ACK/KEY/DISC/REKEY/TRACE)",
+                "graphs_service_breakdown_hint": "Счетчики в секунду по типам служебных пакетов (best-effort).",
                 "discovery": "Обнаружение",
                 "discovery_send": "Отправлять broadcast discovery",
                 "discovery_reply": "Отвечать на broadcast discovery",
@@ -3819,15 +4230,20 @@ def main() -> int:
                 text_rect = QtCore.QRect(rect.left() + pad, rect.top(), max(1, rect.width() - (pad * 2)), rect.height())
                 painter.save()
                 status_code = str(data.get("status_code", "") or "")
+                status_color_hex = str(data.get("status_color", "") or "").strip()
                 panel_color = None
-                if status_code == "app_online":
-                    panel_color = QtGui.QColor("#2bbf66")
-                elif status_code == "app_offline":
-                    panel_color = QtGui.QColor("#154a2b")
-                elif status_code == "mesh_online":
-                    panel_color = QtGui.QColor("#d9b233")
-                elif status_code == "mesh_offline":
-                    panel_color = QtGui.QColor("#5f470c")
+                if status_color_hex and re.fullmatch(r"#[0-9a-fA-F]{6}", status_color_hex):
+                    panel_color = QtGui.QColor(status_color_hex)
+                # Fallback palette: used only when no explicit per-row color was computed.
+                if panel_color is None:
+                    if status_code == "app_online":
+                        panel_color = QtGui.QColor("#2bbf66")
+                    elif status_code == "app_offline":
+                        panel_color = QtGui.QColor("#0e2d1a")
+                    elif status_code == "mesh_online":
+                        panel_color = QtGui.QColor("#d9b233")
+                    elif status_code == "mesh_offline":
+                        panel_color = QtGui.QColor("#2f2206")
                 if panel_color is not None:
                     painter.setPen(QtCore.Qt.NoPen)
                     painter.setBrush(panel_color)
@@ -4610,12 +5026,7 @@ def main() -> int:
                 general_layout.addStretch(1)
                 general_layout.addLayout(right_panel)
 
-                runtime_title = QtWidgets.QLabel(tr("settings_runtime"))
-                runtime_title.setObjectName("muted")
-                runtime_title.setStyleSheet("font-weight:600;")
-                runtime_title.setContentsMargins(6, 8, 0, 0)
-                left_panel.addWidget(runtime_title)
-
+                # Runtime/activity settings live on the Activity tab (keeps General clean).
                 runtime_group = QtWidgets.QGroupBox("")
                 runtime_layout = QtWidgets.QFormLayout(runtime_group)
                 runtime_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
@@ -4628,7 +5039,7 @@ def main() -> int:
                 except Exception:
                     pass
 
-                def compact_field(widget, width: int = 240):
+                def compact_field(widget, width: int = 160):
                     # Keep input fields stable: do not scale with Settings window resizing.
                     w = max(140, int(width))
                     try:
@@ -4644,6 +5055,20 @@ def main() -> int:
                     widget.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
                     return widget
 
+                def row_with_hint(field_widget, hint_text: str) -> QtWidgets.QWidget:
+                    # Render: [field][hint ...] on the same row (hint to the right).
+                    w = QtWidgets.QWidget()
+                    h = QtWidgets.QHBoxLayout(w)
+                    h.setContentsMargins(0, 0, 0, 0)
+                    h.setSpacing(10)
+                    h.addWidget(field_widget, 0)
+                    hint = QtWidgets.QLabel(hint_text)
+                    hint.setObjectName("hint")
+                    hint.setWordWrap(True)
+                    hint.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+                    h.addWidget(hint, 1)
+                    return w
+
                 def int_text(value, fallback: int) -> str:
                     try:
                         return str(int(float(value)))
@@ -4652,7 +5077,13 @@ def main() -> int:
 
                 # Port is auto-detected; do not expose it in UI.
                 retry_edit = QtWidgets.QLineEdit(int_text(cfg.get("retry_seconds", args.retry_seconds), int(args.retry_seconds)))
-                maxsec_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_seconds", args.max_seconds), int(args.max_seconds)))
+                # Store max wait in seconds in config, but present it in days to users.
+                try:
+                    _max_seconds_cfg = int(float(cfg.get("max_seconds", args.max_seconds) or args.max_seconds))
+                except Exception:
+                    _max_seconds_cfg = int(getattr(args, "max_seconds", 3600) or 3600)
+                _max_days_cfg = max(1, int(math.ceil(float(_max_seconds_cfg) / 86400.0)))
+                maxdays_edit = QtWidgets.QLineEdit(int_text(_max_days_cfg, 1))
                 maxbytes_edit = QtWidgets.QLineEdit(int_text(cfg.get("max_bytes", args.max_bytes), int(args.max_bytes)))
                 rate_edit = QtWidgets.QLineEdit(int_text(cfg.get("rate_seconds", args.rate_seconds), int(args.rate_seconds)))
                 parallel_edit = QtWidgets.QLineEdit(
@@ -4662,57 +5093,29 @@ def main() -> int:
                     )
                 )
 
-                compact_field(retry_edit, width=240)
-                compact_field(maxsec_edit, width=240)
-                compact_field(maxbytes_edit, width=240)
-                compact_field(rate_edit, width=240)
-                compact_field(parallel_edit, width=160)
+                compact_field(retry_edit, width=140)
+                compact_field(maxdays_edit, width=140)
+                compact_field(maxbytes_edit, width=140)
+                compact_field(rate_edit, width=140)
+                compact_field(parallel_edit, width=110)
 
                 int_validator = QtGui.QIntValidator(0, 999999, dlg)
                 parallel_validator = QtGui.QIntValidator(1, 128, dlg)
                 retry_edit.setValidator(int_validator)
-                maxsec_edit.setValidator(int_validator)
+                maxdays_edit.setValidator(int_validator)
                 maxbytes_edit.setValidator(int_validator)
                 rate_edit.setValidator(int_validator)
                 parallel_edit.setValidator(parallel_validator)
 
-                runtime_layout.addRow(tr("retry"), retry_edit)
-                retry_hint = QtWidgets.QLabel(tr("hint_retry"))
-                retry_hint.setObjectName("hint")
-                retry_hint.setWordWrap(True)
-                runtime_layout.addRow("", retry_hint)
+                runtime_layout.addRow(tr("retry"), row_with_hint(retry_edit, tr("hint_retry")))
+                runtime_layout.addRow(tr("max_days"), row_with_hint(maxdays_edit, tr("hint_max_days")))
+                runtime_layout.addRow(tr("max_bytes"), row_with_hint(maxbytes_edit, tr("hint_max_bytes")))
+                runtime_layout.addRow(tr("rate"), row_with_hint(rate_edit, tr("hint_rate")))
+                runtime_layout.addRow(tr("parallel_sends"), row_with_hint(parallel_edit, tr("hint_parallel")))
 
-                runtime_layout.addRow(tr("max_seconds"), maxsec_edit)
-                maxsec_hint = QtWidgets.QLabel(tr("hint_max_seconds"))
-                maxsec_hint.setObjectName("hint")
-                maxsec_hint.setWordWrap(True)
-                runtime_layout.addRow("", maxsec_hint)
-
-                runtime_layout.addRow(tr("max_bytes"), maxbytes_edit)
-                maxbytes_hint = QtWidgets.QLabel(tr("hint_max_bytes"))
-                maxbytes_hint.setObjectName("hint")
-                maxbytes_hint.setWordWrap(True)
-                runtime_layout.addRow("", maxbytes_hint)
-
-                runtime_layout.addRow(tr("rate"), rate_edit)
-                rate_hint = QtWidgets.QLabel(tr("hint_rate"))
-                rate_hint.setObjectName("hint")
-                rate_hint.setWordWrap(True)
-                runtime_layout.addRow("", rate_hint)
-
-                runtime_layout.addRow(tr("parallel_sends"), parallel_edit)
-                parallel_hint = QtWidgets.QLabel(tr("hint_parallel"))
-                parallel_hint.setObjectName("hint")
-                parallel_hint.setWordWrap(True)
-                runtime_layout.addRow("", parallel_hint)
-
-                cb_auto_pacing = QtWidgets.QCheckBox("")
+                cb_auto_pacing = QtWidgets.QCheckBox("", runtime_group)
                 cb_auto_pacing.setChecked(bool(cfg.get("auto_pacing", auto_pacing)))
-                runtime_layout.addRow(tr("auto_pacing"), cb_auto_pacing)
-                auto_pacing_hint = QtWidgets.QLabel(tr("hint_auto_pacing"))
-                auto_pacing_hint.setObjectName("hint")
-                auto_pacing_hint.setWordWrap(True)
-                runtime_layout.addRow("", auto_pacing_hint)
+                runtime_layout.addRow(tr("auto_pacing"), row_with_hint(cb_auto_pacing, tr("hint_auto_pacing")))
 
                 settings_rate_edit = rate_edit
                 settings_parallel_edit = parallel_edit
@@ -4725,9 +5128,6 @@ def main() -> int:
 
                 sync_auto_pacing_fields()
                 cb_auto_pacing.toggled.connect(lambda _checked: sync_auto_pacing_fields())
-
-                left_panel.addWidget(runtime_group)
-
                 left_panel.addStretch(1)
 
                 lang_title = QtWidgets.QLabel(tr("language"))
@@ -4738,8 +5138,8 @@ def main() -> int:
 
                 lang_group = QtWidgets.QGroupBox("")
                 lang_v = QtWidgets.QVBoxLayout(lang_group)
-                rb_ru = QtWidgets.QRadioButton(tr("lang_ru"))
-                rb_en = QtWidgets.QRadioButton(tr("lang_en"))
+                rb_ru = QtWidgets.QRadioButton(tr("lang_ru"), lang_group)
+                rb_en = QtWidgets.QRadioButton(tr("lang_en"), lang_group)
                 if current_lang == "en":
                     rb_en.setChecked(True)
                 else:
@@ -4766,7 +5166,7 @@ def main() -> int:
 
                 discovery_group = QtWidgets.QGroupBox("")
                 discovery_v = QtWidgets.QVBoxLayout(discovery_group)
-                cb_discovery_send = QtWidgets.QCheckBox(tr("discovery_send"))
+                cb_discovery_send = QtWidgets.QCheckBox(tr("discovery_send"), discovery_group)
                 cb_discovery_send.setChecked(discovery_send)
                 discovery_v.addWidget(cb_discovery_send)
                 discovery_send_hint = QtWidgets.QLabel(tr("hint_discovery_send"))
@@ -4774,7 +5174,7 @@ def main() -> int:
                 discovery_send_hint.setWordWrap(True)
                 discovery_v.addWidget(discovery_send_hint)
 
-                cb_discovery_reply = QtWidgets.QCheckBox(tr("discovery_reply"))
+                cb_discovery_reply = QtWidgets.QCheckBox(tr("discovery_reply"), discovery_group)
                 cb_discovery_reply.setChecked(discovery_reply)
                 discovery_v.addWidget(cb_discovery_reply)
                 discovery_reply_hint = QtWidgets.QLabel(tr("hint_discovery_reply"))
@@ -4782,7 +5182,7 @@ def main() -> int:
                 discovery_reply_hint.setWordWrap(True)
                 discovery_v.addWidget(discovery_reply_hint)
 
-                cb_clear_pending = QtWidgets.QCheckBox(tr("clear_pending_on_switch"))
+                cb_clear_pending = QtWidgets.QCheckBox(tr("clear_pending_on_switch"), discovery_group)
                 cb_clear_pending.setChecked(clear_pending_on_switch)
                 discovery_v.addWidget(cb_clear_pending)
                 clear_pending_hint = QtWidgets.QLabel(tr("hint_clear_pending"))
@@ -4793,6 +5193,377 @@ def main() -> int:
                 right_panel.addWidget(discovery_group)
 
                 right_panel.addStretch(1)
+
+                # -------------------
+                # Activity tab
+                # -------------------
+                tab_activity = QtWidgets.QWidget()
+                tabs.addTab(tab_activity, tr("tab_activity"))
+                act_root = QtWidgets.QVBoxLayout(tab_activity)
+                act_root.setContentsMargins(14, 12, 14, 10)
+                act_root.setSpacing(12)
+
+                act_title = QtWidgets.QLabel(tr("activity_title"))
+                act_title.setObjectName("muted")
+                act_title.setStyleSheet("font-weight:600;")
+                act_title.setContentsMargins(6, 8, 0, 0)
+                act_root.addWidget(act_title)
+
+                # Profile + aggressiveness (minimal UI).
+                profile_group = QtWidgets.QGroupBox("")
+                profile_layout = QtWidgets.QFormLayout(profile_group)
+                profile_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+                profile_layout.setFormAlignment(QtCore.Qt.AlignTop)
+                profile_layout.setVerticalSpacing(8)
+                profile_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
+                profile_layout.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+                try:
+                    profile_layout.setContentsMargins(10, 10, 10, 10)
+                except Exception:
+                    pass
+
+                def _clamp(v: float, lo: float, hi: float) -> float:
+                    return max(float(lo), min(float(hi), float(v)))
+
+                def compute_activity_preset(profile: str, aggr: int) -> Dict[str, float]:
+                    # aggr: 0..100 (higher => more traffic, lower latency)
+                    s = _clamp(float(aggr), 0.0, 100.0) / 100.0
+                    profile = str(profile or "low").strip().lower()
+                    # Defaults are tuned for low RF noise; fast profile is more active.
+                    if profile == "fast":
+                        # Fast delivery
+                        active = 300.0 + 600.0 * s              # 5..15 min
+                        probe_min = 600.0 - 540.0 * s           # 10..1 min
+                        probe_max = 3600.0 - 3300.0 * s         # 60..5 min
+                        probe_win = 120.0 + 480.0 * s           # 2..10 min
+                        grace = 180.0 + 420.0 * s               # 3..10 min
+                        backoff_cap = 300.0 - 240.0 * s         # 5..1 min
+                        jitter = 0.20
+                    elif profile == "bal":
+                        # Balanced
+                        active = 120.0 + 480.0 * s              # 2..10 min
+                        probe_min = 1800.0 - 1680.0 * s         # 30..2 min
+                        probe_max = 14400.0 - 12600.0 * s       # 4h..30 min
+                        probe_win = 60.0 + 240.0 * s            # 1..5 min
+                        grace = 120.0 + 180.0 * s               # 2..5 min
+                        backoff_cap = 600.0 - 420.0 * s         # 10..3 min
+                        jitter = 0.25
+                    else:
+                        # Low-noise (recommended)
+                        active = 60.0 + 120.0 * s               # 1..3 min
+                        probe_min = 3600.0 - 3000.0 * s         # 60..10 min
+                        probe_max = 43200.0 - 36000.0 * s       # 12h..2h
+                        probe_win = 30.0 + 90.0 * s             # 0.5..2 min
+                        grace = 120.0 + 120.0 * s               # 2..4 min
+                        backoff_cap = 600.0 - 300.0 * s         # 10..5 min
+                        jitter = 0.25
+                    # Sanity clamps
+                    probe_min = _clamp(probe_min, 60.0, 12 * 3600.0)
+                    probe_max = _clamp(probe_max, probe_min, 7 * 86400.0)
+                    probe_win = _clamp(probe_win, 10.0, 30 * 60.0)
+                    active = _clamp(active, 10.0, 60 * 60.0)
+                    grace = _clamp(grace, 10.0, 3600.0)
+                    backoff_cap = _clamp(backoff_cap, 30.0, 3600.0)
+                    jitter = _clamp(jitter, 0.0, 1.0)
+                    return {
+                        "activity_active_window_seconds": float(active),
+                        "activity_probe_interval_min_seconds": float(probe_min),
+                        "activity_probe_interval_max_seconds": float(probe_max),
+                        "activity_probe_window_max_seconds": float(probe_win),
+                        "activity_peer_responsive_grace_seconds": float(grace),
+                        "activity_retry_backoff_max_seconds": float(backoff_cap),
+                        "activity_retry_jitter_ratio": float(jitter),
+                    }
+
+                # Default profile: low-noise
+                prof_combo = QtWidgets.QComboBox(profile_group)
+                prof_combo.addItem(tr("activity_profile_low"), "low")
+                prof_combo.addItem(tr("activity_profile_bal"), "bal")
+                prof_combo.addItem(tr("activity_profile_fast"), "fast")
+                stored_prof = str(cfg.get("activity_profile", "low") or "low").strip().lower()
+                if stored_prof not in ("low", "bal", "fast"):
+                    stored_prof = "low"
+                _pidx = prof_combo.findData(stored_prof)
+                prof_combo.setCurrentIndex(_pidx if _pidx >= 0 else 0)
+                compact_field(prof_combo, width=220)
+                profile_layout.addRow(tr("activity_profile"), row_with_hint(prof_combo, tr("hint_activity_profile")))
+
+                aggr_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, profile_group)
+                aggr_slider.setMinimum(0)
+                aggr_slider.setMaximum(100)
+                aggr_slider.setSingleStep(1)
+                aggr_slider.setPageStep(5)
+                try:
+                    aggr_slider.setFixedHeight(22)
+                except Exception:
+                    pass
+                try:
+                    aggr_val = int(float(cfg.get("activity_aggressiveness", 20) or 20))
+                except Exception:
+                    aggr_val = 20
+                aggr_val = max(0, min(100, int(aggr_val)))
+                aggr_slider.setValue(aggr_val)
+                aggr_read = QtWidgets.QLabel(str(aggr_val), profile_group)
+                aggr_read.setObjectName("hint")
+                try:
+                    aggr_read.setFixedWidth(40)
+                except Exception:
+                    pass
+                aggr_row = QtWidgets.QWidget()
+                aggr_h = QtWidgets.QHBoxLayout(aggr_row)
+                aggr_h.setContentsMargins(0, 0, 0, 0)
+                aggr_h.setSpacing(10)
+                aggr_h.addWidget(aggr_slider, 1)
+                aggr_h.addWidget(aggr_read, 0)
+                profile_layout.addRow(tr("activity_aggr"), row_with_hint(aggr_row, tr("hint_activity_aggr")))
+                aggr_slider.valueChanged.connect(lambda v: aggr_read.setText(str(int(v))))
+
+                act_root.addWidget(profile_group)
+
+                meth = QtWidgets.QLabel(tr("activity_methodology"))
+                meth.setObjectName("hint")
+                meth.setWordWrap(True)
+                try:
+                    meth.setContentsMargins(6, 6, 6, 6)
+                except Exception:
+                    pass
+                act_root.addWidget(meth)
+                act_root.addStretch(1)
+
+                # -------------------
+                # Graphs tab
+                # -------------------
+                tab_graphs = QtWidgets.QWidget()
+                tabs.addTab(tab_graphs, tr("tab_graphs"))
+                graphs_root = QtWidgets.QVBoxLayout(tab_graphs)
+                graphs_root.setContentsMargins(14, 12, 14, 10)
+                graphs_root.setSpacing(12)
+
+                graphs_title = QtWidgets.QLabel(tr("graphs_title"))
+                graphs_title.setObjectName("muted")
+                graphs_title.setStyleSheet("font-weight:600;")
+                graphs_title.setContentsMargins(6, 8, 0, 0)
+                graphs_root.addWidget(graphs_title)
+
+                graphs_scroll = QtWidgets.QScrollArea(tab_graphs)
+                graphs_scroll.setWidgetResizable(True)
+                graphs_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+                graphs_root.addWidget(graphs_scroll, 1)
+
+                graphs_body = QtWidgets.QWidget()
+                graphs_scroll.setWidget(graphs_body)
+                graphs_v = QtWidgets.QVBoxLayout(graphs_body)
+                graphs_v.setContentsMargins(0, 0, 0, 0)
+                graphs_v.setSpacing(12)
+
+                class MetricsLineGraph(QtWidgets.QWidget):
+                    def __init__(self, series: list[tuple[str, str, str]], parent=None) -> None:
+                        super().__init__(parent)
+                        self._series = list(series)
+                        self.setMinimumHeight(130)
+                        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+                    def paintEvent(self, event) -> None:  # type: ignore[override]
+                        del event
+                        p = QtGui.QPainter(self)
+                        try:
+                            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                        except Exception:
+                            pass
+                        r = self.rect()
+                        # Background (subtle, independent from theme; keeps contrast in light/dark).
+                        bg = QtGui.QColor("#1b1b1b")
+                        bg.setAlpha(40)
+                        p.setBrush(bg)
+                        p.setPen(QtCore.Qt.NoPen)
+                        p.drawRoundedRect(r.adjusted(0, 0, -1, -1), 8, 8)
+
+                        rows = metrics_snapshot_rows(window_s=int(METRICS_GRAPH_WINDOW_SECONDS))
+                        if not rows or r.width() < 80 or r.height() < 60:
+                            return
+                        # Compute max Y
+                        max_y = 1.0
+                        for _sec, row in rows:
+                            for key, _name, _color in self._series:
+                                try:
+                                    v = float(row.get(key, 0.0) or 0.0)
+                                except Exception:
+                                    v = 0.0
+                                if v > max_y:
+                                    max_y = v
+                        max_y = max(1.0, float(max_y))
+                        # Plot area
+                        pad_l, pad_r, pad_t, pad_b = (10, 10, 10, 14)
+                        pr = QtCore.QRect(
+                            int(r.left() + pad_l),
+                            int(r.top() + pad_t),
+                            int(max(10, r.width() - pad_l - pad_r)),
+                            int(max(10, r.height() - pad_t - pad_b)),
+                        )
+                        # Grid
+                        grid_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 25))
+                        p.setPen(grid_pen)
+                        for j in range(1, 4):
+                            y = pr.top() + int((pr.height() * j) / 4)
+                            p.drawLine(pr.left(), y, pr.right(), y)
+                        # Lines
+                        n = len(rows)
+                        if n < 2:
+                            return
+                        for key, _name, color in self._series:
+                            path = QtGui.QPainterPath()
+                            first = True
+                            for idx, (_sec, row) in enumerate(rows):
+                                try:
+                                    v = float(row.get(key, 0.0) or 0.0)
+                                except Exception:
+                                    v = 0.0
+                                x = pr.left() + (pr.width() * idx) / float(max(1, n - 1))
+                                y = pr.bottom() - (pr.height() * (v / max_y))
+                                if first:
+                                    path.moveTo(float(x), float(y))
+                                    first = False
+                                else:
+                                    path.lineTo(float(x), float(y))
+                            pen = QtGui.QPen(QtGui.QColor(color))
+                            pen.setWidthF(1.6)
+                            try:
+                                pen.setCapStyle(QtCore.Qt.RoundCap)
+                                pen.setJoinStyle(QtCore.Qt.RoundJoin)
+                            except Exception:
+                                pass
+                            p.setPen(pen)
+                            p.setBrush(QtCore.Qt.NoBrush)
+                            p.drawPath(path)
+
+                def _graphs_section(
+                    title: str,
+                    hint: str,
+                    cb_default: bool,
+                    graph_widget: QtWidgets.QWidget,
+                ) -> QtWidgets.QCheckBox:
+                    group = QtWidgets.QGroupBox("")
+                    v = QtWidgets.QVBoxLayout(group)
+                    v.setContentsMargins(10, 10, 10, 10)
+                    v.setSpacing(8)
+                    cb = QtWidgets.QCheckBox(title, group)
+                    cb.setChecked(bool(cb_default))
+                    v.addWidget(cb)
+                    lbl = QtWidgets.QLabel(hint, group)
+                    lbl.setObjectName("hint")
+                    lbl.setWordWrap(True)
+                    v.addWidget(lbl)
+                    v.addWidget(graph_widget)
+                    graph_widget.setVisible(cb.isChecked())
+                    cb.toggled.connect(lambda on, w=graph_widget: w.setVisible(bool(on)))
+                    graphs_v.addWidget(group)
+                    return cb
+
+                # Defaults: keep essential graphs enabled, rest optional.
+                g_traffic_default = bool(cfg.get("graphs_traffic_enabled", True))
+                g_bytes_default = bool(cfg.get("graphs_bytes_enabled", False))
+                g_rel_default = bool(cfg.get("graphs_reliability_enabled", True))
+                g_backlog_default = bool(cfg.get("graphs_backlog_enabled", True))
+                g_latency_default = bool(cfg.get("graphs_latency_enabled", True))
+                g_comp_default = bool(cfg.get("graphs_compression_enabled", False))
+                g_srv_default = bool(cfg.get("graphs_service_enabled", False))
+
+                traffic_graph = MetricsLineGraph(
+                    [
+                        ("out_msg", "out msg", "#a6e22e"),
+                        ("in_msg", "in msg", "#66d9ef"),
+                        ("out_srv", "out srv", "#fd971f"),
+                        ("in_srv", "in srv", "#ffd75f"),
+                    ],
+                    parent=tab_graphs,
+                )
+                cb_g_traffic = _graphs_section(tr("graphs_traffic"), tr("graphs_traffic_hint"), g_traffic_default, traffic_graph)
+
+                bytes_graph = MetricsLineGraph(
+                    [
+                        ("out_msg_bytes", "out msg bytes", "#a6e22e"),
+                        ("in_msg_bytes", "in msg bytes", "#66d9ef"),
+                        ("out_srv_bytes", "out srv bytes", "#fd971f"),
+                        ("in_srv_bytes", "in srv bytes", "#ffd75f"),
+                    ],
+                    parent=tab_graphs,
+                )
+                cb_g_bytes = _graphs_section(tr("graphs_bytes"), tr("graphs_bytes_hint"), g_bytes_default, bytes_graph)
+
+                rel_graph = MetricsLineGraph(
+                    [
+                        ("out_send", "send", "#a6e22e"),
+                        ("out_retry", "retry", "#fd971f"),
+                        ("in_ack", "ack in", "#66d9ef"),
+                    ],
+                    parent=tab_graphs,
+                )
+                cb_g_rel = _graphs_section(tr("graphs_reliability"), tr("graphs_reliability_hint"), g_rel_default, rel_graph)
+
+                backlog_graph = MetricsLineGraph(
+                    [
+                        ("pending_count", "pending", "#ffd75f"),
+                        ("pending_peers", "peers", "#b894ff"),
+                    ],
+                    parent=tab_graphs,
+                )
+                cb_g_backlog = _graphs_section(tr("graphs_backlog"), tr("graphs_backlog_hint"), g_backlog_default, backlog_graph)
+
+                latency_graph = MetricsLineGraph(
+                    [
+                        ("rtt_avg_s", "rtt avg", "#74b2ff"),
+                    ],
+                    parent=tab_graphs,
+                )
+                cb_g_latency = _graphs_section(tr("graphs_latency"), tr("graphs_latency_hint"), g_latency_default, latency_graph)
+
+                comp_graph = MetricsLineGraph(
+                    [
+                        ("comp_size_pct", "size %", "#c3b38a"),
+                    ],
+                    parent=tab_graphs,
+                )
+                cb_g_comp = _graphs_section(tr("graphs_compression"), tr("graphs_compression_hint"), g_comp_default, comp_graph)
+
+                srv_graph = MetricsLineGraph(
+                    [
+                        ("out_srv_ack", "out ack", "#fd971f"),
+                        ("in_srv_ack", "in ack", "#66d9ef"),
+                        ("out_srv_key", "out key", "#ffd75f"),
+                        ("in_srv_key", "in key", "#ffd75f"),
+                        ("out_srv_disc", "out disc", "#b894ff"),
+                        ("in_srv_disc", "in disc", "#b894ff"),
+                        ("out_srv_rekey", "out rekey", "#74b2ff"),
+                        ("in_srv_rekey", "in rekey", "#74b2ff"),
+                        ("out_srv_trace", "out trace", "#c3b38a"),
+                        ("in_srv_trace", "in trace", "#c3b38a"),
+                    ],
+                    parent=tab_graphs,
+                )
+                cb_g_srv = _graphs_section(tr("graphs_service_breakdown"), tr("graphs_service_breakdown_hint"), g_srv_default, srv_graph)
+
+                graphs_v.addStretch(1)
+
+                graphs_timer = QtCore.QTimer(dlg)
+                graphs_timer.setInterval(1000)
+                def _graphs_tick() -> None:
+                    # Only repaint visible widgets (keeps Settings lightweight).
+                    for cb, w in (
+                        (cb_g_traffic, traffic_graph),
+                        (cb_g_bytes, bytes_graph),
+                        (cb_g_rel, rel_graph),
+                        (cb_g_backlog, backlog_graph),
+                        (cb_g_latency, latency_graph),
+                        (cb_g_comp, comp_graph),
+                        (cb_g_srv, srv_graph),
+                    ):
+                        try:
+                            if cb.isChecked() and w.isVisible():
+                                w.update()
+                        except Exception:
+                            pass
+                graphs_timer.timeout.connect(_graphs_tick)
+                graphs_timer.start()
 
                 # -------------------
                 # Contacts tab
@@ -5102,7 +5873,7 @@ def main() -> int:
                 tab_log_l.setSpacing(10)
 
                 # Log settings (moved from General tab).
-                cb_verbose = QtWidgets.QCheckBox(tr("verbose_events"))
+                cb_verbose = QtWidgets.QCheckBox(tr("verbose_events"), tab_log)
                 cb_verbose.setChecked(verbose_log)
                 tab_log_l.addWidget(cb_verbose)
                 verbose_hint = QtWidgets.QLabel(tr("hint_verbose"))
@@ -5110,7 +5881,7 @@ def main() -> int:
                 verbose_hint.setWordWrap(True)
                 tab_log_l.addWidget(verbose_hint)
 
-                cb_runtime_log = QtWidgets.QCheckBox(tr("runtime_log_file"))
+                cb_runtime_log = QtWidgets.QCheckBox(tr("runtime_log_file"), tab_log)
                 cb_runtime_log.setChecked(runtime_log_file)
                 tab_log_l.addWidget(cb_runtime_log)
                 runtime_log_hint = QtWidgets.QLabel(tr("hint_runtime_log_file"))
@@ -5129,6 +5900,14 @@ def main() -> int:
                 log_view = QtWidgets.QTextEdit()
                 log_view.setReadOnly(True)
                 set_mono(log_view, 10)
+                # Log tab background is fixed "Ubuntu terminal-like" (independent from selected UI theme).
+                # Keep it consistent for readability across dark/light themes.
+                try:
+                    log_view.setStyleSheet(
+                        "QTextEdit { background:#300a24; color:#eeeeec; border:1px solid #3c0f2e; }"
+                    )
+                except Exception:
+                    pass
                 try:
                     log_view.installEventFilter(_no_ctrl_zoom)
                     log_view.viewport().installEventFilter(_no_ctrl_zoom)
@@ -5229,14 +6008,20 @@ def main() -> int:
                     nonlocal contacts_visibility
                     nonlocal security_policy, session_rekey_enabled
                     nonlocal max_plain, current_lang, last_limits_logged, current_theme
-                    verbose_log = cb_verbose.isChecked()
-                    runtime_log_file = cb_runtime_log.isChecked()
-                    auto_pacing = cb_auto_pacing.isChecked()
+                    def _safe_is_checked(cb, default: bool = False) -> bool:
+                        try:
+                            return bool(cb.isChecked())
+                        except Exception:
+                            return bool(default)
+
+                    verbose_log = _safe_is_checked(cb_verbose, verbose_log)
+                    runtime_log_file = _safe_is_checked(cb_runtime_log, runtime_log_file)
+                    auto_pacing = _safe_is_checked(cb_auto_pacing, auto_pacing)
                     _STORAGE.set_runtime_log_enabled(runtime_log_file)
                     prev_send = discovery_send
-                    discovery_send = cb_discovery_send.isChecked()
-                    discovery_reply = cb_discovery_reply.isChecked()
-                    clear_pending_on_switch = cb_clear_pending.isChecked()
+                    discovery_send = _safe_is_checked(cb_discovery_send, discovery_send)
+                    discovery_reply = _safe_is_checked(cb_discovery_reply, discovery_reply)
+                    clear_pending_on_switch = _safe_is_checked(cb_clear_pending, clear_pending_on_switch)
 
                     prev_lang = current_lang
                     next_lang = "ru" if rb_ru.isChecked() else "en"
@@ -5249,11 +6034,21 @@ def main() -> int:
                     # Port is auto-detected.
                     cfg["port"] = "auto"
                     cfg["retry_seconds"] = parse_int_field(retry_edit, 30)
-                    cfg["max_seconds"] = parse_int_field(maxsec_edit, 3600)
+                    # UI uses days, config uses seconds.
+                    cfg["max_seconds"] = max(1, parse_int_field(maxdays_edit, 1)) * 86400
                     cfg["max_bytes"] = parse_int_field(maxbytes_edit, 200)
                     cfg["rate_seconds"] = parse_int_field(rate_edit, 30)
                     cfg["parallel_sends"] = max(1, parse_int_field(parallel_edit, 1))
                     cfg["auto_pacing"] = bool(auto_pacing)
+                    # Activity/resend policy: preset profiles + slider (keep UI minimal).
+                    cfg["activity_profile"] = str(prof_combo.currentData() or "low").strip().lower()
+                    cfg["activity_aggressiveness"] = int(aggr_slider.value())
+                    preset = compute_activity_preset(cfg["activity_profile"], cfg["activity_aggressiveness"])
+                    for k, v in preset.items():
+                        cfg[k] = v
+                    # Backward-compat keys (older builds may read them).
+                    cfg["activity_muted_interval_seconds"] = int(cfg.get("activity_probe_interval_max_seconds", MSG_RETRY_MUTED_INTERVAL_SECONDS))
+                    cfg["activity_probe_window_seconds"] = int(cfg.get("activity_probe_window_max_seconds", MSG_RETRY_PROBE_WINDOW_SECONDS))
                     cfg["discovery_enabled"] = bool(discovery_send and discovery_reply)
                     cfg["discovery_send"] = discovery_send
                     cfg["discovery_reply"] = discovery_reply
@@ -5263,6 +6058,15 @@ def main() -> int:
                     if contacts_visibility not in ("all", "online", "app", "device"):
                         contacts_visibility = "all"
                     cfg["contacts_visibility"] = contacts_visibility
+
+                    # Graphs tab toggles (persisted; window is always last 15 minutes).
+                    cfg["graphs_traffic_enabled"] = _safe_is_checked(cb_g_traffic, bool(cfg.get("graphs_traffic_enabled", True)))
+                    cfg["graphs_bytes_enabled"] = _safe_is_checked(cb_g_bytes, bool(cfg.get("graphs_bytes_enabled", False)))
+                    cfg["graphs_reliability_enabled"] = _safe_is_checked(cb_g_rel, bool(cfg.get("graphs_reliability_enabled", True)))
+                    cfg["graphs_backlog_enabled"] = _safe_is_checked(cb_g_backlog, bool(cfg.get("graphs_backlog_enabled", True)))
+                    cfg["graphs_latency_enabled"] = _safe_is_checked(cb_g_latency, bool(cfg.get("graphs_latency_enabled", True)))
+                    cfg["graphs_compression_enabled"] = _safe_is_checked(cb_g_comp, bool(cfg.get("graphs_compression_enabled", False)))
+                    cfg["graphs_service_enabled"] = _safe_is_checked(cb_g_srv, bool(cfg.get("graphs_service_enabled", False)))
 
                     # Theme settings
                     next_theme = str(theme_combo.currentData() or "ubuntu_style").strip().lower()
@@ -5844,10 +6648,10 @@ def main() -> int:
             bubble.setProperty("peer_id", str(peer_id))
             base = _theme_base(current_theme)
             bubble_alpha = float(base.get("bubble_alpha", 0.92) or 0.92)
-            bubble_border = str(base.get("bubble_border") or "rgba(255,255,255,0.10)")
             bg_rgba = _rgba_css(bg, bubble_alpha)
             bubble.setStyleSheet(
-                f"QFrame#chatBubble {{ background-color:{bg_rgba}; border:1px solid {bubble_border}; border-radius:9px; }}"
+                # No visible border: only background + rounded corners.
+                f"QFrame#chatBubble {{ background-color:{bg_rgba}; border:none; border-radius:9px; }}"
             )
             bubble_l = QtWidgets.QVBoxLayout(bubble)
             bubble_l.setContentsMargins(8, 6, 10, 6)
@@ -6368,8 +7172,9 @@ def main() -> int:
                 item.setIcon(make_avatar(item_id))
                 unread = int(dialogs.get(item_id, {}).get("unread", 0) or 0)
                 status_code: Optional[str] = None
+                status_color: Optional[str] = None
                 app_recent = False
-                app_seen_any = False
+                app_seen_any = False  # any app activity ever recorded
                 device_recent = False
                 app_seen_fresh = False
                 device_seen_fresh = False
@@ -6408,6 +7213,28 @@ def main() -> int:
                             device_ts = float(getattr(st, "device_seen_ts", 0.0) or 0.0)
                         except Exception:
                             device_ts = 0.0
+                    # For Meshtastic-only peers (no PeerState yet), derive device presence from node DB cache
+                    # (lastHeard) or persisted peer_meta.
+                    if device_ts <= 0.0:
+                        try:
+                            meta = peer_meta.get(item_id, {})
+                            if isinstance(meta, dict):
+                                ds = meta.get("device_seen_ts")
+                                if isinstance(ds, (int, float)) and float(ds) > 0.0:
+                                    device_ts = float(ds)
+                        except Exception:
+                            pass
+                    if device_ts <= 0.0:
+                        try:
+                            with peer_names_lock:
+                                rec = peer_names.get(item_id) or peer_names.get(str(item_id).lower()) or {}
+                            lh = rec.get("last_heard_ts") if isinstance(rec, dict) else None
+                            if isinstance(lh, (int, float)) and float(lh) > 0.0:
+                                device_ts = float(lh)
+                                if st is not None and float(getattr(st, "device_seen_ts", 0.0) or 0.0) <= 0.0:
+                                    st.device_seen_ts = float(lh)
+                        except Exception:
+                            pass
                     if seen_ts > 0.0:
                         app_seen_any = True
                         app_age_s = float(now_ts) - float(seen_ts)
@@ -6428,29 +7255,70 @@ def main() -> int:
                             )
                         except Exception:
                             keys_ok = False
-                    if app_seen_any and keys_ok:
+                    # Smooth fade: when peer just stops talking (no explicit app-offline signal),
+                    # gradually darken the square from online -> offline across the stale window.
+                    def _fade_ratio(age_s: float) -> float:
+                        # Log-style fade:
+                        # - keep "online" color until 1 hour
+                        # - at 1 hour: immediate dim to 1/3
+                        # - then smoothly (moderately) fade to dark until CONTACT_STALE_SECONDS
+                        try:
+                            a = float(age_s)
+                        except Exception:
+                            a = 0.0
+                        start_s = 3600.0  # 1 hour hard step
+                        end_s = float(CONTACT_STALE_SECONDS)
+                        if a <= start_s:
+                            return 0.0
+                        if a >= end_s:
+                            return 1.0
+                        span = max(1.0, end_s - start_s)
+                        x = max(0.0, min(1.0, (a - start_s) / span))
+                        # f in [0..1], logarithmic-ish easing.
+                        k = 9.0
+                        try:
+                            f = math.log1p(k * x) / math.log1p(k)
+                        except Exception:
+                            f = x
+                        return (1.0 / 3.0) + ((2.0 / 3.0) * max(0.0, min(1.0, f)))
+
+                    explicit_offline = False
+                    if st:
+                        try:
+                            offline_ts = float(getattr(st, "app_offline_ts", 0.0) or 0.0)
+                            if offline_ts > 0.0 and float(seen_ts) <= offline_ts:
+                                explicit_offline = True
+                        except Exception:
+                            explicit_offline = False
+
+                    # Base palette for the small status square.
+                    APP_ON = "#2bbf66"
+                    APP_OFF = "#0e2d1a"
+                    MESH_ON = "#d9b233"
+                    MESH_OFF = "#2f2206"
+                    # Contact indicator policy:
+                    # - show green only for "fresh" meshTalk app activity (<= CONTACT_STALE_SECONDS) and valid keys
+                    # - otherwise, fall back to Meshtastic device presence (yellow) if available
+                    if app_seen_any and keys_ok and app_seen_fresh:
                         if app_recent:
                             status_code = "app_online"
-                        elif app_seen_fresh:
+                            status_color = APP_ON
+                        else:
                             status_code = "app_offline"
-                        else:
-                            status_code = None
-                    elif not app_seen_any:
-                        if device_recent:
-                            status_code = "mesh_online"
-                        elif device_seen_fresh:
-                            status_code = "mesh_offline"
-                        else:
-                            status_code = None
+                            if explicit_offline:
+                                status_color = APP_OFF
+                            else:
+                                status_color = mix_hex(APP_ON, APP_OFF, _fade_ratio(float(now_ts - float(seen_ts or 0.0))))
                     else:
-                        # App was seen, but keys are not valid now (e.g. mismatch/reset):
-                        # keep device presence indicator instead of hiding status completely.
                         if device_recent:
                             status_code = "mesh_online"
+                            status_color = MESH_ON
                         elif device_seen_fresh:
                             status_code = "mesh_offline"
+                            status_color = mix_hex(MESH_ON, MESH_OFF, _fade_ratio(float(now_ts - float(device_ts or 0.0))))
                         else:
                             status_code = None
+                            status_color = None
                     if visibility_mode == "online" and status_code not in ("app_online", "mesh_online"):
                         return
                     if visibility_mode == "app" and status_code not in ("app_online", "app_offline"):
@@ -6465,6 +7333,7 @@ def main() -> int:
                         "unread": unread,
                         "last_rx_ts": float(dialogs.get(item_id, {}).get("last_rx_ts", 0.0) or 0.0),
                         "status_code": status_code,
+                        "status_color": status_color or "",
                     },
                 )
                 items_list.addItem(item)
@@ -7877,6 +8746,7 @@ def main() -> int:
             except Exception as ex:
                 log_line(f"{ts_local()} SENDSTD: failed -> {peer_id} ({type(ex).__name__}: {ex})", "warn")
                 return False
+            activity_record("out", "msg", 1)
             msg_id = f"mtxt:{os.urandom(4).hex()}"
             try:
                 if isinstance(pkt, dict):
@@ -7927,6 +8797,7 @@ def main() -> int:
             except Exception as ex:
                 log_line(f"{ts_local()} SENDSTD: failed -> Primary ({type(ex).__name__}: {ex})", "warn")
                 return False
+            activity_record("out", "msg", 1)
             msg_id = f"mtxt:{os.urandom(4).hex()}"
             try:
                 if isinstance(pkt, dict):
