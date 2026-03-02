@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-rem Simple launcher for meshTalk.exe (keeps window open).
+rem Simple launcher for meshTalk.exe (non-blocking).
 
 set "EXE=%~dp0dist\meshTalk.exe"
 if not exist "%EXE%" (
@@ -10,8 +10,12 @@ if not exist "%EXE%" (
   exit /b 1
 )
 
-"%EXE%"
+cd /d "%~dp0"
+start "" "%EXE%"
+if errorlevel 1 (
+  echo ERROR: failed to start %EXE%
+  pause
+  exit /b 1
+)
 
-echo.
-pause
 endlocal

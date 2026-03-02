@@ -1,9 +1,15 @@
 # meshTools
 
 Author: Anton Vologzhanin (R3VAF)
-Current version: 0.4.0
+Current version: 0.6.0
 
 Small utilities around Meshtastic.
+
+## meshTalk in short
+
+- Purpose: desktop client for resilient message exchange over Meshtastic mesh links with delivery feedback.
+- Principle: messages are split into packet groups and sent with ACK/retry/backoff; route is chosen per peer (`meshTalk` protocol path or plain Meshtastic text).
+- Protocol path: MT-WIREv2 transport + KR1/KR2 key exchange.
 
 ## Project Vision
 
@@ -34,9 +40,10 @@ Small utilities around Meshtastic.
 ## Key capabilities
 
 - Best-effort delivery over Meshtastic with ACK/retry/backoff and message status tracking.
-- Per-peer key exchange flow (KR1/KR2), MT-WIRE AES-256-GCM container, and local at-rest sealing for profile data.
+- Per-peer key exchange flow (MT2 KR1/KR2 binary frames), MT-WIREv2 AES-256-GCM container, and local at-rest sealing for profile data.
 - Dedicated `Primary` dialog for Meshtastic broadcast/public text channel (`TEXT_MESSAGE_APP`), with direct messages routed to contact dialogs.
 - Adaptive pacing and queue control to reduce traffic noise.
+- Activity controller models in Settings: `Trickle (RFC 6206)`, `LEDBAT (RFC 6817)`, `QUIC-style loss recovery + pacing`.
 - Traceroute integration in dialogs with route details and diagnostics.
 - Compression with automatic mode selection (`DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `ZSTD`) plus reversible normalization (`Token stream`, `SentencePiece vocab`).
 - Runtime observability: colorized event log, health snapshots, compression stats (`COMPRESS`/`COMPSTAT`).
@@ -127,17 +134,20 @@ In the GUI, use the search box to type a node id (e.g. `02e591e0` or `!02e591e0`
 
 Keys are stored in `keyRings/` as `<id>.key` and `<id>.pub` (leading `!` is stripped).
 If `keyRings/<id>.key` / `keyRings/<id>.pub` are missing, they are generated automatically.
-Local at-rest storage key is stored in `keyRings/storage.key` (32 bytes, base64; created automatically).
+Local at-rest storage key backend is configurable via `MESHTALK_STORAGE_BACKEND`:
+- `file` (default): key in `keyRings/storage.key`
+- `keyring`: key only in OS keyring
+- `auto`: prefer OS keyring, fallback to file
 
 ## Cryptography (where/when)
 
 This project uses cryptographic primitives for payload sealing and local at-rest sealing. It does not claim or guarantee any specific security properties.
 On startup the runtime log prints a `CRYPTO:` line with the active primitive set.
 
-- Key exchange frames (MT-KEY v1): `KR1|...` / `KR2|...`
-  - Format: plaintext UTF-8/ASCII with `|` separators.
-  - Public key: X25519 public key (32 raw bytes, base64 in the frame).
-- Transport container (MT-WIRE v1): AES-256-GCM (AEAD)
+- Key exchange frames (MT2 plaintext control):
+  - `HELLO` broadcast: fixed 9-byte MT2 frame (no public key inside HELLO).
+  - `KR1` / `KR2` unicast: fixed binary MT2 frames with X25519 public key (32 bytes) and nonce4.
+- Transport container (MT-WIRE v2): AES-256-GCM (AEAD)
   - Key derivation: X25519 ECDH + HKDF-SHA256 -> 32-byte AES key (see `meshtalk/protocol.py` and `meshtalk/protocol.txt`).
   - Applied: to all MSG/ACK frames on the Meshtastic `PRIVATE_APP` port.
 - Local at-rest sealing (per node profile): AES-256-GCM (AEAD)
@@ -155,15 +165,185 @@ HKDF(static_shared || ephemeral_shared). Full details: `meshtalk/protocol.txt`.
 Full, versioned specification: `meshtalk/protocol.txt`.
 
 Quick summary:
-- MT-KEY v1 (plaintext): `KR1|...` / `KR2|...`
-- MT-WIRE v1 (AES-256-GCM): `[ver=1][type][msg_id(8)][nonce(12)][ct||tag]`
+- MT2 plaintext control: fixed binary frames (`HELLO`, `KR1`, `KR2`) on `PRIVATE_APP`.
+- MT-WIRE v2 (AES-256-GCM): `[ver=2][type][msg_id(8)][nonce(12)][ct||tag]`
 - MT-MSG v2 (inside MSG): binary `M2` framing (16-byte header + chunk)
 - MT-ACK (inside ACK): UTF-8 `ACK|...`
 
 ## User Manuals
 
-- English: `documentation/user_manual_en.txt`
-- Русский: `documentation/user_manual_ru.txt`
+- Primary documentation: `README.md`
+- Change history: `CHANGELOG.md`
+- Third-party notices: `THIRD_PARTY_LICENSES.md`
+
+## Routing Trace Harness
+
+Offline replay tool for routing policy comparison:
+
+```bash
+python3 tools/routing_trace_harness.py tools/sample_routing_trace.jsonl
+```
+
+Outputs two metric sets:
+- `BASELINE`: old simple preference policy
+- `ROUTING2`: score/hysteresis/failover policy
+
+## Routing2: how route selection works
+
+Implementation:
+- `meshtalk/routing.py` (`RoutingController`, `LinkStats`, `RoutingConfig`)
+- Integration in `meshTalk.py` via `select_delivery_route(...)` and group send policy.
+
+Design constraints:
+- local-only observations (no topology flooding),
+- compatibility with current message/ACK/handshake formats,
+- lower retry noise under weak RF conditions,
+- stable route choice (anti-flapping) with fast failover.
+
+### Inputs and per-route statistics
+
+For each `peer_id + route_id` (for now `meshTalk` and `meshtastic_text`) controller keeps:
+- delivery EMA,
+- timeout EMA,
+- retry EMA,
+- micro-retry EMA,
+- SNR EMA (from passive RX telemetry),
+- hops EMA,
+- RTT EMA and short history (p50/p95 derived),
+- samples count and last update timestamp.
+
+Smoothing and aging:
+- EMA coefficient: `routing_ema_alpha` (default `0.22`).
+- Time decay: `routing_decay_half_life_seconds` (default `1200`).
+- Route confidence uses both sample count and freshness:
+  - `sample_trust = min(samples / routing_min_samples, 1.0)`
+  - `age_trust = max(0, 1 - age / routing_route_ttl_seconds)`
+  - `trust = sample_trust * age_trust`
+
+### Score model
+
+Normalized factors:
+- `delivery`, `timeout_rate`,
+- `rtt_norm` (from p50 RTT / `routing_rtt_ref_seconds`),
+- `hops_norm` (hops / `routing_hops_ref`),
+- `retry_norm` (retry EMA / `routing_retry_ref`),
+- `micro_norm` (micro-retry EMA / `routing_retry_ref`),
+- `congestion_norm` (pending queue depth / `routing_queue_ref`),
+- `snr_bonus` (snr EMA / `routing_snr_ref_db`).
+
+Weighted raw score:
+- `raw = +w_delivery*delivery - w_timeout*timeout - w_rtt*rtt_norm - w_hops*hops_norm - w_retry*retry_norm - w_micro*micro_norm - w_congestion*congestion_norm + w_snr_bonus*snr_bonus`
+- final: `score = raw * max(0.05, trust)`
+
+Defaults are configured through `routing_score_*` keys in config.
+
+### Unicast route choice
+
+Candidate routes are scored and sorted; controller stores top-3 as `k_best`.
+
+Anti-flapping and failover logic:
+- `sticky_hold`: keep previous route for `routing_sticky_hold_seconds`.
+- `hysteresis`: switch only if improvement is above threshold:
+  - `threshold = max(routing_hysteresis_abs, abs(prev_score)*routing_hysteresis_rel)`.
+- `fast_failover`: switch immediately when previous route degrades sharply:
+  - timeout EMA >= `routing_failover_timeout_ema`, or
+  - delivery EMA <= `routing_failover_delivery_ema`, or
+  - RTT >= `routing_failover_rtt_seconds`.
+
+Decision reasons in logs/API:
+- `best_score`, `sticky_hold`, `hysteresis_hold`, `hysteresis_pass`, `fast_failover`.
+
+### Group/broadcast policy
+
+- `group:Primary`: always plain Meshtastic broadcast text (`TEXT_MESSAGE_APP`).
+- Custom groups:
+  - each member gets normal unicast decision first,
+  - meshTalk route is allowed only for top peers from `choose_group_targets(...)`,
+  - cap by `routing_group_fanout_cap`,
+  - require score >= `routing_group_min_score`,
+  - others fallback to `meshtastic_text` with reason `group_fanout_cap`.
+
+This keeps fanout noise bounded on shared RF medium.
+
+### Control-plane shaping
+
+`allow_control(kind)` uses token bucket + per-kind floor:
+- `routing_control_rate_per_second` (default `0.20`),
+- `routing_control_burst` (default `3.0`),
+- `routing_control_min_interval_seconds` (default `2.0`).
+
+Applied to key requests, discovery/offline beacons, and encrypted control frames (`ctrl_*`).
+Dropped control attempts increment `control_dropped_total`.
+
+### Diagnostics and counters
+
+`ROUTE2` log line includes:
+- selected route,
+- score and trust,
+- decision reason,
+- compact alternative routes (`alt=[...]`),
+- strongest score contributors (`top=[...]`).
+
+Counters:
+- `route_select_total`,
+- `route_switch_total`,
+- `route_hold_hysteresis`,
+- `route_failover_total`,
+- `control_dropped_total`.
+
+Runtime `HEALTH` and Graph metrics expose key counters (`route_switch_total`, `route_failover_total`, `route_hysteresis_hold_total`).
+
+### Routing-focused runtime observability
+
+For live routing/debug sessions, prefer these log families:
+- `SEND_DATA`: payload frames; includes `flow=<id>`, `part=X/Y`, `route=<route_id>/<reason>`.
+- `SEND_CTRL`: encrypted control frames (`token_adv`, `caps`, `caps_req`, `hop_ack`, `end_ack`); same `flow=` correlation.
+- `FLOW`: compact lifecycle lines:
+  - `queue` when a payload enters retry state,
+  - `tx` on first transmit,
+  - `ack` on `hop_ack`,
+  - `delivered` on local `end_ack`.
+- `ROUTE_SWITCH`: route change decisions for a peer.
+- `ROUTE2`: compact scoring explanation for the current routing choice.
+- `HEALTH`: periodic aggregate status, including pending queue depth.
+- `PENDING_FLOWS`: which flows are currently holding the queue (`peer:type/attempts/parts/flow`).
+- `TRANSPORT_SNAPSHOT`: per direct-ready peer transport state and routing metrics snapshot.
+- `TRACE`: end-to-end Meshtastic traceroute, useful to validate actual transit path beyond local route scoring.
+- `PKT`: raw wire visibility (only useful when packet trace is enabled; duplicate suppression lines are low-level noise, not route decisions).
+
+`HEALTH` now reports pending queue breakdown by data/control and by frame type, which helps distinguish a stuck user payload from a delayed control-plane handshake.
+
+### Transport Tab (Settings)
+
+`Settings -> Transport` is the runtime routing monitor.
+
+It contains:
+- transport status summary,
+- route table for direct `meshTalk` peers only,
+- a unified relay buffer (incoming transit assembly + outgoing retry queue).
+
+The route table is intentionally focused on peers that are currently `direct_ready` over `meshTalk`, because these are the links that actually participate in local route selection. For each direct peer it shows:
+- whether `meshTalk` is currently the active path (`Path = active|standby`),
+- selected score,
+- delivery EMA,
+- timeout EMA,
+- RTT (p50),
+- hops EMA,
+- retry EMA,
+- SNR EMA,
+- age since last metric refresh.
+
+This is the same metric set used by `RoutingController` scoring and hysteresis logic.
+
+### Key-sync retry note
+
+Current build does not enforce a hard global "stop after 7 minutes" timeout for KR1 retries.
+Key requests are throttled by:
+- local per-peer 5-second gate,
+- control-plane token bucket,
+- state transitions (`KOF1` offline signal, pinned mismatch policy, key confirmed state).
+
+If you need strict cutoff semantics, implement explicit `key_req_deadline_ts` / max-attempt policy in `send_key_request()` + `send_due()` loop.
 
 ## Runtime Log: Event Types and UI Colors
 
@@ -175,10 +355,16 @@ Log lines are colorized in the GUI by event prefix (as a reading aid only):
 - `TRACE` (cyan, `#66d9ef`): traceroute.
 - `PACE` (green, `#a6e22e`): adaptive pacing suggestions/changes.
 - `HEALTH` (mint, `#6be5b5`): periodic health line.
+- `PENDING_FLOWS` (mint, `#6be5b5`): compact list of flows currently holding the retry queue.
+- `SEND_DATA` (default log color): encrypted payload send.
+- `SEND_CTRL` (default log color): encrypted control-plane send.
+- `FLOW` (default log color): queue/tx/ack/delivered correlation line.
 - `DISCOVERY` (violet, `#b894ff`): discovery/broadcast scheduling.
 - `RADIO` (blue, `#74b2ff`): connect/disconnect and low-level radio events.
+- `TRANSPORT_SNAPSHOT` (mint, `#6be5b5`): direct peer transport state + routing metric snapshot.
 - `GUI` (light, `#e0e0e0`): GUI lifecycle events.
 - `QUEUE` (sand, `#c3b38a`): queue changes/clears.
+- `PKT` (default log color): low-level packet trace (only when packet trace logging is enabled).
 - `COMPRESS` / `COMPSTAT` (default log color): compression decision and periodic compression/normalization efficiency totals.
 
 The script detects your node id from the radio automatically.
@@ -333,6 +519,38 @@ Output: `dist\meshTalk.exe`
 - Сжатие с авто-выбором режима (`DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `ZSTD`) и обратимой нормализацией (`Token stream`, `SentencePiece vocab`).
 - Наблюдаемость runtime: цветной лог событий, health-сводки, статистика сжатия (`COMPRESS`/`COMPSTAT`).
 
+## Отладка маршрутизации
+
+Для отладки маршрутизации и прохождения сообщений используйте следующие линии лога:
+- `SEND_DATA`: полезная нагрузка; содержит `flow=<id>`, `part=X/Y`, `route=<route_id>/<reason>`.
+- `SEND_CTRL`: служебные кадры (`token_adv`, `caps`, `caps_req`, `hop_ack`, `end_ack`) с тем же `flow=`.
+- `FLOW`: короткая трасса жизненного цикла кадра:
+  - `queue` — постановка в очередь,
+  - `tx` — первая отправка,
+  - `ack` — `hop_ack`,
+  - `delivered` — локально полученный `end_ack`.
+- `ROUTE_SWITCH`: смена маршрута для пира.
+- `ROUTE2`: компактное объяснение выбора маршрута (`reason`, `alt=[...]`, `top=[...]`).
+- `HEALTH`: периодическая сводка по очереди и счетчикам маршрутизации.
+- `PENDING_FLOWS`: какие именно flow сейчас держат очередь (`peer:type/attempts/parts/flow`).
+- `TRANSPORT_SNAPSHOT`: состояние direct-ready пиров и краткий срез routing-метрик.
+- `TRACE`: сквозная Meshtastic traceroute для проверки реального transit-path.
+- `PKT`: низкоуровневый packet trace; строки `suppress duplicate` диагностируют дедупликацию, а не выбор маршрута.
+
+В `Настройки -> Транспорт`:
+- таблица маршрутов показывает только direct-ready `meshTalk` пиры;
+- столбец `Путь` показывает `active` / `standby`;
+- выводятся именно метрики, которыми пользуется routing:
+  - `Оценка`,
+  - `Доставка`,
+  - `Таймаут`,
+  - `RTT`,
+  - `Хопы`,
+  - `Ретраи`,
+  - `SNR`,
+  - `Возраст`.
+- буфер объединен в один runtime-список: входящая транзитная сборка + исходящая retry-очередь.
+
 ## Требования
 
 - Python 3.9+
@@ -430,7 +648,7 @@ python meshTalk.py
 - Обмен ключами (MT-KEY v1): кадры `KR1|...` / `KR2|...`
   - Формат: plaintext UTF-8/ASCII с разделителем `|`.
   - Публичный ключ: X25519 public key (32 raw bytes, base64 внутри кадра).
-- Транспортный контейнер (MT-WIRE v1): AES-256-GCM (AEAD)
+- Транспортный контейнер (MT-WIRE v2): AES-256-GCM (AEAD)
   - Вычисление ключа: X25519 ECDH + HKDF-SHA256 -> 32-байтный AES key (см. `meshtalk/protocol.py` и `meshtalk/protocol.txt`).
   - Применяется: ко всем MSG/ACK кадрам на порту Meshtastic `PRIVATE_APP`.
 - Локальное запечатывание на диске (профиль ноды): AES-256-GCM (AEAD)

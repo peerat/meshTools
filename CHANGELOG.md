@@ -2,6 +2,30 @@
 
 ## EN
 
+### 0.6.0 (2026-03-02)
+
+Added
+- Multi-hop `meshTalk` routing:
+  - earlier `meshTalk` payload exchange was effectively direct-only between two peers,
+  - now encrypted `meshTalk` traffic can be relayed through intermediate nodes when a direct path is unavailable or worse.
+- New protocol generation:
+  - encrypted traffic now uses `MT-WIRE v2`,
+  - service/control exchange now uses binary MT2 frames (`HELLO`, `KR1`, `KR2`) instead of the old text-style control exchange.
+- Settings -> Transport was redesigned for live routing diagnostics:
+  - incoming transit assembly and outgoing retry queue are shown in one combined buffer,
+  - the route table now focuses only on peers that are actually reachable by direct `meshTalk`,
+  - the table shows the routing metrics that affect path choice,
+  - the `Path` column shows whether `meshTalk` is currently active or only on standby for that peer.
+
+Changed
+- Protocol behavior for users:
+  - the old generation used text-like key/control frames, the previous transport envelope, and in practice relied on direct peer-to-peer delivery,
+  - the new generation uses shorter binary control frames and the `MT-WIRE v2` transport format,
+  - this enables cleaner separation between broadcast hello, key exchange, service traffic, and payload traffic,
+  - most importantly, `meshTalk` is no longer limited to direct-only exchange and can use relay nodes for delivery,
+  - logs and diagnostics now reflect these stages explicitly, so protocol state is easier to understand.
+- Routing and transport diagnostics are now structured around actual message progression, so it is easier to understand what path was chosen, what is still pending, and where delivery is blocked.
+
 ### Unreleased
 
 Added
@@ -142,6 +166,30 @@ Removed
 - Duplicate "attempt" lines from chat history view after restart.
 
 ## RU
+
+### 0.6.0 (2026-03-02)
+
+Добавлено
+- Многоскачковая маршрутизация `meshTalk`:
+  - раньше обмен полезной нагрузкой `meshTalk` по сути работал только direct между двумя пирами,
+  - теперь зашифрованный `meshTalk` трафик может идти через промежуточные узлы, если direct-путь недоступен или хуже.
+- Новое поколение протокола:
+  - зашифрованный трафик теперь идет через `MT-WIRE v2`,
+  - служебный/control-обмен теперь использует бинарные MT2-кадры (`HELLO`, `KR1`, `KR2`) вместо старого текстоподобного формата.
+- Вкладка `Настройки -> Транспорт` переделана под живую диагностику маршрутизации:
+  - входящая транзитная сборка и исходящая retry-очередь объединены в один буфер,
+  - таблица маршрутов теперь показывает только тех пиров, которые реально доступны direct по `meshTalk`,
+  - в таблице видны именно те метрики, которые влияют на выбор маршрута,
+  - столбец `Путь` показывает, активен сейчас `meshTalk` для этого пира или находится в режиме ожидания.
+
+Изменено
+- Что изменилось для пользователя в самом протоколе:
+  - в старой версии ключевой и служебный обмен шел через текстоподобные кадры и старый транспортный конверт, а сам обмен `meshTalk` на практике был direct-only,
+  - в новой версии служебные кадры стали короче и бинарными, а транспорт перешел на `MT-WIRE v2`,
+  - broadcast-hello, обмен ключами, служебный трафик и полезная нагрузка теперь разделены заметно чище,
+  - самое важное: `meshTalk` больше не ограничен прямым обменом и теперь может доставлять сообщения через relay-узлы,
+  - по логам и диагностике стало проще понять, на каком именно этапе сейчас находится обмен.
+- Диагностика маршрутизации и транспорта теперь строится вокруг реального прохождения сообщения: проще увидеть выбранный путь, текущие ожидания и место, где доставка останавливается.
 
 ### Unreleased
 
