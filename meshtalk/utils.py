@@ -632,9 +632,9 @@ def assemble_compact_parts(
     legacy_codec: Optional[str],
     show_partial: bool = True,
 ) -> Tuple[str, bool]:
-    # Local import keeps utility module lightweight and avoids hard dependency
-    # during contexts where message_text_compression is not used.
-    from message_text_compression import decompress_text
+    # Local import keeps the utility module lightweight and avoids a hard
+    # dependency during contexts where compression is not used.
+    from meshtalk.compression import decompress_text
 
     if not isinstance(parts, dict) or int(total) <= 0:
         return ("", True)
@@ -794,19 +794,23 @@ def format_meta_text(
                 cmp_tail = f", {line}"
     status_map_ru = {
         "timeout": "таймаут",
+        "send_blocked": "радиоинтерфейс занят",
         "queue_limit": "лимит очереди",
         "too_long": "слишком длинное",
         "payload_too_big": "слишком большой пакет",
         "nack": "nack",
         "decode_error": "ошибка декодирования",
+        "canceled": "отменено",
     }
     status_map_en = {
         "timeout": "timeout",
+        "send_blocked": "radio interface busy",
         "queue_limit": "queue limit",
         "too_long": "too long",
         "payload_too_big": "payload too big",
         "nack": "nack",
         "decode_error": "decode error",
+        "canceled": "canceled",
     }
     if is_ru:
         status_text = status_map_ru.get(status, status or "")

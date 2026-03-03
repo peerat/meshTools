@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from meshtalk_utils import (
+from meshtalk.utils import (
     compress_for_encrypt_with_method,
     compression_method_from_payload,
     maybe_decompress_after_decrypt,
@@ -35,12 +35,14 @@ def b64d(s: str) -> bytes:
 
 
 def load_priv(path: str) -> x25519.X25519PrivateKey:
-    raw = b64d(open(path, "r", encoding="utf-8").read().strip())
+    with open(path, "r", encoding="utf-8") as f:
+        raw = b64d(f.read().strip())
     return x25519.X25519PrivateKey.from_private_bytes(raw)
 
 
 def load_pub(path: str) -> x25519.X25519PublicKey:
-    raw = b64d(open(path, "r", encoding="utf-8").read().strip())
+    with open(path, "r", encoding="utf-8") as f:
+        raw = b64d(f.read().strip())
     return x25519.X25519PublicKey.from_public_bytes(raw)
 
 

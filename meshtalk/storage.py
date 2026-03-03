@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -13,7 +15,7 @@ from typing import Dict, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from meshtalk_utils import (
+from meshtalk.utils import (
     HISTORY_TEXT_ENC_PREFIX,
     HISTORY_TEXT_PREFIX,
     encode_history_text,
@@ -24,6 +26,16 @@ from meshtalk_utils import (
 
 HISTORY_META_PREFIX = "meta64:"
 HISTORY_META_MAX_BYTES = 8192
+STORAGE_BACKEND_FILE = "file"
+STORAGE_BACKEND_KEYRING = "keyring"
+STORAGE_BACKEND_AUTO = "auto"
+_WIN_ACL_DONE: set[str] = set()
+_WIN_ACL_LOCK = threading.Lock()
+
+
+def _win_acl_enabled() -> bool:
+    raw = str(os.environ.get("MESHTALK_WIN_ACL", "1") or "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
 
 
 def maybe_set_private_umask() -> None:
@@ -44,6 +56,9 @@ def harden_dir(path: str) -> None:
     except Exception:
         return
     if sys.platform.startswith("win"):
+        if not _win_acl_enabled():
+            return
+        _harden_windows_acl(path)
         return
     try:
         os.chmod(path, 0o700)
@@ -55,6 +70,9 @@ def harden_file(path: str) -> None:
     if not path:
         return
     if sys.platform.startswith("win"):
+        if not _win_acl_enabled():
+            return
+        _harden_windows_acl(path)
         return
     try:
         os.chmod(path, 0o600)
@@ -62,18 +80,114 @@ def harden_file(path: str) -> None:
         pass
 
 
+def _harden_windows_acl(path: str) -> None:
+    if not path or (not sys.platform.startswith("win")):
+        return
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = str(path)
+    try:
+        with _WIN_ACL_LOCK:
+            if abs_path in _WIN_ACL_DONE:
+                return
+    except Exception:
+        pass
+    user = str(os.environ.get("USERNAME", "") or "").strip()
+    if not user:
+        return
+    try:
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        startupinfo = None
+        if hasattr(subprocess, "STARTUPINFO") and hasattr(subprocess, "STARTF_USESHOWWINDOW"):
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            except Exception:
+                startupinfo = None
+        subprocess.run(
+            [
+                "icacls",
+                abs_path,
+                "/inheritance:r",
+                "/grant:r",
+                f"{user}:F",
+                "SYSTEM:F",
+                "Administrators:F",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+        try:
+            with _WIN_ACL_LOCK:
+                _WIN_ACL_DONE.add(abs_path)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _storage_backend_mode() -> str:
+    raw = str(os.environ.get("MESHTALK_STORAGE_BACKEND", STORAGE_BACKEND_FILE) or STORAGE_BACKEND_FILE).strip().lower()
+    if raw in (STORAGE_BACKEND_FILE, STORAGE_BACKEND_KEYRING, STORAGE_BACKEND_AUTO):
+        return raw
+    return STORAGE_BACKEND_FILE
+
+
+def _keyring_slot(keydir: str) -> str:
+    full = os.path.abspath(str(keydir or ""))
+    digest = hashlib.sha256(full.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"profile:{digest}"
+
+
+def _keyring_load_storage_key(keydir: str) -> Optional[bytes]:
+    try:
+        import keyring  # type: ignore
+    except Exception:
+        return None
+    try:
+        token = keyring.get_password("meshTalk.storage", _keyring_slot(keydir))
+    except Exception:
+        return None
+    if not token:
+        return None
+    try:
+        raw = base64.b64decode(str(token).encode("ascii"), validate=True)
+        if len(raw) == 32:
+            return raw
+    except Exception:
+        return None
+    return None
+
+
+def _keyring_store_storage_key(keydir: str, raw_key: bytes) -> bool:
+    try:
+        import keyring  # type: ignore
+    except Exception:
+        return False
+    try:
+        keyring.set_password(
+            "meshTalk.storage",
+            _keyring_slot(keydir),
+            base64.b64encode(bytes(raw_key)).decode("ascii"),
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _storage_encrypt_str(value: object, key: Optional[bytes], aad: bytes) -> object:
     if value is None:
         return value
     if not key:
-        return value
+        raise ValueError("storage key is not available")
     text = str(value)
-    try:
-        nonce = os.urandom(12)
-        ct = AESGCM(key).encrypt(nonce, text.encode("utf-8"), aad)
-        return HISTORY_TEXT_ENC_PREFIX + base64.b64encode(nonce + ct).decode("ascii")
-    except Exception:
-        return value
+    nonce = os.urandom(12)
+    ct = AESGCM(key).encrypt(nonce, text.encode("utf-8"), aad)
+    return HISTORY_TEXT_ENC_PREFIX + base64.b64encode(nonce + ct).decode("ascii")
 
 
 def _storage_decrypt_str(value: object, key: Optional[bytes], aad: bytes) -> object:
@@ -213,26 +327,53 @@ class Storage:
     def ensure_storage_key(self) -> Optional[bytes]:
         if self.storage_key:
             return self.storage_key
+        mode = _storage_backend_mode()
+        keydir_here = str(self.keydir or "")
+        if mode in (STORAGE_BACKEND_KEYRING, STORAGE_BACKEND_AUTO) and keydir_here:
+            kr_raw = _keyring_load_storage_key(keydir_here)
+            if isinstance(kr_raw, (bytes, bytearray)) and len(bytes(kr_raw)) == 32:
+                self.storage_key = bytes(kr_raw)
+                set_history_encryption_key(self.storage_key)
+                return self.storage_key
+            if mode == STORAGE_BACKEND_KEYRING:
+                try:
+                    raw_new = os.urandom(32)
+                    if _keyring_store_storage_key(keydir_here, raw_new):
+                        self.storage_key = raw_new
+                        set_history_encryption_key(raw_new)
+                        return self.storage_key
+                except Exception:
+                    pass
+                return None
         if not self.storage_key_file:
             return None
         harden_dir(os.path.dirname(self.storage_key_file) or ".")
         # Load existing key
         try:
             if os.path.isfile(self.storage_key_file):
+                with open(self.storage_key_file, "r", encoding="utf-8") as f:
+                    raw_b64 = f.read().strip()
                 raw = base64.b64decode(
-                    open(self.storage_key_file, "r", encoding="utf-8").read().strip().encode("ascii"),
+                    raw_b64.encode("ascii"),
                     validate=True,
                 )
                 if len(raw) == 32:
                     self.storage_key = raw
                     set_history_encryption_key(raw)
                     harden_file(self.storage_key_file)
+                    if keydir_here:
+                        _keyring_store_storage_key(keydir_here, raw)
                     return self.storage_key
         except Exception:
             pass
         # Create new key
         try:
             raw = os.urandom(32)
+            if mode == STORAGE_BACKEND_AUTO and keydir_here:
+                if _keyring_store_storage_key(keydir_here, raw):
+                    self.storage_key = raw
+                    set_history_encryption_key(raw)
+                    return self.storage_key
             tmp = self.storage_key_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(base64.b64encode(raw).decode("ascii"))
@@ -282,8 +423,16 @@ class Storage:
             peer_norm = peer_norm_fn(peer_id)
         else:
             peer_norm = str(peer_id or "")
+        key_ok = self.ensure_storage_key()
+        if not key_ok:
+            # Fail closed: avoid writing plaintext history when storage key is unavailable.
+            return
         aad = f"{direction}|{peer_norm}|{msg_id}".encode("utf-8", errors="replace")
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} | {direction} | {peer_norm} | {msg_id} | {encode_history_text(text, aad=aad)}"
+        try:
+            enc_text = encode_history_text(text, aad=aad)
+        except Exception:
+            return
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} | {direction} | {peer_norm} | {msg_id} | {enc_text}"
         extras: list[str] = []
         extra_text = str(extra).strip()
         if extra_text:
@@ -443,6 +592,9 @@ class Storage:
     def save_state(self, pending_by_peer: Dict[str, Dict[str, Dict[str, object]]]) -> None:
         import json
 
+        storage_key = self.ensure_storage_key()
+        if not storage_key:
+            return
         tmp = self.state_file + ".tmp"
         harden_dir(os.path.dirname(self.state_file) or ".")
         flat = []
@@ -459,7 +611,7 @@ class Storage:
                             if field in out and out.get(field) is not None:
                                 out[field] = _storage_encrypt_str(
                                     out.get(field),
-                                    self.storage_key,
+                                    storage_key,
                                     aad_base + b"|" + field.encode("ascii"),
                                 )
                     flat.append(out)
@@ -529,6 +681,9 @@ class Storage:
     def save_incoming_state(self, incoming: Dict[str, Dict[str, object]]) -> None:
         import json
 
+        storage_key = self.ensure_storage_key()
+        if not storage_key:
+            return
         tmp = self.incoming_file + ".tmp"
         harden_dir(os.path.dirname(self.incoming_file) or ".")
         flat = []
@@ -552,7 +707,7 @@ class Storage:
                 parts_str[part_idx] = str(
                     _storage_encrypt_str(
                         str(v),
-                        self.storage_key,
+                        storage_key,
                         aad_base + b"|" + part_idx.encode("ascii", errors="replace"),
                     )
                 )

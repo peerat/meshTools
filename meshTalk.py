@@ -49,7 +49,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from meshtalk_utils import (
+from meshtalk.utils import (
     format_meta_text,
     format_duration_mmss,
     snapshot_runtime_state,
@@ -199,7 +199,7 @@ from meshtalk.relay_protocol import (
 )
 from meshtalk.relay_state import RelayState
 from meshtalk.routing import RoutingController
-from message_text_compression import (
+from meshtalk.compression import (
     MODE_BZ2,
     MODE_DEFLATE,
     MODE_BYTE_DICT,
@@ -938,7 +938,7 @@ def infer_compact_norm_from_chunk(chunk: bytes) -> Optional[str]:
         flags = int(raw[5]) & 0xFF
     except Exception:
         return None
-    # message_text_compression.FLAG_TOKEN_STREAM
+    # meshtalk.compression.FLAG_TOKEN_STREAM
     if (flags & (1 << 4)) != 0:
         return "TOKEN_STREAM"
     return "off"

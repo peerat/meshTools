@@ -1,4 +1,4 @@
-meshTalk v0.4.0
+meshTalk v0.5.0
 Author: Anton Vologzhanin (R3VAF)
 Updated: 2026-02-12
 
@@ -7,8 +7,13 @@ EN
 ========================
 
 Purpose
-- Research prototype for P2P payload exchange over Meshtastic (ACK/retry + cryptographic primitives).
-- Focused on best-effort delivery stats and experimental topology behavior study.
+- Desktop client for resilient message exchange over Meshtastic mesh links with delivery feedback.
+- Focused on best-effort delivery behavior and topology experiments.
+
+How it works
+- Messages are split into packet groups and sent with ACK/retry/backoff.
+- Route is selected per peer (`meshTalk` protocol path or plain Meshtastic text path).
+- For the meshTalk path, MT-WIREv2 transport and KR1/KR2 key exchange are used.
 
 License
 - Apache License 2.0 (`LICENSE`).
@@ -92,7 +97,9 @@ Settings
   - Force algorithm can be used for experiments.
   - ZSTD (`mc_zstd`) is supported. Dependency: `zstandard` (see `requirements.txt`).
 - Hint labels in settings use a smaller font (`QLabel#hint`, 10px) to avoid looking like regular options.
-- `Full reset` button (red, with confirmation) removes profile config/state/history/incoming/runtime logs and key files, then regenerates local keys.
+- Two red reset buttons (with confirmation):
+  - `Reset current profile` removes only the current profile data and keys, then regenerates local keys.
+  - `Reset all settings` removes all local profiles/keys/settings on this device, then recreates keys for current profile.
 
 Auto key refresh
 - Periodic key request roughly hourly (+ jitter).
@@ -105,10 +112,10 @@ Cryptography (where/when)
 - This project uses cryptographic primitives for payload sealing and local at-rest sealing.
   It does not claim or guarantee any specific security properties.
 - On startup the runtime log prints a `CRYPTO:` line with the active primitive set (MT-KEY, HKDF, MT-WIRE AEAD, at-rest sealing).
-- MT-KEY v1 (KR1/KR2 key exchange frames):
-  - Format: plaintext UTF-8/ASCII with `|` separators.
-  - Public key: X25519 public key (32 raw bytes, base64 in the frame).
-- MT-WIRE v1 (transport container):
+- MT2 key exchange/control:
+  - `HELLO`: fixed 9-byte broadcast frame (no public key in HELLO).
+  - `KR1`/`KR2`: fixed binary unicast frames containing X25519 public key (32 bytes) + nonce4.
+- MT-WIRE v2 (transport container):
   - AEAD: AES-256-GCM.
   - Key derivation: X25519 ECDH + HKDF-SHA256 -> 32-byte AES key (see `meshtalk/protocol.py` and `meshtalk/protocol.txt`).
   - Applied to all MSG/ACK frames sent over the Meshtastic `PRIVATE_APP` port.
@@ -128,11 +135,11 @@ Session rekey (where/when)
 
 Wire protocol and packet structure (reference)
 - Full specification (versioned): `meshtalk/protocol.txt`.
-- Key exchange (plaintext, MT-KEY v1):
-  - `KR1|<sender_id>|<sender_pub_b64>|key=value|...`
-  - `KR2|<sender_id>|<sender_pub_b64>|key=value|...`
-- Cryptographic container (MT-WIRE v1, AES-256-GCM AEAD):
-  - `[ver=1][type=1|2][msg_id(8)][nonce(12)][ct||tag]`
+- Key exchange/control (plaintext MT2 binary frames):
+  - `HELLO` (broadcast, fixed 9 bytes).
+  - `KR1`/`KR2` (unicast, fixed size, X25519 public key + nonce4).
+- Cryptographic container (MT-WIRE v2, AES-256-GCM AEAD):
+  - `[ver=2][type=1|2][msg_id(8)][nonce(12)][ct||tag]`
   - `type=1` MSG, `type=2` ACK
 - Message framing (inside MT-WIRE type=MSG):
   - MT-MSG v2 (binary, prefix `M2`): header is 16 bytes, then chunk data.
@@ -175,9 +182,9 @@ Project files (repository / source-controlled)
   - Storage layer: config/state/history/incoming I/O, at-rest storage key, file hardening.
 - `meshtalk/pacing.py`:
   - Adaptive sending pace controller: tunes `rate_seconds`/`parallel_sends` from recent ACK stats.
-- `meshtalk_utils.py`:
+- `meshtalk/utils.py`:
   - Shared helpers: history encode/decode, parsers, metadata formatting, wire payload assembly.
-- `message_text_compression.py`:
+- `meshtalk/compression.py`:
   - Compression codecs/modes used by message payload processing.
 - `run_meshTalk.bat`: Windows launcher.
 - `build_meshTalk.bat`: Windows single-file build helper.
@@ -185,11 +192,11 @@ Project files (repository / source-controlled)
 - `requirements.txt`: Python dependencies (includes `zstandard` for ZSTD compression).
 - `README.md`: project-level usage and options.
 - `meshTalk.txt`: focused meshTalk behavior reference.
-- `meshtools/meshLogger.txt`: focused meshLogger behavior reference.
-- `meshtools/graphGen.txt`: focused graphGen behavior reference.
-- `nodeDbUpdater.txt`: focused nodeDbUpdater behavior reference.
-- `meshtalk_utils.txt`: focused meshtalk_utils module reference.
-- `message_text_compression.txt`: focused text-compression module reference.
+- `documentation/user_manual.txt`: end-user manual.
+- `documentation/protocol_documentation.txt`: protocol and wire-format reference.
+- `documentation/routing_algorithm_documentation.txt`: routing and relay behavior reference.
+- `meshtalk/utils.py`: focused shared utility module reference.
+- `meshtalk/compression.py`: focused text-compression module reference.
 - `meshtalk/protocol.txt`: focused protocol module reference.
 - `meshtalk/storage.txt`: focused storage module reference.
 - `meshtalk/pacing.txt`: focused pacing module reference.
@@ -311,7 +318,9 @@ RU
     - SentencePiece vocab (обратимый): жадная токенизация по `meshtalk/sp_vocab.txt` перед бинарным сжатием.
       `sentencepiece` используется только чтобы генерировать/обновлять vocab; на декодирование он не влияет.
 - Подсказки в настройках показываются меньшим шрифтом (`QLabel#hint`, 10px), чтобы не выглядеть как обычные опции.
-- Кнопка `Полный сброс` (красная, с подтверждением) удаляет конфиг/очереди/историю/incoming/runtime.log и ключи профиля, затем создает новую пару локальных ключей.
+- Две красные кнопки сброса (с подтверждением):
+  - `Сброс текущего профиля` удаляет только данные текущего профиля и создает новую локальную пару ключей.
+  - `Сброс всех настроек` удаляет все локальные профили/ключи/настройки на устройстве и пересоздает текущий профиль.
 
 Автообновление ключей
 - Периодический запрос ключа примерно раз в час (+ джиттер).
@@ -321,10 +330,10 @@ RU
 Криптография (где/когда)
 - В проекте используются криптографические примитивы для запечатывания payload и локального запечатывания данных на диске.
 - При старте в runtime‑логе печатается строка `CRYPTO:` с набором активных примитивов (MT‑KEY, HKDF, MT‑WIRE AEAD, запечатывание на диске).
-- MT-KEY v1 (обмен ключами, кадры KR1/KR2):
-  - Формат: plaintext UTF-8/ASCII с разделителем `|`.
-  - Публичный ключ: X25519 public key (32 raw bytes, base64 внутри кадра).
-- MT-WIRE v1 (транспортный контейнер):
+- MT2 key exchange/control:
+  - `HELLO`: фиксированный broadcast-кадр 9 байт (без public key).
+  - `KR1`/`KR2`: фиксированные бинарные unicast-кадры с X25519 public key (32 байта) + nonce4.
+- MT-WIRE v2 (транспортный контейнер):
   - AEAD: AES-256-GCM.
   - Вычисление ключа: X25519 ECDH + HKDF-SHA256 -> 32‑байтный AES key (см. `meshtalk/protocol.py` и `meshtalk/protocol.txt`).
   - Применяется ко всем MSG/ACK кадрам, отправляемым через Meshtastic `PRIVATE_APP`.
@@ -344,11 +353,11 @@ Rekey сессии (где/когда)
 
 Wire протокол и структура пакетов (справка)
 - Полная спецификация (с версионированием): `meshtalk/protocol.txt`.
-- Обмен ключами (plaintext, MT-KEY v1):
-  - `KR1|<sender_id>|<sender_pub_b64>|key=value|...`
-  - `KR2|<sender_id>|<sender_pub_b64>|key=value|...`
-- Криптоконтейнер (MT-WIRE v1, AES-256-GCM AEAD):
-  - `[ver=1][type=1|2][msg_id(8)][nonce(12)][ct||tag]`
+- Обмен ключами/control (plaintext MT2 бинарные кадры):
+  - `HELLO` (broadcast, фиксированный размер 9 байт).
+  - `KR1`/`KR2` (unicast, фиксированный размер, X25519 public key + nonce4).
+- Криптоконтейнер (MT-WIRE v2, AES-256-GCM AEAD):
+  - `[ver=2][type=1|2][msg_id(8)][nonce(12)][ct||tag]`
   - `type=1` MSG, `type=2` ACK
 - Фрейминг сообщений (внутри MT-WIRE type=MSG):
   - MT-MSG v2 (бинарный, префикс `M2`): заголовок 16 байт + chunk данные.
@@ -391,9 +400,9 @@ Wire протокол и структура пакетов (справка)
   - Слой хранения: I/O config/state/history/incoming, ключ хранения на диске, hardening прав файлов.
 - `meshtalk/pacing.py`:
   - Автоподбор скорости отправки: подбирает `rate_seconds`/`parallel_sends` по статистике ACK.
-- `meshtalk_utils.py`:
+- `meshtalk/utils.py`:
   - Общие утилиты: кодирование/декодирование истории, парсеры, форматирование метаданных, сборка wire-пакетов.
-- `message_text_compression.py`:
+- `meshtalk/compression.py`:
   - Алгоритмы/режимы сжатия для полезной нагрузки сообщений.
 - `run_meshTalk.bat`: запуск на Windows.
 - `build_meshTalk.bat`: сборка single-file для Windows.
@@ -401,11 +410,11 @@ Wire протокол и структура пакетов (справка)
 - `requirements.txt`: зависимости Python (включая `zstandard` для сжатия ZSTD).
 - `README.md`: общее использование проекта и параметры.
 - `meshTalk.txt`: целевая справка по поведению meshTalk.
-- `meshtools/meshLogger.txt`: целевая справка по поведению meshLogger.
-- `meshtools/graphGen.txt`: целевая справка по поведению graphGen.
-- `nodeDbUpdater.txt`: целевая справка по поведению nodeDbUpdater.
-- `meshtalk_utils.txt`: целевая справка по модулю meshtalk_utils.
-- `message_text_compression.txt`: целевая справка по модулю сжатия текста.
+- `documentation/user_manual.txt`: руководство пользователя.
+- `documentation/protocol_documentation.txt`: справка по протоколу и формату кадров.
+- `documentation/routing_algorithm_documentation.txt`: справка по маршрутизации и relay-логике.
+- `meshtalk/utils.py`: целевая справка по общему utility-модулю.
+- `meshtalk/compression.py`: целевая справка по модулю сжатия текста.
 - `meshtalk/protocol.txt`: целевая справка по модулю протокола.
 - `meshtalk/storage.txt`: целевая справка по модулю хранения.
 - `meshtalk/pacing.txt`: целевая справка по модулю автоскорости.

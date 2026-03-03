@@ -28,14 +28,11 @@ Small utilities around Meshtastic.
 
 ## Contents
 
-- `meshTalk.py`: research prototype GUI for best-effort P2P payload exchange (ACK/retry, key exchange, runtime diagnostics).
-- `meshtools/meshLogger.py`: traceroute/events logger + SQLite telemetry DB (`meshLogger.db`).
-- `meshtools/graphGen.py`: Graphviz + D3 map/graph generator from collected logs/DB.
-- `meshtools/nodeDbUpdater.py`: legacy text node DB updater (`nodeDb.txt`).
-- `meshtalk/`: internal protocol/storage modules (`protocol.py`, `storage.py`).
-- `meshtalk_utils.py`: shared parsing/formatting/runtime helpers.
-- `message_text_compression.py`: compression/normalization pipeline for payload text.
-- Text references: `meshTalk.txt`, `meshtools/meshLogger.txt`, `meshtools/graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+- `meshTalk.py`: research prototype GUI for best-effort P2P and multi-hop payload exchange (ACK/retry, key exchange, runtime diagnostics).
+- `meshtalk/`: internal protocol/routing/storage modules.
+- `meshtalk/utils.py`: shared parsing/formatting/runtime helpers.
+- `meshtalk/compression.py`: compression/normalization pipeline for payload text.
+- Main references: `README.md`, `CHANGELOG.md`, `meshTalk.txt`, `documentation/user_manual.txt`, `documentation/*.txt`.
 
 ## Key capabilities
 
@@ -54,19 +51,16 @@ Small utilities around Meshtastic.
 - Meshtastic CLI in PATH (`meshtastic`)
 - `cryptography` package (for `meshTalk.py`)
 - `PySide6` package (Qt GUI for `meshTalk.py`)
-- Graphviz in PATH (`dot`) for `meshtools/graphGen.py`
 
 ## Windows notes
 
 - Install Meshtastic CLI: `pip install meshtastic` (make sure Scripts is in PATH)
-- Install Graphviz and add its `bin` to PATH
 - Use COM port (example: `--port COM3`)
 - Find real paths on your machine:
   - `where python`
   - `where meshtastic`
-  - `where dot`
 - Add missing folders to PATH (PowerShell, current user):
-  - `setx PATH "$env:PATH;C:\path\to\Python\Scripts;C:\path\to\Graphviz\bin"`
+  - `setx PATH "$env:PATH;C:\path\to\Python\Scripts"`
 - Via GUI (Windows):
   - Start -> "Environment Variables"
   - Edit `Path` -> New -> paste path -> OK
@@ -87,41 +81,11 @@ Check that tools are in PATH:
 
 ```bash
 meshtastic --help
-dot -V
 ```
 
 ## Quick start
 
-Continuous route logging (Ctrl+C to stop):
-
-```bash
-python meshtools/meshLogger.py --port /dev/ttyUSB0
-```
-
-Update node DB (one-shot):
-
-```bash
-python meshtools/nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt
-```
-
-Hourly DB updates (SQLite) are built into `meshtools/meshLogger.py`.
-Traceroutes and listen-events are stored in SQLite only (no text logs).
-
-Print DB schema:
-
-```bash
-python meshtools/meshLogger.py --db-schema
-```
-
-Generate graph from recent logs (Graphviz + D3.js):
-
-```bash
-python meshtools/graphGen.py --root .
-```
-
-Best-effort P2P payload exchange (cryptographic primitives + ACK):
-
-Qt GUI app:
+Start the Qt GUI app:
 
 ```bash
 python meshTalk.py
@@ -428,55 +392,40 @@ Output: `dist\meshTalk.exe`
 ## First run checklist
 
 - `meshtastic --help` works
-- `dot -V` works
-- `python meshtools/meshLogger.py --port ...` creates `meshLogger/YYYY-MM-DD !xxxxxxxx.txt`
-- `python meshtools/nodeDbUpdater.py --port ...` creates/updates `nodeDb.txt`
+- `python meshTalk.py` starts and shows `GUI: ready | self=...`
+- `Settings -> Transport` shows direct peers and routing metrics after handshake
 
 ## File layout
 
 ### Project files (repository / source-controlled)
 
-- `meshtools/meshLogger.py` — traceroute/logger utility.
-- `meshtools/nodeDbUpdater.py` — legacy text DB updater.
-- `meshtools/graphGen.py` — Graphviz + D3 generator.
-- `meshTalk.py` — research prototype GUI for best-effort P2P payload exchange (ACK/retry + cryptographic primitives).
+- `meshTalk.py` — research prototype GUI for best-effort P2P and multi-hop payload exchange (ACK/retry + cryptographic primitives).
 - `meshtalk/` — internal meshTalk modules:
   - `meshtalk/protocol.py` — wire protocol + cryptographic primitives.
+  - `meshtalk/routing.py` — route scoring/selection and relay decisions.
   - `meshtalk/storage.py` — config/state/history/incoming storage + at-rest sealing/hardening.
-- `meshtalk_utils.py` — shared helpers/parsers/formatters.
-- `message_text_compression.py` — text compression modes/codecs.
+- `meshtalk/utils.py` — shared helpers/parsers/formatters.
+- `meshtalk/compression.py` — text compression modes/codecs.
+- `documentation/` — user manual and focused subsystem documentation.
 - `requirements.txt` — Python dependencies.
 - `run_meshTalk.bat` / `build_meshTalk.bat` — Windows run/build scripts.
 - `README.md` / `CHANGELOG.md` / `meshTalk.txt` — docs.
 
 ### Generated during runtime (not source code)
 
-- `meshLogger/` — generated daily traceroute logs.
-- `graphGen/` — generated graph output (`dot/svg/html/json`).
-- `meshLogger.db` — generated SQLite DB.
-- `nodeDb.txt` — generated node DB (legacy mode).
 - `keyRings/` — generated key files (`<id>.key`, `<id>.pub`, peer public keys, `storage.key`).
 - `<node_id>/` — per-node runtime profile directory:
   - `config.json`, `state.json`, `incoming.json`, `history.log`, `runtime.log`, `keyRings/`.
 
 ## Notes
 
-- `nodeDb.txt` may contain sensitive data (keys, coordinates). Keep it private.
-- `.gitignore` excludes generated logs and DB.
-- `meshtools/graphGen.py` expects trace files named `YYYY-MM-DD !xxxxxxxx*.txt`.
+- Per-node profiles can contain message history, peer metadata and keys. Keep them private.
+- `.gitignore` excludes local runtime artifacts and build files.
 
 ## Troubleshooting
 
 - `meshtastic` not found: run `pip install meshtastic` and add Scripts to PATH.
-- `dot` not found: install Graphviz and add `bin` to PATH.
-- No logs: ensure `meshLogger/` has `YYYY-MM-DD !xxxxxxxx*.txt` files.
 - Device not found: check port name (Linux `/dev/ttyUSB0`, Windows `COM3`), cable, and drivers.
-
-## meshtools/graphGen.py (D3.js options)
-
-- `--no-d3` disables HTML/JSON.
-- `--d3-top N` limits top-N nodes for filtering (default: 30).
-- `--d3-min-neighbors N` filters by neighbor count (default: 0).
 
 ---
 
@@ -501,14 +450,11 @@ Output: `dist\meshTalk.exe`
 
 ## Содержание
 
-- `meshTalk.py`: исследовательский GUI-прототип best-effort P2P-обмена (ACK/повторы, обмен ключами, runtime-диагностика).
-- `meshtools/meshLogger.py`: логгер traceroute/событий + SQLite-телеметрия (`meshLogger.db`).
-- `meshtools/graphGen.py`: генерация карт/графов Graphviz + D3 из логов/БД.
-- `meshtools/nodeDbUpdater.py`: legacy-обновление текстовой базы узлов (`nodeDb.txt`).
-- `meshtalk/`: внутренние модули протокола/хранилища (`protocol.py`, `storage.py`).
-- `meshtalk_utils.py`: общие утилиты парсинга/форматирования.
-- `message_text_compression.py`: пайплайн сжатия/нормализации текста payload.
-- Текстовые справки: `meshTalk.txt`, `meshtools/meshLogger.txt`, `meshtools/graphGen.txt`, `nodeDbUpdater.txt`, `meshtalk_utils.txt`, `message_text_compression.txt`.
+- `meshTalk.py`: исследовательский GUI-прототип best-effort P2P и multi-hop обмена (ACK/повторы, обмен ключами, runtime-диагностика).
+- `meshtalk/`: внутренние модули протокола, маршрутизации и хранения.
+- `meshtalk/utils.py`: общие утилиты парсинга/форматирования.
+- `meshtalk/compression.py`: пайплайн сжатия/нормализации текста payload.
+- Основные справки: `README.md`, `CHANGELOG.md`, `meshTalk.txt`, `documentation/user_manual.txt`, `documentation/*.txt`.
 
 ## Ключевые возможности
 
@@ -556,19 +502,17 @@ Output: `dist\meshTalk.exe`
 - Python 3.9+
 - Meshtastic CLI в PATH (`meshtastic`)
 - Пакет `cryptography` (для `meshTalk.py`)
-- Graphviz в PATH (`dot`) для `meshtools/graphGen.py`
+- Пакет `PySide6` (Qt GUI для `meshTalk.py`)
 
 ## Примечания для Windows
 
 - Установите Meshtastic CLI: `pip install meshtastic` (убедитесь, что Scripts в PATH)
-- Установите Graphviz и добавьте его `bin` в PATH
 - Используйте COM-порт (например: `--port COM3`)
 - Узнать реальные пути на вашей машине:
   - `where python`
   - `where meshtastic`
-  - `where dot`
 - Добавить недостающие папки в PATH (PowerShell, текущий пользователь):
-  - `setx PATH "$env:PATH;C:\path\to\Python\Scripts;C:\path\to\Graphviz\bin"`
+  - `setx PATH "$env:PATH;C:\path\to\Python\Scripts"`
 - Через GUI (Windows):
   - Start -> "Environment Variables"
   - Edit `Path` -> New -> вставьте путь -> OK
@@ -589,41 +533,11 @@ pip install -r requirements.txt
 
 ```bash
 meshtastic --help
-dot -V
 ```
 
 ## Быстрый старт
 
-Непрерывное логирование маршрутов (Ctrl+C для остановки):
-
-```bash
-python meshtools/meshLogger.py --port /dev/ttyUSB0
-```
-
-Обновить базу узлов (однократно):
-
-```bash
-python meshtools/nodeDbUpdater.py --port /dev/ttyUSB0 --db nodeDb.txt
-```
-
-Почасовое обновление SQLite-базы встроено в `meshtools/meshLogger.py`.
-Traceroute и события listen сохраняются только в SQLite (без текстовых логов).
-
-Показать схему БД:
-
-```bash
-python meshtools/meshLogger.py --db-schema
-```
-
-Сгенерировать граф из свежих логов (Graphviz + D3.js):
-
-```bash
-python meshtools/graphGen.py --root .
-```
-
-Best-effort P2P-обмен полезной нагрузкой (криптографические примитивы + ACK):
-
-Qt GUI app:
+Запуск Qt GUI:
 
 ```bash
 python meshTalk.py
@@ -710,52 +624,36 @@ build_meshTalk.bat
 ## Чеклист первого запуска
 
 - `meshtastic --help` работает
-- `dot -V` работает
-- `python meshtools/meshLogger.py --port ...` создает `meshLogger/YYYY-MM-DD !xxxxxxxx.txt`
-- `python meshtools/nodeDbUpdater.py --port ...` создает/обновляет `nodeDb.txt`
+- `python meshTalk.py` запускается и выводит `GUI: ready | self=...`
+- `Настройки -> Транспорт` показывает direct-пиры и routing-метрики после handshake
 
 ## Структура файлов
 
 ### Файлы проекта (в репозитории / исходники)
 
-- `meshtools/meshLogger.py` — утилита traceroute/logger.
-- `meshtools/nodeDbUpdater.py` — legacy-обновление текстовой БД.
-- `meshtools/graphGen.py` — генерация Graphviz + D3.
-- `meshTalk.py` — research prototype GUI для best-effort P2P-обмена полезной нагрузкой (ACK/повторы + криптографические примитивы).
+- `meshTalk.py` — research prototype GUI для best-effort P2P и multi-hop обмена полезной нагрузкой (ACK/повторы + криптографические примитивы).
 - `meshtalk/` — внутренние модули meshTalk:
   - `meshtalk/protocol.py` — wire-протокол + криптографические примитивы.
+  - `meshtalk/routing.py` — оценка и выбор маршрута.
   - `meshtalk/storage.py` — хранение config/state/history/incoming + запечатывание на диске.
-- `meshtalk_utils.py` — общие утилиты/парсеры/форматтеры.
-- `message_text_compression.py` — режимы/кодеки сжатия текста.
+- `meshtalk/utils.py` — общие утилиты/парсеры/форматтеры.
+- `meshtalk/compression.py` — режимы/кодеки сжатия текста.
+- `documentation/` — user manual и тематические документы по подсистемам.
 - `requirements.txt` — Python-зависимости.
 - `run_meshTalk.bat` / `build_meshTalk.bat` — скрипты запуска/сборки для Windows.
 - `README.md` / `CHANGELOG.md` / `meshTalk.txt` — документация.
 
 ### Генерируется во время работы (не исходники)
 
-- `meshLogger/` — сгенерированные ежедневные логи traceroute.
-- `graphGen/` — сгенерированные файлы графов (`dot/svg/html/json`).
-- `meshLogger.db` — сгенерированная SQLite-база.
-- `nodeDb.txt` — сгенерированная база узлов (legacy-режим).
 - `keyRings/` — сгенерированные ключи (`<id>.key`, `<id>.pub`, публичные ключи пиров, `storage.key`).
 - `<node_id>/` — runtime-профиль конкретной ноды:
   - `config.json`, `state.json`, `incoming.json`, `history.log`, `runtime.log`, `keyRings/`.
 
 ## Заметки
 
-- `nodeDb.txt` может содержать чувствительные данные (ключи, координаты). Храните приватно.
-- `.gitignore` исключает сгенерированные логи и базу.
-- `meshtools/graphGen.py` ожидает файлы трасс вида `YYYY-MM-DD !xxxxxxxx*.txt`.
+- `.gitignore` исключает локальные runtime-артефакты и сборочные файлы.
 
 ## Устранение неполадок
 
 - `meshtastic` не найден: выполните `pip install meshtastic` и добавьте Scripts в PATH.
-- `dot` не найден: установите Graphviz и добавьте `bin` в PATH.
-- Нет логов: убедитесь, что в `meshLogger/` есть файлы `YYYY-MM-DD !xxxxxxxx*.txt`.
 - Устройство не найдено: проверьте порт (Linux `/dev/ttyUSB0`, Windows `COM3`), кабель и драйверы.
-
-## meshtools/graphGen.py (D3.js опции)
-
-- `--no-d3` выключает HTML/JSON.
-- `--d3-top N` ограничивает top-N узлов для фильтрации (по умолчанию 30).
-- `--d3-min-neighbors N` фильтрует по числу соседей (по умолчанию 0).
