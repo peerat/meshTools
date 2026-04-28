@@ -48,10 +48,11 @@ class AdaptivePacer:
         min_rate_seconds: int = 5,
         max_rate_seconds: int = 120,
         min_parallel: int = 1,
-        max_parallel: int = 3,
-        adjust_interval_seconds: float = 30.0,
-        stats_window_seconds: float = 120.0,
-        parallel_penalty: float = 0.06,
+        max_parallel: int = 4,
+        # More aggressive by default: react faster, ramp up sooner.
+        adjust_interval_seconds: float = 15.0,
+        stats_window_seconds: float = 90.0,
+        parallel_penalty: float = 0.04,
     ) -> None:
         self._lock = threading.Lock()
         self.enabled = bool(enabled)
@@ -116,7 +117,9 @@ class AdaptivePacer:
             if self._last_adjust_ts > 0.0 and (t - self._last_adjust_ts) < self.adjust_interval_seconds:
                 return None
             self._prune_locked(t)
-            if len(self._acks) < 6:
+            # Allow ramp-up earlier: we don't need a huge sample to increase speed,
+            # because we still clamp and re-check every adjust_interval_seconds.
+            if len(self._acks) < 3:
                 return None
 
             acks = list(self._acks)
@@ -142,39 +145,50 @@ class AdaptivePacer:
             # Targets: keep almost everything delivered on the first attempt.
             # This minimizes retransmits, which reduces overall mesh airtime usage.
             if timeout_drops > 0:
-                desired = cur_score * 0.40
+                # Still slow down, but less brutally: keep momentum for long multipart sends.
+                desired = cur_score * 0.55
                 why = f"timeout_drops={timeout_drops}"
             elif attempts_avg >= 1.30 or retries_ratio >= 0.20:
-                desired = cur_score * 0.60
+                desired = cur_score * 0.75
                 why = f"bad attempts_avg={attempts_avg:.2f} retries_ratio={retries_ratio:.2f}"
             elif attempts_avg >= 1.15 or retries_ratio >= 0.10:
-                desired = cur_score * 0.80
+                desired = cur_score * 0.90
                 why = f"warn attempts_avg={attempts_avg:.2f} retries_ratio={retries_ratio:.2f}"
-            elif rtt_p50 >= 12.0:
+            elif rtt_p50 >= 16.0:
                 # Even with few retries, high RTT usually means the mesh is busy.
-                desired = cur_score * 0.85
+                desired = cur_score * 0.90
                 why = f"high_rtt_p50={rtt_p50:.1f}s"
             elif (
-                attempts_avg <= 1.02
-                and retries_ratio <= 0.02
+                attempts_avg <= 1.06
+                and retries_ratio <= 0.05
                 and rtt_p50 > 0.0
-                and rtt_p50 <= 6.0
-                and pend >= 20
+                and rtt_p50 <= 10.0
+                and pend >= 8
             ):
-                # Scale up only when we have backlog AND delivery is clean AND RTT is low.
-                desired = cur_score * 1.05
-                why = f"good attempts_avg={attempts_avg:.2f}"
+                # Scale up aggressively when we have backlog AND delivery is clean.
+                desired = cur_score * 1.20
+                why = f"good attempts_avg={attempts_avg:.2f} retries_ratio={retries_ratio:.2f}"
+            elif (
+                attempts_avg <= 1.10
+                and retries_ratio <= 0.08
+                and rtt_p50 > 0.0
+                and rtt_p50 <= 12.0
+                and pend >= 3
+            ):
+                # Gentle scale-up for small backlogs (keeps chat responsive).
+                desired = cur_score * 1.10
+                why = f"ok attempts_avg={attempts_avg:.2f} retries_ratio={retries_ratio:.2f}"
             else:
                 return None
 
             desired = self._clamp_score(desired)
             new_rate, new_par = self._pick_pair(desired, cur_rate, cur_par)
-            self._last_adjust_ts = t
             if new_rate == cur_rate and new_par == cur_par:
                 return None
 
             old_score = cur_score
             new_score = self._score(new_rate, new_par)
+            self._last_adjust_ts = t
             self.rate_seconds = new_rate
             self.parallel_sends = new_par
             return (

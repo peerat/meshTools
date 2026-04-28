@@ -1,0 +1,106 @@
+meshTalk — User Manual
+======================
+
+Version: 0.6.0
+State: current runtime
+Date: 2026-04-28
+
+RU
+--
+1. Что это
+- meshTalk — настольный клиент обмена сообщениями поверх Meshtastic.
+- Для meshTalk-сообщений используется текущий v3-стек с relay-доставкой.
+- Для `group:Primary` используется обычный `TEXT_MESSAGE_APP`.
+
+2. Два пути передачи
+1. meshTalk v3
+- шифрованный `envelope_v3`
+- relay/control кадры
+- `HOP_ACK` и `END_ACK`
+
+2. Primary
+- обычный широковещательный текст Meshtastic
+- без relay-v3 и без meshTalk ACK-модели
+
+3. Главный экран
+- слева: контакты и группы
+- справа: история сообщений
+- сверху: строка статуса, ID, public key, тревоги
+- снизу: поле ввода и отправка
+
+4. Статусы доставки
+- исходящее сообщение сначала находится в промежуточном состоянии
+- по мере прихода `HOP_ACK` растёт счётчик частей
+- когда подтверждены все части, сообщение выходит из промежуточного цвета
+- `END_ACK` означает подтверждённую конечную доставку
+
+5. Компрессия
+- meshTalk может сжимать большие сообщения
+- сжатие включается только если уменьшается полный wire-size
+- в статусе сообщения показывается фактический режим и эффективность для этого сообщения
+
+6. Настройки безопасности
+- backup приватного ключа по умолчанию сохраняется в `keyRings/backups`
+- импорт приватного ключа выполняется через staged replace, чтобы не ломать профиль при частичном сбое
+
+7. Вкладка Activity
+- показывает статистику трафика
+- график рисуется столбиками:
+  - вверх — TX
+  - вниз — RX
+- снизу есть шкала времени
+- слева — шкала байт/сек
+
+8. Логи
+- runtime log показывает маршрутизацию, компрессию, ACK, rekey и системные события
+- `COMPSTAT top_mode` — агрегированная статистика по сессии, а не режим последнего сообщения
+
+EN
+--
+1. What this is
+- meshTalk is a desktop messaging client built on top of Meshtastic.
+- meshTalk messages use the current v3 relay-capable stack.
+- `group:Primary` uses plain `TEXT_MESSAGE_APP`.
+
+2. Two delivery paths
+1. meshTalk v3
+- encrypted `envelope_v3`
+- relay/control frames
+- `HOP_ACK` and `END_ACK`
+
+2. Primary
+- plain Meshtastic broadcast text
+- no relay-v3 framing and no meshTalk ACK model
+
+3. Main screen
+- left: contacts and groups
+- right: chat history
+- top: status header, ID, public key, alerts
+- bottom: input and send controls
+
+4. Delivery states
+- an outgoing message starts in an intermediate state
+- fragment progress advances on `HOP_ACK`
+- once all fragments are acknowledged, the message leaves its intermediate color
+- `END_ACK` means end delivery is confirmed
+
+5. Compression
+- meshTalk may compress large messages
+- compression is only enabled when full wire-size becomes smaller
+- the message footer shows the actual codec and efficiency for that message
+
+6. Security actions
+- private-key backup export defaults to `keyRings/backups`
+- private-key import uses staged replacement to reduce profile corruption risk
+
+7. Activity tab
+- shows traffic statistics
+- the graph is drawn as bars:
+  - upward for TX
+  - downward for RX
+- bottom axis is time
+- left axis is bytes per second
+
+8. Logs
+- runtime log shows routing, compression, ACK, rekey, and system events
+- `COMPSTAT top_mode` is a session aggregate, not the codec of the last message

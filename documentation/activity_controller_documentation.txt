@@ -1,0 +1,75 @@
+meshTalk — Activity Controller Documentation
+============================================
+
+State: current runtime
+Date: 2026-04-28
+
+RU
+--
+1. Назначение
+- управлять плотностью повторов;
+- уменьшать шум в эфире;
+- ускорять отправку на живом peer;
+- снижать давление на очередь при молчащем peer.
+
+2. Фазы peer-состояния
+- `active`: peer недавно отвечал или наблюдался;
+- `waiting_peer`: peer молчит, retry становятся тише.
+
+3. Что считается живым peer
+Peer считается responsive, если недавно есть:
+- `last_ack_ts`, или
+- `last_seen_ts`.
+
+4. Модель retry delay
+Задержка строится из:
+- базового `retry_seconds`;
+- номера попытки;
+- верхнего backoff cap;
+- jitter ratio.
+
+5. Quiet retry
+Если peer не responsive:
+- запись переводится в более тихую фазу;
+- retry откладываются консервативнее;
+- scheduler уменьшает бессмысленный RF-шум.
+
+6. Возврат в active
+Когда peer снова оживает:
+- pending retry могут быть подтянуты ближе;
+- retry-фаза возвращается к `active`.
+
+EN
+--
+1. Purpose
+- control retry density;
+- reduce RF noise;
+- send more aggressively when a peer is alive;
+- reduce queue pressure when a peer is silent.
+
+2. Peer phases
+- `active`: the peer was recently seen or acknowledged;
+- `waiting_peer`: the peer is silent and retries become quieter.
+
+3. Responsive peer definition
+A peer is considered responsive when recent activity exists through:
+- `last_ack_ts`, or
+- `last_seen_ts`.
+
+4. Retry-delay model
+Delay is built from:
+- base `retry_seconds`;
+- attempt number;
+- backoff cap;
+- jitter ratio.
+
+5. Quiet retry
+If a peer is not responsive:
+- the record moves into a quieter phase;
+- retries are delayed more conservatively;
+- the scheduler reduces pointless RF noise.
+
+6. Return to active
+When a peer becomes active again:
+- pending retries may be pulled closer;
+- the retry phase returns to `active`.

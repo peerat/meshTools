@@ -1,0 +1,53 @@
+meshTalk — Adaptive Pacing Documentation
+========================================
+
+State: current runtime
+Date: 2026-04-28
+
+RU
+--
+1. Назначение
+- подстраивать send pace под текущее состояние сети;
+- снижать коллизии и retry pressure;
+- сохранять стабильную доставку при меняющемся RF-канале.
+
+2. Что регулируется
+- `rate_seconds`
+- `parallel_sends`
+
+Эффективный темп:
+- `parallel_sends / rate_seconds` отправок в секунду.
+
+3. Источники наблюдений
+- ACK с RTT и числом попыток;
+- drop-события;
+- длина pending-очереди.
+
+4. Что делает pacer
+- ведёт rolling-статистику;
+- оценивает latency и retry pressure;
+- предлагает более быстрый или более осторожный pace в заданных границах.
+
+EN
+--
+1. Purpose
+- adapt send pace to current network conditions;
+- reduce collisions and retry pressure;
+- keep delivery stable as RF quality changes.
+
+2. Controlled values
+- `rate_seconds`
+- `parallel_sends`
+
+Effective pace:
+- `parallel_sends / rate_seconds` sends per second.
+
+3. Inputs
+- ACK observations with RTT and attempt count;
+- drop events;
+- pending queue pressure.
+
+4. What the pacer does
+- maintains rolling statistics;
+- estimates latency and retry pressure;
+- suggests a faster or more conservative pace within configured bounds.

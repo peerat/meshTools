@@ -1,64 +1,115 @@
-meshTalk — compression_documentation
+meshTalk — Compression Documentation
+====================================
 
-Дата обновления: 2026-02-12
+State: current runtime
+Date: 2026-04-28
 
-1) Общий пайплайн
-- Вход: UTF-8 текст.
-- Этап 1: нормализация (опционально, обратимая).
-- Этап 2: компрессия (алгоритм/режим).
-- Этап 3: упаковка в MC/compact payload и шифрование MT-WIRE.
+RU
+--
+1. Назначение
+- уменьшить число частей;
+- сократить полный wire-size;
+- уменьшить число повторов и нагрузку на эфир;
+- сохранить точное восстановление исходного текста.
 
-2) Нормализация
+2. Pipeline
+1. исходный UTF-8 текст;
+2. опциональная нормализация;
+3. компрессия;
+4. упаковка в relay `DATA` body;
+5. фрагментация;
+6. шифрование во внешнем `envelope_v3`.
+
+3. Нормализация
 Режимы:
-- `OFF` — без предобработки.
-- `TOKENS` — обратимый token-stream.
-- `SP_VOCAB` — обратимая нормализация по SentencePiece vocab.
-- `AUTO` — перебор вариантов нормализации и выбор по наименьшему packed size.
+- `off`
+- `tokens`
+- `sp_vocab`
+- `auto`
 
-3) Алгоритмы компрессии
-- BYTE_DICT
-- FIXED_BITS
-- DEFLATE
-- ZLIB
-- BZ2
-- LZMA
-- ZSTD
+4. Алгоритмы сжатия
+- `BYTE_DICT`
+- `FIXED_BITS`
+- `DEFLATE`
+- `ZLIB`
+- `BZ2`
+- `LZMA`
+- `ZSTD`
 
-4) Политики выбора
-- `OFF`: компрессия отключена.
-- `FORCE`: строго выбранный алгоритм (если поддерживается пиром).
-- `AUTO`: конкурентный выбор лучшего packed варианта.
+5. Как выбирается режим
+- runtime считает кандидаты по доступным режимам;
+- сравнивает не только packed size, но и полный wire-size;
+- учитывает overhead relay header и внешнего контейнера;
+- сжатие включается только если `wire_comp < wire_plain`.
 
-4.1) Режим `AUTO + AUTO` (нормализация + компрессия)
-- Сначала берется исходный текст без нормализации (`OFF`).
-- Затем последовательно пробуются доступные нормализации (`TOKENS`, `SP_VOCAB`, ...).
-- Для каждого нормализованного варианта пробуются доступные компрессоры (`DEFLATE`, `BZ2`, `LZMA`, `ZSTD`, ...).
-- Сравнивается итоговый размер `packed` у всех комбинаций.
-- Выбирается комбинация с минимальным `packed`.
-- Если ни одна комбинация не дает выгоду, отправка идет без сжатия (`cmp=none`).
-- В статусе отображается финальный выбор, например:
-  - `TOKEN_STREAM сжатие ZSTD 31.4%`
-  - Это означает: после выбранной нормализации и компрессии размер стал `31.4% от исходного`.
+6. Что хранится в очереди
+- `cmp`
+- `cmp_norm`
+- `cmp_eff_pct`
 
-5) Совместимость
-- Режим применяется только при поддержке peer (capabilities `mc_modes`, `mt_msg/mt_mc`).
-- При отсутствии поддержки система откатывается к безопасному варианту (AUTO/plain).
+7. Что видно в логах
+- `NORM`
+- `COMPRESS`
+- `COMPSTAT`
 
-6) Метрики эффективности
-- `plain` — исходный размер байт.
-- `packed` — размер после нормализации+сжатия.
-- `size%` — сколько осталось от исходного (`packed/plain * 100`).
-- В GUI используется формулировка вида:
-  - `<NORM> сжатие <ALGO> <PCT>%`
-  - пример: `TOKEN_STREAM сжатие ZSTD 31.4%`.
+Важно:
+- `COMPSTAT top_mode` — агрегированная статистика по сессии, а не режим последнего сообщения.
 
-7) Агрегированная статистика
-- `COMPSTAT`: total/compressed/ratio/plain/packed/size/top_mode/top_norm.
-- `COMPRESS`: per-message выбор и итог.
-- `NORM`: телеметрия этапа нормализации.
+8. Что видно в UI
+- для исходящего сообщения показывается фактический режим этой группы;
+- для входящего — конкретный режим из metadata или generic `MC` для сжатого v3 payload.
 
-8) Важно про обычный Meshtastic канал
-- Для `transport=meshtastic_text` компрессия/нормализация этого модуля не применяются.
-- Статус таких сообщений в UI упрощен и показывает только время:
-  - исходящее: `отправлено в HH:MM`,
-  - входящее: `пришло в HH:MM`.
+EN
+--
+1. Purpose
+- reduce fragment count;
+- reduce total wire-size;
+- reduce retries and RF load;
+- preserve exact source-text recovery.
+
+2. Pipeline
+1. source UTF-8 text;
+2. optional normalization;
+3. compression;
+4. wrap into relay `DATA` body;
+5. fragment;
+6. encrypt into outer `envelope_v3`.
+
+3. Normalization
+Modes:
+- `off`
+- `tokens`
+- `sp_vocab`
+- `auto`
+
+4. Compression codecs
+- `BYTE_DICT`
+- `FIXED_BITS`
+- `DEFLATE`
+- `ZLIB`
+- `BZ2`
+- `LZMA`
+- `ZSTD`
+
+5. Selection rule
+- runtime evaluates candidates from supported modes;
+- compares full wire-size, not just packed payload size;
+- includes relay-header and outer-container overhead;
+- compression is enabled only when `wire_comp < wire_plain`.
+
+6. Queue metadata
+- `cmp`
+- `cmp_norm`
+- `cmp_eff_pct`
+
+7. Logging
+- `NORM`
+- `COMPRESS`
+- `COMPSTAT`
+
+Important:
+- `COMPSTAT top_mode` is a session aggregate, not the codec of the last message.
+
+8. UI presentation
+- outgoing messages show the actual codec used for that message group;
+- incoming messages show the explicit codec when available, otherwise generic `MC` for compressed v3 payload.

@@ -1,0 +1,8 @@
+{"type":"observe","t":1000.0,"peer":"a1b2c3d4","route":"meshTalk","success":1,"timeout":0,"rtt_s":1.2,"attempts":1,"hops":1,"micro_retries":0}
+{"type":"observe","t":1001.0,"peer":"a1b2c3d4","route":"meshtastic_text","success":0,"timeout":1,"rtt_s":null,"attempts":1,"hops":0,"micro_retries":0}
+{"type":"observe","t":1002.0,"peer":"a1b2c3d4","route":"meshTalk","success":0,"timeout":1,"rtt_s":null,"attempts":3,"hops":3,"micro_retries":1}
+{"type":"observe","t":1003.0,"peer":"a1b2c3d4","route":"meshTalk","success":0,"timeout":1,"rtt_s":null,"attempts":3,"hops":3,"micro_retries":1}
+{"type":"observe","t":1004.0,"peer":"a1b2c3d4","route":"meshtastic_text","success":1,"timeout":0,"rtt_s":4.5,"attempts":1,"hops":1,"micro_retries":0}
+{"type":"tx","t":1010.0,"peer":"a1b2c3d4","queue_depth":2,"candidates":["meshTalk","meshtastic_text"],"outcomes":{"meshTalk":{"success":1,"latency_s":2.1,"attempts":2,"bytes":120,"hops":2,"micro_retries":1},"meshtastic_text":{"success":0,"latency_s":0.0,"attempts":1,"bytes":60,"hops":0,"micro_retries":0}}}
+{"type":"tx","t":1020.0,"peer":"a1b2c3d4","queue_depth":6,"candidates":["meshTalk","meshtastic_text"],"outcomes":{"meshTalk":{"success":0,"latency_s":0.0,"attempts":3,"bytes":120,"hops":3,"micro_retries":1},"meshtastic_text":{"success":1,"latency_s":4.8,"attempts":1,"bytes":60,"hops":1,"micro_retries":0}}}
+{"type":"tx","t":1030.0,"peer":"a1b2c3d4","queue_depth":5,"candidates":["meshTalk","meshtastic_text"],"outcomes":{"meshTalk":{"success":0,"latency_s":0.0,"attempts":3,"bytes":120,"hops":3,"micro_retries":1},"meshtastic_text":{"success":1,"latency_s":4.6,"attempts":1,"bytes":60,"hops":1,"micro_retries":0}}}

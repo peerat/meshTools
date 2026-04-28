@@ -1,0 +1,55 @@
+meshTalk — Documentation Index
+==============================
+
+State: current runtime
+Date: 2026-04-28
+
+RU
+--
+Этот каталог — точка входа в актуальную документацию проекта.
+
+1. Протокол и транспорт
+- `protocol_documentation.txt`
+- `control_plane_documentation.txt`
+- `retry_and_delivery_documentation.txt`
+
+2. Безопасность
+- `security_documentation.txt`
+
+3. Компрессия
+- `compression_documentation.txt`
+
+4. Маршрутизация
+- `routing_algorithm_documentation.txt`
+
+5. Activity и pacing
+- `activity_controller_documentation.txt`
+- `adaptive_pacing_documentation.txt`
+
+6. Пользовательское руководство
+- `user_manual.txt`
+
+EN
+--
+This directory is the entry point into the current project documentation.
+
+1. Protocol and transport
+- `protocol_documentation.txt`
+- `control_plane_documentation.txt`
+- `retry_and_delivery_documentation.txt`
+
+2. Security
+- `security_documentation.txt`
+
+3. Compression
+- `compression_documentation.txt`
+
+4. Routing
+- `routing_algorithm_documentation.txt`
+
+5. Activity and pacing
+- `activity_controller_documentation.txt`
+- `adaptive_pacing_documentation.txt`
+
+6. User manual
+- `user_manual.txt`

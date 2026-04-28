@@ -20,6 +20,7 @@ state.json
 history.log
 incoming.json
 startup_crash.log
+.meshtalk.instance.lock
 core
 core.*
 [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/
@@ -27,10 +28,8 @@ core.*
 # Local archives and temp
 *.zip
 *.[Zz][Ii][Pp]
+*.private.backup.key
 tmp_review_meta/
-
-# Local test utilities
-tests/
 
 # Python artifacts
 __pycache__/
@@ -41,3 +40,5 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+meshTalk.prompt

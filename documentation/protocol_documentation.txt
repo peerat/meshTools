@@ -1,137 +1,131 @@
-meshTalk — protocol_documentation
+meshTalk — Protocol Documentation
+=================================
 
-Дата обновления: 2026-02-12
-Реализация: meshTalk.py, meshtalk_utils.py, message_text_compression.py
+State: current runtime
+Date: 2026-04-28
 
-1. Общая модель передачи
-- Транспорт: Meshtastic `sendData(...)`.
-- Полезная нагрузка шифруется в wire-кадре `MT-WIREv1` (AES-256-GCM).
-- Поверх шифрования есть типы внутренних сообщений:
-  - DATA (текст/части сообщения)
-  - ACK (подтверждение доставки)
-  - REKEY (служебные rekey-кадры)
-- Отдельно от MT-WIRE есть открытые служебные key-exchange кадры:
-  - `KR1|...` (запрос ключа)
-  - `KR2|...` (ответ с public key)
+RU
+--
+1. Протокольный стек
+- Весь meshTalk-трафик работает на текущем v3-стеке.
+- Для meshTalk используется единый актуальный wire-формат.
+- Стек состоит из двух уровней:
+  1. внешний зашифрованный контейнер `envelope_v3`;
+  2. внутренние relay/control кадры `relay_protocol`.
 
-2. Базовый wire MT-WIREv1
-Фиксированные накладные расходы (из кода):
-- `PAYLOAD_OVERHEAD = 1 + 1 + 8 + 12 + 16 = 38 байт`
-  - `ver` (1 байт)
-  - `type` (1 байт)
-  - `msg_id` (8 байт)
-  - `nonce` (12 байт)
-  - `tag` (16 байт, GCM)
+2. Внешний контейнер `envelope_v3`
+Назначение:
+- единый шифрованный транспортный контейнер для data и control payload;
+- привязка сообщения к `msg_id` через AAD;
+- единый формат для всего v3-трафика.
 
-Практический предел plaintext:
-- `max_plain = max_bytes - 38`
-- по умолчанию `max_bytes=200`, значит `max_plain=162`.
-
-3. Key exchange кадры (plaintext)
-
-3.1 KR1 — запрос ключа
 Формат:
-- `KR1|<from_norm_id>|<from_pub_b64>|mc_modes=<csv>|mt_wire=<csv>|mt_msg=<csv>|mt_mc=<csv>|mt_caps=<csv>`
+- `version` = 3 (1 байт)
+- `type` = 1 (1 байт)
+- `msg_id` (8 байт)
+- `nonce` (12 байт)
+- `ciphertext + tag` (AES-256-GCM)
 
-Поля:
-- `from_norm_id` — id отправителя (без `!`, 8 hex).
-- `from_pub_b64` — публичный X25519 ключ (32 байта, base64).
-- `mc_modes` — поддерживаемые compression mode id.
-- `mt_wire` — поддерживаемые версии wire.
-- `mt_msg` — поддерживаемые версии message framing.
-- `mt_mc` — поддерживаемые версии MC-блока.
-- `mt_caps` — дополнительные capability-флаги (например `aad_type`).
+AAD:
+- `[version, type] + msg_id`
 
-3.2 KR2 — ответ на KR1
-Формат аналогичен KR1:
-- `KR2|<from_norm_id>|<from_pub_b64>|mc_modes=...|mt_wire=...|mt_msg=...|mt_mc=...|mt_caps=...`
-
-3.3 KOF1 — сигнал offline присутствия приложения
-Формат:
-- `KOF1|<from_norm_id>`
+3. Внутренний слой `relay_protocol`
+Header содержит:
+- `magic`, `version`, `frame_type`, `ttl`, `epoch_slot`
+- `msg_id`, `relay_token`, `return_token`
+- `frag_index`, `frag_total`, `body`
 
 Назначение:
-- отправляется на shutdown клиента broadcast-кадром;
-- получатель сразу снимает app-online состояние пира и временно переключает маршрутизацию на обычный Meshtastic text до нового meshTalk-трафика от этого пира.
+- `msg_id`: идентификатор логического сообщения;
+- `ttl`: ограничение пересылки;
+- `relay_token`: токен назначения;
+- `return_token`: токен обратного подтверждения;
+- `frag_index` / `frag_total`: разбиение на части.
 
-4. ACK payload внутри MT-WIRE
-Формат ACK-текста:
-- `ACK mc=1 mc_modes=<csv> [hops=<n>]`
+4. Типы кадров
+- `DATA`
+- `HOP_ACK`
+- `END_ACK`
+- `TOKEN_ADV`
+- `TOKEN_WITHDRAW`
+- `CAPS_REQ`
+- `CAPS`
+- `REKEY1`, `REKEY2`, `REKEY3`
 
-Назначение:
-- подтверждение msg_id,
-- передача capability/MC информации,
-- опционально hop-метрика.
+5. Доставка
+- Исходящее сообщение разбивается на части.
+- Каждая часть отправляется отдельным `DATA` кадром.
+- На каждый `DATA` сосед возвращает `HOP_ACK`.
+- После полной сборки конечный узел возвращает `END_ACK`.
 
-5. Сообщения данных (payload semantics)
+6. Relay-модель
+- Любой meshTalk-узел relay-capable.
+- Пересылка управляется локальным `RelayState`.
+- Решение о форварде принимается локально, без глобальной карты сети.
 
-5.1 Legacy text framing (совместимость)
-- Строка вида: `T<created_s>|<group_id>|<part>/<total>|<attempt>|<text>`
-- Используется для восстановления времени отправки, группировки частей и номера попытки.
+7. Отдельный путь `Primary`
+- `group:Primary` использует обычный Meshtastic `TEXT_MESSAGE_APP`.
+- Это отдельный путь, не relay-v3.
 
-5.2 Compact/MC payload
-- При `compression_flag=1` данные упакованы MC-блоком.
-- Для компактного wire декодер определяет режим по MC header/metadata.
-- После сборки частей выполняется обратимая распаковка/денормализация.
+EN
+--
+1. Protocol stack
+- All meshTalk traffic runs on the current v3 stack.
+- meshTalk uses a single current wire format.
+- The stack has two layers:
+  1. outer encrypted `envelope_v3`;
+  2. inner relay/control frames from `relay_protocol`.
 
-6. Компрессия и нормализация
+2. Outer container `envelope_v3`
+Purpose:
+- one encrypted transport container for both data and control payloads;
+- binds messages to `msg_id` through AAD;
+- one format for all v3 traffic.
 
-6.1 Нормализация (preprocess)
-Режимы:
-- `off`
-- `tokens` (token stream, обратимый)
-- `sp_vocab` (SentencePiece vocab, обратимый)
-- `auto` (конкурентный выбор лучшего варианта)
+Format:
+- `version` = 3 (1 byte)
+- `type` = 1 (1 byte)
+- `msg_id` (8 bytes)
+- `nonce` (12 bytes)
+- `ciphertext + tag` (AES-256-GCM)
 
-Порядок:
-- сначала нормализация,
-- затем бинарная компрессия,
-- выбирается минимальный packed размер (в AUTO).
+AAD:
+- `[version, type] + msg_id`
 
-6.2 Compression mode ID -> label
-- `MODE_BYTE_DICT` -> `mc_byte_dict`
-- `MODE_FIXED_BITS` -> `mc_fixed_bits`
-- `MODE_DEFLATE` -> `mc_deflate`
-- `MODE_ZLIB` -> `mc_zlib`
-- `MODE_BZ2` -> `mc_bz2`
-- `MODE_LZMA` -> `mc_lzma`
-- `MODE_ZSTD` -> `mc_zstd`
+3. Inner layer `relay_protocol`
+Header contains:
+- `magic`, `version`, `frame_type`, `ttl`, `epoch_slot`
+- `msg_id`, `relay_token`, `return_token`
+- `frag_index`, `frag_total`, `body`
 
-В UI/статусе нормализуется к именам:
-- `BYTE_DICT`, `FIXED_BITS`, `DEFLATE`, `ZLIB`, `BZ2`, `LZMA`, `ZSTD`.
+Purpose:
+- `msg_id`: logical message identifier;
+- `ttl`: forwarding limit;
+- `relay_token`: destination token;
+- `return_token`: return-path token;
+- `frag_index` / `frag_total`: fragment numbering.
 
-7. Поля метаданных сообщения (GUI/history)
-Типичные поля meta_data:
-- `delivery` — задержка доставки (сек).
-- `attempts` — число попыток.
-- `forward_hops` — хопы до получателя.
-- `ack_hops` — хопы обратно (если есть).
-- `sent_at` / `received_at` / `delivered_at` — unix timestamps.
-- `status` — состояние отправки/получения.
-- `compression_name` — имя алгоритма (`DEFLATE`, `BZ2`, ...).
-- `compression_eff_pct` — итоговый размер после сжатия, в % от исходного (`size%`).
-- `compression_norm` — режим нормализации (`OFF`, `TOKENS`, `SP_VOCAB`, ...).
+4. Frame types
+- `DATA`
+- `HOP_ACK`
+- `END_ACK`
+- `TOKEN_ADV`
+- `TOKEN_WITHDRAW`
+- `CAPS_REQ`
+- `CAPS`
+- `REKEY1`, `REKEY2`, `REKEY3`
 
-8. Traceroute (диагностический обмен)
-- Запускается через Meshtastic traceroute API (`TRACEROUTE_APP`).
-- В логах/чате отражаются:
-  - попытки,
-  - hops туда/обратно,
-  - маршрут по узлам,
-  - timeout/успех.
-- Повторы и backoff аналогичны политике служебных отправок.
+5. Delivery
+- Outgoing messages are split into fragments.
+- Each fragment is sent as a `DATA` frame.
+- Each `DATA` frame gets a `HOP_ACK` from the next hop.
+- Once fully assembled, the destination returns `END_ACK`.
 
-9. Версии и совместимость
-- Текущий wire в логах: `MT-WIREv1`.
-- При key exchange стороны обмениваются версиями `mt_wire/mt_msg/mt_mc`.
-- При несовпадении wire версии формируется warning в логе.
+6. Relay model
+- Every meshTalk node is relay-capable.
+- Forwarding is controlled by local `RelayState`.
+- Next-hop decisions are local, without a global route map.
 
-10. Диагностические инварианты
-- Если decrypt fail повторяется, запускается повторный key request.
-- При `pinned key mismatch` автоматические запросы ограничиваются политикой безопасности.
-- `KEYOK` фиксирует подтвержденный рабочий этап обмена.
-
-11. Обычный Meshtastic text канал (`TEXT_MESSAGE_APP`)
-- Direct сообщения маршрутизируются в диалог конкретного контакта.
-- Broadcast/`^all` сообщения маршрутизируются в `group:Primary`.
-- При отправке из `group:Primary` используется broadcast Meshtastic text (без MT-WIRE контейнера).
+7. Separate `Primary` path
+- `group:Primary` uses plain Meshtastic `TEXT_MESSAGE_APP`.
+- It is separate from relay-v3.

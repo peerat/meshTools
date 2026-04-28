@@ -1,0 +1,105 @@
+meshTalk — Retry and Delivery Documentation
+===========================================
+
+State: current runtime
+Date: 2026-04-28
+
+RU
+--
+Этот документ описывает, как meshTalk ставит исходящий трафик в очередь, отправляет его, повторяет, подтверждает и отражает в UI.
+Низкоуровневый wire-формат описан в `protocol_documentation.txt`.
+
+1. Модель отправки
+- каждое исходящее сообщение превращается в pending-записи per peer;
+- большие сообщения разбиваются на части;
+- каждая часть отслеживается отдельно.
+
+2. Основные модули send-path
+- `meshtalk/v3_send_worker.py`
+- `meshtalk/v3_send_record.py`
+- `meshtalk/v3_send_effects.py`
+- `meshtalk/v3_sender_service.py`
+
+3. Действия worker
+`V3SendWorker` может вернуть:
+- `none`
+- `set_self_aes`
+- `key_request_due`
+- `need_aes`
+- `timeout_drop`
+- `drop`
+- `send_ready`
+
+4. Ограничение темпа
+- `rate_seconds`
+- `parallel_sends`
+- `activity_intra_batch_gap_ms`
+
+5. Жизненный цикл retry
+- после каждой отправки часть получает новый `next_retry_at`;
+- задержка зависит от activity-модели;
+- responsive peer получает более плотные retry;
+- silent peer переводится в более тихую фазу.
+
+6. Снятие pending-записи
+Часть удаляется, если:
+- получен matching `HOP_ACK`;
+- она истекла по `max_seconds`;
+- нарушены ограничения размера;
+- runtime явно дропнул запись по политике.
+
+7. Семантика доставки
+- `HOP_ACK` снимает конкретную pending-часть;
+- UI обновляет прогресс частей по `HOP_ACK`;
+- когда подтверждены все части, исходящее сообщение выходит из промежуточного состояния;
+- `END_ACK` означает конечную доставку и логируется отдельно.
+
+EN
+--
+This document describes how meshTalk queues, sends, retries, acknowledges, and reflects outgoing traffic in the UI.
+Low-level frame formats are described in `protocol_documentation.txt`.
+
+1. Send model
+- each outgoing message becomes per-peer pending records;
+- large messages are split into fragments;
+- each fragment is tracked independently.
+
+2. Main send-path modules
+- `meshtalk/v3_send_worker.py`
+- `meshtalk/v3_send_record.py`
+- `meshtalk/v3_send_effects.py`
+- `meshtalk/v3_sender_service.py`
+
+3. Worker actions
+`V3SendWorker` may return:
+- `none`
+- `set_self_aes`
+- `key_request_due`
+- `need_aes`
+- `timeout_drop`
+- `drop`
+- `send_ready`
+
+4. Rate limiting
+- `rate_seconds`
+- `parallel_sends`
+- `activity_intra_batch_gap_ms`
+
+5. Retry lifecycle
+- after each send, a fragment receives a new `next_retry_at`;
+- retry delay depends on the activity model;
+- responsive peers get denser retries;
+- silent peers move into a quieter retry phase.
+
+6. Pending removal
+A fragment is removed when:
+- a matching `HOP_ACK` is received;
+- it expires by `max_seconds`;
+- it violates size constraints;
+- runtime explicitly drops it by policy.
+
+7. Delivery semantics
+- `HOP_ACK` removes the matching pending fragment;
+- UI fragment progress is updated from `HOP_ACK`;
+- once all fragments are acknowledged, the outgoing message leaves its intermediate state;
+- `END_ACK` indicates final end delivery and is logged separately.

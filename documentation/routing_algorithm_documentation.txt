@@ -1,0 +1,77 @@
+meshTalk — Routing Documentation
+================================
+
+State: current runtime
+Date: 2026-04-28
+
+RU
+--
+1. Общая идея
+- meshTalk использует локально-адаптивную relay-модель.
+- Каждый узел meshTalk relay-capable.
+- Решение о форварде принимается локально и опирается на состояние `RelayState`.
+
+2. Основной runtime-объект
+- `RelayState`
+
+Он хранит:
+- соседей;
+- достижимость relay-token;
+- подавление дублей;
+- выбор next-hop.
+
+3. Что влияет на форвард
+- source hop текущего кадра;
+- `ttl`;
+- известный путь до `relay_token`;
+- ограничение числа downstream peers.
+
+4. Forward policy
+- не форвардить обратно в source hop;
+- не форвардить при `ttl <= 0`;
+- не форвардить дубликаты, подавленные seen-cache;
+- ограничивать fanout.
+
+5. ACK-маршруты
+- `HOP_ACK` возвращается ближайшему предыдущему hop;
+- `END_ACK` может идти назад по `return_token`.
+
+6. Путь `Primary`
+- `group:Primary` не относится к relay-v3 routing;
+- это отдельный plain Meshtastic broadcast path.
+
+EN
+--
+1. Core idea
+- meshTalk uses a locally adaptive relay model.
+- Every meshTalk node is relay-capable.
+- Forwarding decisions are local and based on `RelayState`.
+
+2. Main runtime object
+- `RelayState`
+
+It tracks:
+- neighbors;
+- relay-token reachability;
+- duplicate suppression;
+- next-hop selection.
+
+3. What affects forwarding
+- the source hop of the current frame;
+- `ttl`;
+- any known path to the `relay_token`;
+- downstream fanout limits.
+
+4. Forward policy
+- do not forward back to the source hop;
+- do not forward when `ttl <= 0`;
+- do not forward duplicates suppressed by seen-cache;
+- limit fanout.
+
+5. ACK routing
+- `HOP_ACK` returns to the immediate previous hop;
+- `END_ACK` may travel back via `return_token`.
+
+6. `Primary` path
+- `group:Primary` is outside relay-v3 routing;
+- it remains a separate plain Meshtastic broadcast path.

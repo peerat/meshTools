@@ -1,52 +1,97 @@
-meshTalk — security_documentation
+meshTalk — Security Documentation
+=================================
 
-Дата обновления: 2026-02-12
+State: current runtime
+Date: 2026-04-28
 
-1) Криптографические примитивы (текущая реализация)
-- Обмен публичными ключами: X25519 (32 bytes, base64 в KR1/KR2).
-- Выработка ключа сессии: HKDF-SHA256.
-- Шифрование wire-пакета: AES-256-GCM (`MT-WIREv1`).
-- Хранение секретов на диске: AES-256-GCM (ключ в `keyRings/storage.key`).
+RU
+--
+1. Криптография
+- Обмен ключами: X25519
+- KDF: HKDF-SHA256
+- AEAD: AES-256-GCM
+- Шифрование backup/storage: AES-256-GCM
+- Защита backup-passphrase: Scrypt
 
-2) Модель доверия
-- TOFU + pinning: первый принятый публичный ключ пира закрепляется локально.
-- При смене ключа пира возникает `pinned key mismatch`.
+2. Что шифруется
+- весь meshTalk v3-трафик внутри `envelope_v3`;
+- `DATA`, `HOP_ACK`, `END_ACK`;
+- `TOKEN_ADV` / `TOKEN_WITHDRAW`;
+- `CAPS_REQ` / `CAPS`;
+- `REKEY1/2/3`.
 
-3) Политики смены ключа (`security_key_rotation_policy`)
-- `AUTO`:
-  - автопринятие только если старый закрепленный ключ никогда не был подтвержден.
-  - если был подтвержден — нужен ручной reset/replace.
-- `STRICT`:
-  - любое изменение ключа требует ручного действия пользователя.
-- `ALWAYS`:
-  - изменение ключа принимается автоматически (минимум трения, максимум риска подмены).
+3. Что видно на внешнем транспорте
+- метаданные Meshtastic-пакета (`from`, `to`, hops, portnum);
+- факт трафика;
+- размер контейнера;
+- временные характеристики.
 
-4) Подтверждение обмена
-- Статус считается подтвержденным после `KEYOK`:
-  - `confirmed_by=resp` (получен KR2-ответ), или
-  - `confirmed_by=payload` (расшифрован полезный payload после обмена).
+4. Модель доверия
+- TOFU + pinning для long-term identity;
+- session rekey сокращает срок жизни активного ключа;
+- при decrypt failure ключ может быть сброшен и переобменен.
 
-5) Сценарии ошибок/рисков
-- `KEY: pinned key mismatch ...`
-  - возможная ротация ключа, переустановка пира или атака подмены.
-- `KEY: decrypt failed ...`
-  - рассинхрон сессионного ключа, устаревший ключ, поврежденный пакет.
-- `KEY: reject invalid public key ...`
-  - некорректный/поврежденный ключевой кадр.
+5. Session key lifecycle
+- shared secret строится через X25519;
+- AES-сеанс выводится через HKDF-SHA256;
+- `REKEY1/2/3` меняют активный session key внутри шифрованного канала.
 
-6) Поведение автоматики при проблемах
-- При частых `decrypt failed` система запрашивает повторный обмен (`reason=decrypt_fail`).
-- Локальный rate-limit ограничивает частые KR1 запросы.
-- При pinned mismatch авто-инициация ограничена, требуются явные действия.
-- При штатном shutdown отправляется broadcast-кадр `KOF1|<id>` для синхронизации app-presence (это не key-rotate и не смена pinned-key).
+6. Локальное хранение ключей
+- backup приватного ключа по умолчанию сохраняется в `keyRings/backups`;
+- backup-файл шифруется и не используется как live key.
 
-7) Ручные действия пользователя
-- `Send and request public key` — отправить свой и запросить public key пира.
-- `Accept` (при конфликте) — принять новый public key вручную.
-- `Ignore` (при конфликте) — временно скрыть предупреждение без замены ключа.
+7. Импорт приватного ключа
+- новый `priv/pub` сначала пишется во временные файлы;
+- staged-файлы валидируются;
+- затем live-файлы заменяются через `os.replace()`;
+- при ошибке выполняется best-effort rollback.
 
-8) Рекомендации по безопасной эксплуатации
-- Для публичных/шумных сетей использовать `STRICT`.
-- Проверять fingerprint ключа вне канала при первом доверии.
-- Реагировать на `pinned key mismatch`, не игнорировать по умолчанию.
-- Периодически делать rekey сессии (если включен `session_rekey`).
+8. Остаточные риски
+- при жёстком сбое ОС между `replace()` и фиксацией каталога остаётся окно durability-риска;
+- backup export использует безопасный путь по умолчанию, но всё ещё пишет напрямую в выбранный файл.
+
+EN
+--
+1. Cryptography
+- Key exchange: X25519
+- KDF: HKDF-SHA256
+- AEAD: AES-256-GCM
+- Backup/storage encryption: AES-256-GCM
+- Backup passphrase protection: Scrypt
+
+2. What is encrypted
+- all meshTalk v3 traffic inside `envelope_v3`;
+- `DATA`, `HOP_ACK`, `END_ACK`;
+- `TOKEN_ADV` / `TOKEN_WITHDRAW`;
+- `CAPS_REQ` / `CAPS`;
+- `REKEY1/2/3`.
+
+3. What remains visible on the outer transport
+- Meshtastic packet metadata (`from`, `to`, hops, portnum);
+- the fact that traffic exists;
+- encrypted container size;
+- timing characteristics.
+
+4. Trust model
+- TOFU + pinning for long-term identity;
+- session rekey reduces active session-key lifetime;
+- on decrypt failure the key may be reset and re-requested.
+
+5. Session key lifecycle
+- shared secret is derived with X25519;
+- AES session key is derived with HKDF-SHA256;
+- `REKEY1/2/3` rotate the active session key inside the encrypted channel.
+
+6. Local key storage
+- private-key backups default to `keyRings/backups`;
+- backup files are encrypted and are not used as live keys.
+
+7. Private-key import
+- new `priv/pub` are first written to temporary files;
+- staged files are validated;
+- live files are replaced via `os.replace()`;
+- best-effort rollback runs on failure.
+
+8. Residual risks
+- there is still a filesystem durability window around `replace()` on hard OS failure;
+- backup export uses a safe default location, but still writes directly to the user-selected file.

@@ -1,0 +1,99 @@
+meshTalk — Control Plane Documentation
+======================================
+
+State: current runtime
+Date: 2026-04-28
+
+RU
+--
+Этот документ описывает текущий служебный трафик meshTalk.
+Низкоуровневый формат кадров описан в `protocol_documentation.txt`.
+
+1. Что относится к control-plane
+- `HELLO`
+- `TOKEN_ADV` / `TOKEN_WITHDRAW`
+- `CAPS_REQ` / `CAPS`
+- `REKEY1/2/3`
+- `HOP_ACK` / `END_ACK`
+
+2. Основная цель
+- поддерживать достижимость и session state;
+- ограничивать раздувание служебного трафика;
+- сохранять стабильность data-plane.
+
+3. Discovery
+- `HELLO` — внешний discovery-канал;
+- не является relay-v3 payload;
+- используется для presence и trigger key exchange.
+
+4. Token reachability
+- `TOKEN_ADV` сообщает достижимость relay-token;
+- receiving side обновляет `RelayState`;
+- реклама может форвардиться с TTL-ограничением;
+- `TOKEN_WITHDRAW` удаляет устаревшие записи достижимости.
+
+5. Capability exchange
+- `CAPS_REQ` запрашивает capabilities;
+- `CAPS` передаёт версии wire, message, compression и AAD-флаги.
+
+6. Rekey
+- `REKEY1/2/3` переключают активный session key;
+- state-machine находится в `meshtalk/v3_rekey.py`.
+
+7. ACK semantics
+- `HOP_ACK` подтверждает одну часть на ближайшем hop;
+- `END_ACK` подтверждает полную конечную доставку;
+- UI-прогресс идёт по `HOP_ACK`;
+- конечная доставка фиксируется по `END_ACK`.
+
+8. Runtime-поведение
+- control-трафик проходит через те же send-window и retry-ограничения, что и data;
+- дубли ограничиваются seen-cache и TTL;
+- duplicate relay control обрабатывается как обычный v3 control-трафик.
+
+EN
+--
+This document describes the current meshTalk service/control traffic.
+Low-level frame formats are described in `protocol_documentation.txt`.
+
+1. Control-plane scope
+- `HELLO`
+- `TOKEN_ADV` / `TOKEN_WITHDRAW`
+- `CAPS_REQ` / `CAPS`
+- `REKEY1/2/3`
+- `HOP_ACK` / `END_ACK`
+
+2. Main goal
+- keep peer/session state alive;
+- limit service-traffic amplification;
+- preserve data-plane stability.
+
+3. Discovery
+- `HELLO` is the external discovery channel;
+- it is not a relay-v3 payload;
+- it is used for presence and key-exchange triggers.
+
+4. Token reachability
+- `TOKEN_ADV` advertises relay-token reachability;
+- the receiver updates `RelayState`;
+- advertisements may be forwarded with TTL limits;
+- `TOKEN_WITHDRAW` removes stale reachability entries.
+
+5. Capability exchange
+- `CAPS_REQ` requests capabilities;
+- `CAPS` carries wire, message, compression, and AAD capability flags.
+
+6. Rekey
+- `REKEY1/2/3` rotate the active session key;
+- the state machine lives in `meshtalk/v3_rekey.py`.
+
+7. ACK semantics
+- `HOP_ACK` confirms one fragment at the next hop;
+- `END_ACK` confirms complete end delivery;
+- UI progress is driven by `HOP_ACK`;
+- final delivery is indicated by `END_ACK`.
+
+8. Runtime behavior
+- control traffic uses the same send-window and retry limits as data traffic;
+- duplicates are bounded by seen-cache and TTL;
+- duplicate relay control is handled as normal v3 control traffic.
