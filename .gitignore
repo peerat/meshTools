@@ -1,44 +1,52 @@
-# Generated data and artifacts
-meshLogger/
-graphGen/
-meshTalk/
-keyRings/
-nodeDb*.txt
-!nodeDbUpdater.txt
-nodes.txt
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.codex
+
+# Virtual environments
+.venv/
+venv/
+meshTalk/.venv/
+meshTalk/venv/
+
+# Root runtime data and generated graph reports
 meshLogger.db
+meshLogger.db-shm
+meshLogger.db-wal
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
+nodeDb.txt
+nodes.txt
+graphGen/
 *.dot
 *.svg
-runtime.log
-config.json
-state.json
-history.log
-incoming.json
-startup_crash.log
-.meshtalk.instance.lock
+*.html
+*.json
+
+# meshTalk runtime data and local artifacts
+meshTalk/dist/
+meshTalk/keyRings/
+meshTalk/runtime.log
+meshTalk/startup_crash.log
+meshTalk/config.json
+meshTalk/state.json
+meshTalk/history.log
+meshTalk/incoming.json
+meshTalk/.meshtalk.instance.lock
+meshTalk/meshTalk.prompt
+meshTalk/*.zip
+meshTalk/*.[Zz][Ii][Pp]
+meshTalk/*.private.backup.key
+meshTalk/tmp_review_meta/
+meshTalk/[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/
+
+# Crash/core dumps
 core
 core.*
-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/
-
-# Local archives and temp
-*.zip
-*.[Zz][Ii][Pp]
-*.private.backup.key
-tmp_review_meta/
-
-# Python artifacts
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual environments
-.venv/
-venv/
-
-meshTalk.prompt

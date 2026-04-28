@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesh-tools-original"
+version = "0.0.0"
+description = "Meshtastic CLI utilities for logging telemetry and generating topology graphs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Anton Vologzhanin (R3VAF)" }
+]
+dependencies = []
+
+[tool.setuptools]
+py-modules = ["graphGen", "meshLogger", "nodeDbUpdater", "sqlite_utils"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

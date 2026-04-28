@@ -1,0 +1,44 @@
+# Generated data and artifacts
+meshLogger/
+graphGen/
+meshTalk/
+keyRings/
+nodeDb*.txt
+!nodeDbUpdater.txt
+nodes.txt
+meshLogger.db
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.dot
+*.svg
+runtime.log
+config.json
+state.json
+history.log
+incoming.json
+startup_crash.log
+.meshtalk.instance.lock
+core
+core.*
+[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/
+
+# Local archives and temp
+*.zip
+*.[Zz][Ii][Pp]
+*.private.backup.key
+tmp_review_meta/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+meshTalk.prompt
